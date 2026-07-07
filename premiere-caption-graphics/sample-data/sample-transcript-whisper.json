@@ -1,0 +1,36 @@
+{
+  "segments": [
+    {
+      "text": "This is the secret nobody tells you about growing an audience.",
+      "start": 0.0,
+      "end": 4.8,
+      "words": [
+        { "word": "This", "start": 0.0, "end": 0.18, "probability": 0.99 },
+        { "word": "is", "start": 0.18, "end": 0.3, "probability": 0.99 },
+        { "word": "the", "start": 0.3, "end": 0.42, "probability": 0.98 },
+        { "word": "secret", "start": 0.42, "end": 0.9, "probability": 0.97 },
+        { "word": "nobody", "start": 0.9, "end": 1.4, "probability": 0.96 },
+        { "word": "tells", "start": 1.4, "end": 1.7, "probability": 0.98 },
+        { "word": "you", "start": 1.7, "end": 1.9, "probability": 0.99 },
+        { "word": "about", "start": 2.3, "end": 2.6, "probability": 0.98 },
+        { "word": "growing", "start": 2.6, "end": 3.0, "probability": 0.97 },
+        { "word": "an", "start": 3.0, "end": 3.1, "probability": 0.99 },
+        { "word": "audience.", "start": 3.1, "end": 3.7, "probability": 0.96 }
+      ]
+    },
+    {
+      "text": "You need one proven idea, executed daily.",
+      "start": 5.0,
+      "end": 8.6,
+      "words": [
+        { "word": "You", "start": 5.0, "end": 5.15, "probability": 0.99 },
+        { "word": "need", "start": 5.15, "end": 5.4, "probability": 0.98 },
+        { "word": "one", "start": 5.4, "end": 5.6, "probability": 0.99 },
+        { "word": "proven", "start": 5.6, "end": 6.1, "probability": 0.95 },
+        { "word": "idea,", "start": 6.1, "end": 6.5, "probability": 0.96 },
+        { "word": "executed", "start": 6.7, "end": 7.3, "probability": 0.94 },
+        { "word": "daily.", "start": 7.3, "end": 7.8, "probability": 0.97 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "caption-graphics-studio",
+  "version": "1.0.0",
+  "description": "Premiere Pro UXP panel that turns a transcript into timed, styled caption graphics on the timeline.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {}
+}

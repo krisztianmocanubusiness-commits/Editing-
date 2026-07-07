@@ -1,0 +1,48 @@
+{
+  "_comment": "Canonical Essential Graphics 'Expose' control names this extension looks for on a .mogrt, mirrors src/presets/mogrtContract.js CANONICAL_PARAMS. A preset's mogrt.paramMap can override any of these per-template.",
+  "captionText": { "type": "Source Text", "required": true, "notes": "The main caption line." },
+  "emphasisText": { "type": "Source Text", "required": false, "notes": "Optional second text layer listing the emphasis word(s), if your template overlays them separately instead of recoloring inline." },
+
+  "fontSize": { "type": "Slider", "required": false },
+  "fontWeight": { "type": "Slider", "required": false, "notes": "100-900. Only useful if your text layer's font family has weight variants wired to a Responsive Design - Type font selector, or if you rig a font-family swap via expression." },
+  "fillColor": { "type": "Color Control", "required": true },
+  "fillOpacity": { "type": "Slider", "required": false, "notes": "0-100. Also used as the fallback fade in/out target if 'Animation Style' isn't implemented." },
+
+  "gradientEnabled": { "type": "Checkbox", "required": false },
+  "gradientStartColor": { "type": "Color Control", "required": false },
+  "gradientEndColor": { "type": "Color Control", "required": false },
+  "gradientAngle": { "type": "Slider", "required": false },
+
+  "bgBoxEnabled": { "type": "Checkbox", "required": false },
+  "bgBoxColor": { "type": "Color Control", "required": false },
+  "bgBoxOpacity": { "type": "Slider", "required": false },
+  "bgBoxCornerRadius": { "type": "Slider", "required": false },
+  "bgBoxPaddingX": { "type": "Slider", "required": false },
+  "bgBoxPaddingY": { "type": "Slider", "required": false },
+
+  "positionX": { "type": "Slider or Point Control", "required": false },
+  "positionY": { "type": "Slider or Point Control", "required": false },
+  "tracking": { "type": "Slider", "required": false, "notes": "Maps to the text layer's Character panel Tracking value." },
+
+  "shadowEnabled": { "type": "Checkbox", "required": false, "notes": "Toggle the layer's Drop Shadow style opacity between 0 and its authored value." },
+  "shadowColor": { "type": "Color Control", "required": false },
+  "shadowOpacity": { "type": "Slider", "required": false },
+  "shadowAngle": { "type": "Slider", "required": false },
+  "shadowDistance": { "type": "Slider", "required": false },
+  "shadowSoftness": { "type": "Slider", "required": false },
+
+  "blurEnabled": { "type": "Checkbox", "required": false },
+  "blurAmount": { "type": "Slider", "required": false, "notes": "Wire to a Gaussian/Fast Box Blur effect's Blurriness." },
+
+  "animationStyleIndex": {
+    "type": "Slider (integer 0-5)",
+    "required": false,
+    "notes": "0=none 1=fade 2=pop 3=slide-up 4=slide-down 5=typewriter. Drives which pre-built animation rig plays via expression selection. If omitted, the extension falls back to a plain opacity fade using fillOpacity."
+  },
+  "entranceDurationMs": { "type": "Slider", "required": false },
+  "exitDurationMs": { "type": "Slider", "required": false },
+
+  "emphasisEnabled": { "type": "Checkbox", "required": false },
+  "emphasisColor": { "type": "Color Control", "required": false },
+  "emphasisScale": { "type": "Slider", "required": false }
+}

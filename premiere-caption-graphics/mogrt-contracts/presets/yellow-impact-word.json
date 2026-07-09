@@ -1,0 +1,55 @@
+{
+  "id": "keris-yellow-impact-word",
+  "name": "Yellow Impact Word",
+  "font": { "family": "Helvetica Neue", "size": 110, "weight": 900, "italic": false },
+  "color": { "fill": "#FFD400", "opacity": 100 },
+  "gradient": {
+    "enabled": false,
+    "angleDeg": 90,
+    "stops": [
+      { "color": "#FFD400", "position": 0 },
+      { "color": "#FFB800", "position": 100 }
+    ]
+  },
+  "backgroundBox": {
+    "enabled": false,
+    "color": "#000000",
+    "opacity": 0,
+    "cornerRadius": 12,
+    "paddingX": 24,
+    "paddingY": 12
+  },
+  "position": {
+    "vertical": "bottom",
+    "horizontal": "center",
+    "offsetX": 0,
+    "offsetY": -200,
+    "safeMarginPct": 8
+  },
+  "tracking": 40,
+  "shadow": {
+    "enabled": true,
+    "color": "#000000",
+    "opacity": 80,
+    "angleDeg": 135,
+    "distance": 8,
+    "softness": 14
+  },
+  "blur": { "enabled": false, "amount": 0 },
+  "animation": {
+    "entrance": { "style": "pop", "durationMs": 120 },
+    "exit": { "style": "pop", "durationMs": 100 }
+  },
+  "emphasis": {
+    "enabled": false,
+    "mode": "auto-keywords",
+    "color": "#FFD400",
+    "scale": 1.0,
+    "weightBoost": 0
+  },
+  "mogrt": {
+    "path": "",
+    "contractId": "KERIS_CAPTION_V1",
+    "paramMap": {}
+  }
+}

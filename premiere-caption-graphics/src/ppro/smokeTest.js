@@ -1,5 +1,8 @@
 /**
- * Host validation pass for the Premiere scripting layer.
+ * Host validation pass for the Premiere scripting layer, checked against the
+ * first real MOGRT contract this extension ships: KERIS_CAPTION_V1 (see
+ * /mogrt-contracts/KERIS_CAPTION_V1.md and
+ * ../presets/contracts/kerisCaptionV1.js).
  *
  * This deliberately duplicates a little logic from applyCaptions.js /
  * mogrtContract.js rather than reusing the preset pipeline: the point of
@@ -9,16 +12,38 @@
  * calls actually work on their installed host and which don't. Nothing
  * here is allowed to silently assume success — every call is wrapped and
  * its real return value / thrown error is logged.
+ *
+ * Two independent checks come out of this, and they answer different
+ * questions:
+ *   - the per-field "trySetByCandidates" writes are best-effort — they try
+ *     the contract's exact param name plus a couple of legacy aliases, so
+ *     this still reports something useful against a non-contract template.
+ *   - the "contract compliance" check (step 8) is strict — it compares the
+ *     template's real discovered param names against KERIS_CAPTION_V1's
+ *     required list with no aliasing, so it can tell an editor *exactly*
+ *     which named control is missing and needs to be added/renamed in
+ *     After Effects.
  */
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, setTrackItemEnd } from "./mogrt.js";
 import { tickToSec } from "./time.js";
 import { setParamValue, coerceValue } from "./componentParams.js";
+import { KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
+import { validateAgainstContract, describeCompliance } from "../presets/contractValidation.js";
 
-const TEXT_CANDIDATES = ["Caption Text", "Source Text", "Text"];
-const FONT_SIZE_CANDIDATES = ["Font Size", "Size"];
-const FILL_COLOR_CANDIDATES = ["Fill Color", "Fill Colour", "Color", "Colour"];
-const BG_OPACITY_CANDIDATES = ["Background Opacity", "Background Enabled", "Opacity"];
+const P = KERIS_CAPTION_V1.paramMap;
+
+// Contract name first (exact match this template is expected to have),
+// then legacy aliases kept only so this test still says something useful
+// against an older/non-contract template.
+const TEXT_CANDIDATES = [P.captionText, "Caption Text", "Source Text"];
+const FONT_SIZE_CANDIDATES = [P.fontSize, "Size"];
+const FILL_COLOR_CANDIDATES = [P.fillColor, "Fill Colour", "Color", "Colour"];
+const BG_OPACITY_CANDIDATES = [P.bgBoxOpacity, "Background Enabled", "Opacity"];
+const BG_COLOR_CANDIDATES = [P.bgBoxColor, "Background Colour"];
+const TRACKING_CANDIDATES = [P.tracking, "Letter Spacing"];
+const SHADOW_OPACITY_CANDIDATES = [P.shadowOpacity, "Drop Shadow Opacity"];
+const ENTRANCE_STYLE_CANDIDATES = [P.animationStyleIndex, "Animation Style"];
 
 const MAX_COMPONENT_SCAN = 64;
 const MAX_PARAM_SCAN = 64;
@@ -157,12 +182,22 @@ function trySetByCandidates(project, discovered, candidateNames, kind, value, la
 }
 
 /**
- * Position's real value shape (single Point control vs split X/Y sliders)
- * is unconfirmed, so this tries several encodings against a "Position"
- * param before falling back to split Position X / Position Y params, and
- * logs every attempt rather than assuming the first one worked.
+ * KERIS_CAPTION_V1 requires split "Position X" / "Position Y" number
+ * params, so that exact shape is tried first (no guessing needed — they're
+ * plain numbers). A single "Position" point control is still tried as a
+ * fallback for non-contract templates, with a few plausible value
+ * encodings since that shape is otherwise unconfirmed; every attempt is
+ * logged rather than assuming the first one worked.
  */
 function trySetPosition(project, discovered, x, y, log) {
+  const xHit = findByCandidates(discovered, [P.positionX, "Position X"]);
+  const yHit = findByCandidates(discovered, [P.positionY, "Position Y"]);
+  if (xHit && yHit) {
+    const rx = trySetByCandidates(project, discovered, [xHit.name], "number", x, "Position X", log);
+    const ry = trySetByCandidates(project, discovered, [yHit.name], "number", y, "Position Y", log);
+    return { ok: rx.ok && ry.ok, paramName: "Position X / Position Y" };
+  }
+
   const single = findByCandidates(discovered, ["Position"]);
   if (single) {
     const encodings = [
@@ -183,15 +218,7 @@ function trySetPosition(project, discovered, x, y, log) {
     return { ok: false, paramName: "Position" };
   }
 
-  const xHit = findByCandidates(discovered, ["Position X"]);
-  const yHit = findByCandidates(discovered, ["Position Y"]);
-  if (xHit && yHit) {
-    const rx = trySetByCandidates(project, discovered, ["Position X"], "number", x, "Position X", log);
-    const ry = trySetByCandidates(project, discovered, ["Position Y"], "number", y, "Position Y", log);
-    return { ok: rx.ok && ry.ok, paramName: "Position X / Position Y" };
-  }
-
-  log(`✗ Position: no "Position" or "Position X"/"Position Y" param found on this .mogrt.`, "error");
+  log(`✗ Position: no "${P.positionX}"/"${P.positionY}" or "Position" param found on this .mogrt.`, "error");
   return { ok: false };
 }
 
@@ -205,11 +232,12 @@ function trySetPosition(project, discovered, x, y, log) {
  * @param {number} opts.positionY
  * @param {number} [opts.testDurationSec]
  * @param {(message: string, level?: string) => void} opts.log
+ * @param {{ id: string, requiredParams: string[] }} [opts.contract] Defaults to KERIS_CAPTION_V1.
  */
 export async function runSmokeTest(opts) {
-  const { mogrtPath, text, fontSize, fillColorHex, positionX, positionY, testDurationSec = 3, log } = opts;
+  const { mogrtPath, text, fontSize, fillColorHex, positionX, positionY, testDurationSec = 3, log, contract = KERIS_CAPTION_V1 } = opts;
 
-  log("════ Caption Studio host smoke test — start ════", "info");
+  log(`════ Caption Studio host smoke test — start (contract: ${contract.id}) ════`, "info");
 
   // 1. Active project + sequence.
   let project, sequence;
@@ -283,7 +311,15 @@ export async function runSmokeTest(opts) {
   // 7. Full component/param dump.
   const discovered = await dumpComponentChain(trackItem, log);
 
-  // 8. Set the required fields, each independently logged.
+  // 8. Strict contract compliance — exact required-name match, no aliasing.
+  // This is the check that tells the editor precisely which named control
+  // is missing on this .mogrt, independent of whether a fallback alias
+  // happened to let the best-effort writes below succeed anyway.
+  const discoveredNames = discovered.map((d) => d.name);
+  const compliance = validateAgainstContract(discoveredNames, contract);
+  log(describeCompliance(compliance), compliance.isCompliant ? "success" : "error");
+
+  // 9. Best-effort writes for the 10 KERIS_CAPTION_V1 fields, each logged.
   log("Setting exposed parameters…", "info");
   const results = {
     trim: trimResult.ok && trimResult.value,
@@ -291,30 +327,48 @@ export async function runSmokeTest(opts) {
     fontSize: trySetByCandidates(project, discovered, FONT_SIZE_CANDIDATES, "number", fontSize, "Font size", log),
     fillColor: trySetByCandidates(project, discovered, FILL_COLOR_CANDIDATES, "color", fillColorHex, "Fill colour", log),
     position: trySetPosition(project, discovered, positionX, positionY, log),
+    tracking: trySetByCandidates(project, discovered, TRACKING_CANDIDATES, "number", 0, "Tracking", log),
+    entranceStyle: trySetByCandidates(project, discovered, ENTRANCE_STYLE_CANDIDATES, "number", 1, "Entrance style", log),
   };
 
-  const bgHit = findByCandidates(discovered, BG_OPACITY_CANDIDATES);
-  if (bgHit) {
-    results.backgroundOpacity = trySetByCandidates(project, discovered, BG_OPACITY_CANDIDATES, "percent", 60, "Background opacity", log);
-  } else {
-    log(`… Background opacity: no matching param found on this .mogrt — skipping (marked optional).`, "warn");
-    results.backgroundOpacity = { ok: false, skipped: true };
-  }
+  const bgOpacityHit = findByCandidates(discovered, BG_OPACITY_CANDIDATES);
+  results.backgroundOpacity = bgOpacityHit
+    ? trySetByCandidates(project, discovered, BG_OPACITY_CANDIDATES, "percent", 60, "Background opacity", log)
+    : (log("… Background opacity: no matching param found on this .mogrt — skipping.", "warn"), { ok: false, skipped: true });
+
+  const bgColorHit = findByCandidates(discovered, BG_COLOR_CANDIDATES);
+  results.backgroundColor = bgColorHit
+    ? trySetByCandidates(project, discovered, BG_COLOR_CANDIDATES, "color", "#E8D9BE", "Background colour", log)
+    : (log("… Background colour: no matching param found on this .mogrt — skipping.", "warn"), { ok: false, skipped: true });
+
+  const shadowHit = findByCandidates(discovered, SHADOW_OPACITY_CANDIDATES);
+  results.shadowOpacity = shadowHit
+    ? trySetByCandidates(project, discovered, SHADOW_OPACITY_CANDIDATES, "percent", 75, "Shadow opacity", log)
+    : (log("… Shadow opacity: no matching param found on this .mogrt — skipping.", "warn"), { ok: false, skipped: true });
 
   const summary = {
-    sequence: true,
-    track: true,
-    insert: true,
+    contract: contract.id,
+    contractCompliant: compliance.isCompliant,
+    missingRequired: compliance.missingRequired,
     trim: results.trim,
     text: results.text.ok,
     fontSize: results.fontSize.ok,
     fillColor: results.fillColor.ok,
     position: results.position.ok,
+    tracking: results.tracking.ok,
+    entranceStyle: results.entranceStyle.ok,
     backgroundOpacity: results.backgroundOpacity.ok || results.backgroundOpacity.skipped,
+    backgroundColor: results.backgroundColor.ok || results.backgroundColor.skipped,
+    shadowOpacity: results.shadowOpacity.ok || results.shadowOpacity.skipped,
   };
-  const passCount = Object.values(results).filter((r) => r === true || r?.ok).length;
+  const coreChecks = [results.text, results.fontSize, results.fillColor, results.position, results.tracking, results.entranceStyle];
+  const passCount = coreChecks.filter((r) => r.ok).length;
   log(`Summary: ${describe(summary)}`, "info");
-  log(`════ Caption Studio host smoke test — finished (${passCount}/5 param checks passed) ════`, passCount === 5 ? "success" : "warn");
+  log(
+    `════ Caption Studio host smoke test — finished (${passCount}/${coreChecks.length} core param checks passed, ` +
+      `contract ${compliance.isCompliant ? "COMPLIANT" : "NOT COMPLIANT"}) ════`,
+    passCount === coreChecks.length && compliance.isCompliant ? "success" : "warn"
+  );
 
-  return { ok: true, trackItem, discovered, results };
+  return { ok: true, trackItem, discovered, results, compliance };
 }

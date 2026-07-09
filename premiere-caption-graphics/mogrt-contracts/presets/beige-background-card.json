@@ -1,0 +1,55 @@
+{
+  "id": "keris-beige-background-card",
+  "name": "Beige Background Card",
+  "font": { "family": "Inter", "size": 58, "weight": 600, "italic": false },
+  "color": { "fill": "#2B2118", "opacity": 100 },
+  "gradient": {
+    "enabled": false,
+    "angleDeg": 90,
+    "stops": [
+      { "color": "#2B2118", "position": 0 },
+      { "color": "#4A3B2A", "position": 100 }
+    ]
+  },
+  "backgroundBox": {
+    "enabled": true,
+    "color": "#F1E3CE",
+    "opacity": 92,
+    "cornerRadius": 14,
+    "paddingX": 28,
+    "paddingY": 14
+  },
+  "position": {
+    "vertical": "bottom",
+    "horizontal": "center",
+    "offsetX": 0,
+    "offsetY": -150,
+    "safeMarginPct": 8
+  },
+  "tracking": 8,
+  "shadow": {
+    "enabled": true,
+    "color": "#000000",
+    "opacity": 25,
+    "angleDeg": 135,
+    "distance": 3,
+    "softness": 6
+  },
+  "blur": { "enabled": false, "amount": 0 },
+  "animation": {
+    "entrance": { "style": "slide-up", "durationMs": 200 },
+    "exit": { "style": "fade", "durationMs": 140 }
+  },
+  "emphasis": {
+    "enabled": false,
+    "mode": "auto-keywords",
+    "color": "#FFD400",
+    "scale": 1.0,
+    "weightBoost": 0
+  },
+  "mogrt": {
+    "path": "",
+    "contractId": "KERIS_CAPTION_V1",
+    "paramMap": {}
+  }
+}

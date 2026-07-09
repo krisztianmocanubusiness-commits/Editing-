@@ -40,18 +40,22 @@ transcript file / clip transcript
 3. Load the plugin into a running Premiere Pro project. The panel appears
    under Window → Extensions → **Caption Graphics Studio**.
 4. Author (or license) at least one `.mogrt` matching
-   `mogrt-authoring/param-contract.json` — see that folder's README for the
-   minimum viable template spec. Point a preset at it via **"Choose
-   .mogrt…"** in the panel.
+   **[`mogrt-contracts/KERIS_CAPTION_V1.md`](mogrt-contracts/KERIS_CAPTION_V1.md)**
+   — the first real, buildable contract this extension ships against (10
+   required exposed params). Point a preset at it via **"Choose .mogrt…"**
+   in the panel, or import one of the four ready-made presets in
+   `mogrt-contracts/presets/` and just fill in its `mogrt.path`.
 
 ## Validate the host connection first
 
 Before trusting the full pipeline, run the panel's **"0. Host smoke test"**
-section: it inserts one `.mogrt`, sets text/font size/fill colour/position/
-duration on it, and logs every step's real success/failure to both the
-panel and the UXP Developer Tool console — no assumptions, no silent
-fallbacks. Full step-by-step instructions and how to read the output:
-**[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
+section: it inserts one `.mogrt`, sets all 10 `KERIS_CAPTION_V1` fields
+(text/font size/fill colour/position/background/tracking/shadow/entrance
+style/duration) on it, and logs every step's real success/failure — plus a
+strict contract-compliance check naming exactly which required param is
+missing, if any — to both the panel and the UXP Developer Tool console. No
+assumptions, no silent fallbacks. Full step-by-step instructions and how to
+read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
 
 ## Using the panel
 
@@ -89,9 +93,14 @@ fallbacks. Full step-by-step instructions and how to read the output:
 - `src/caption/` — `chunker.js` (timing split) and `keywords.js` (emphasis
   scoring heuristic), both pure functions, unit-tested.
 - `src/presets/` — the `Preset` schema (`types.js`), built-in library
-  (`library.js`), validation/clamping (`validate.js`), and the "authoring
-  contract" that maps preset fields to named Essential Graphics parameters
-  (`mogrtContract.js`).
+  (`library.js`), validation/clamping (`validate.js`), the mapping layer
+  that resolves preset fields to named Essential Graphics parameters
+  (`mogrtContract.js`), the contract-compliance checker
+  (`contractValidation.js`), and the named-contract registry
+  (`contracts/` — currently just `KERIS_CAPTION_V1`).
+- `mogrt-contracts/` — `KERIS_CAPTION_V1.md`, the first concrete,
+  smoke-test-validated contract (10 required params), plus four ready-to-
+  import example presets built for it in `mogrt-contracts/presets/`.
 - `src/ppro/` — everything that actually talks to Premiere: project/sequence
   access, timeline range read/write, `.mogrt` insertion, component-parameter
   get/set/keyframe, the `applyCaptions.js` orchestrator, and
@@ -105,10 +114,12 @@ fallbacks. Full step-by-step instructions and how to read the output:
   the smoke test panel, including expected log output and a failure triage
   table.
 - `test/` — pure-logic unit tests (`node --test`), covering chunking,
-  keyword scoring, all transcript parsers, and preset flattening. These run
-  without Premiere; the `src/ppro/*` scripting layer cannot be
-  unit-tested outside a live host — that's what the smoke test panel and
-  `docs/PREMIERE_HOST_TEST.md` are for.
+  keyword scoring, all transcript parsers, preset flattening, and the
+  `KERIS_CAPTION_V1` contract (including that its markdown spec and JS
+  definition haven't drifted apart, and that all four example presets
+  resolve correctly against it). These run without Premiere; the
+  `src/ppro/*` scripting layer cannot be unit-tested outside a live host —
+  that's what the smoke test panel and `docs/PREMIERE_HOST_TEST.md` are for.
 
 ## Running the tests
 

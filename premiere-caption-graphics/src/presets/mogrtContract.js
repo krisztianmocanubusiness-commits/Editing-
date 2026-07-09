@@ -1,3 +1,5 @@
+import { getContract } from "./contracts/index.js";
+
 /**
  * The "authoring contract" between this extension and the .mogrt files it
  * drives.
@@ -10,11 +12,19 @@
  * exposes must correspond to a named, exposed control on the underlying
  * .mogrt, authored once in After Effects/Premiere by a motion designer.
  *
- * CANONICAL_PARAMS is the default display-name each control is expected to
- * have. A preset can override any of these per-field via
- * `preset.mogrt.paramMap`, so the same JS preset can drive differently
- * authored templates without code changes. See mogrt-authoring/README.md
- * for the full spec editors should follow when building new templates.
+ * A preset field's exposed-param name is resolved with three tiers of
+ * priority (see resolveParamName()):
+ *   1. `preset.mogrt.paramMap[fieldKey]`      — explicit per-preset override
+ *   2. the named contract's `paramMap[fieldKey]` — `preset.mogrt.contractId`,
+ *      e.g. "KERIS_CAPTION_V1" (see ./contracts/kerisCaptionV1.js and
+ *      /mogrt-contracts/KERIS_CAPTION_V1.md)
+ *   3. CANONICAL_PARAMS[fieldKey]              — generic fallback default
+ *
+ * CANONICAL_PARAMS below is that generic fallback, covering every style
+ * dimension the preset UI exposes (including a few, like gradient and
+ * per-word emphasis, that no shipped contract requires yet — see
+ * mogrt-authoring/README.md for the full, unconstrained spec vs. a named
+ * contract like KERIS_CAPTION_V1's smaller required set).
  */
 export const CANONICAL_PARAMS = {
   captionText: "Caption Text",
@@ -65,7 +75,14 @@ export const CANONICAL_PARAMS = {
 export const ANIMATION_STYLES = ["none", "fade", "pop", "slide-up", "slide-down", "typewriter"];
 
 export function resolveParamName(preset, fieldKey) {
-  return preset.mogrt?.paramMap?.[fieldKey] || CANONICAL_PARAMS[fieldKey];
+  const override = preset.mogrt?.paramMap?.[fieldKey];
+  if (override) return override;
+
+  const contract = preset.mogrt?.contractId ? getContract(preset.mogrt.contractId) : null;
+  const fromContract = contract?.paramMap?.[fieldKey];
+  if (fromContract) return fromContract;
+
+  return CANONICAL_PARAMS[fieldKey];
 }
 
 function animationIndex(style) {

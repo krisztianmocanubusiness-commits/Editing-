@@ -53,5 +53,6 @@ export const store = createStore({
     positionY: 980,
     running: false,
     lastResult: null, // "pass" | "fail" | "partial" | null
+    lastCompliance: null, // result of validateAgainstContract(), or null
   },
 });

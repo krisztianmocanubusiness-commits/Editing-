@@ -3,6 +3,8 @@ import { store } from "../state/store.js";
 import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { runSmokeTest } from "../ppro/smokeTest.js";
+import { KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
+import { describeCompliance } from "../presets/contractValidation.js";
 
 function patchSmokeTest(patch) {
   store.set((s) => ({ smokeTest: { ...s.smokeTest, ...patch } }));
@@ -27,7 +29,7 @@ async function run() {
     log("Pick a test .mogrt before running the smoke test.", "error");
     return;
   }
-  patchSmokeTest({ running: true, lastResult: null });
+  patchSmokeTest({ running: true, lastResult: null, lastCompliance: null });
   try {
     const result = await runSmokeTest({
       mogrtPath: st.mogrtPath,
@@ -42,9 +44,16 @@ async function run() {
       patchSmokeTest({ lastResult: "fail" });
       return;
     }
-    const checks = [result.results.text.ok, result.results.fontSize.ok, result.results.fillColor.ok, result.results.position.ok];
+    const checks = [
+      result.results.text.ok,
+      result.results.fontSize.ok,
+      result.results.fillColor.ok,
+      result.results.position.ok,
+      result.results.tracking.ok,
+      result.results.entranceStyle.ok,
+    ];
     const allCore = checks.every(Boolean);
-    patchSmokeTest({ lastResult: allCore ? "pass" : "partial" });
+    patchSmokeTest({ lastResult: allCore ? "pass" : "partial", lastCompliance: result.compliance });
   } catch (err) {
     log(`Smoke test crashed unexpectedly: ${err.message || err}`, "error");
     patchSmokeTest({ lastResult: "fail" });
@@ -56,12 +65,18 @@ async function run() {
 function resultBadge(lastResult) {
   if (!lastResult) return el("span", { class: "status-line", text: "Not run yet." });
   const map = {
-    pass: { text: "PASS — text, size, colour, position all set successfully.", cls: "log-success" },
+    pass: { text: "PASS — all 6 core params (text, size, colour, position, tracking, entrance style) set successfully.", cls: "log-success" },
     partial: { text: "PARTIAL — some params set, others failed. See log for exactly which.", cls: "log-warn" },
     fail: { text: "FAIL — see log for the step that failed.", cls: "log-error" },
   };
   const info = map[lastResult];
   return el("span", { class: `status-line ${info.cls}`, text: info.text });
+}
+
+function complianceBadge(compliance) {
+  if (!compliance) return null;
+  const cls = compliance.isCompliant ? "log-success" : "log-error";
+  return el("div", { class: `status-line ${cls}`, text: describeCompliance(compliance) });
 }
 
 export function renderSmokeTestPanel(onChange) {
@@ -93,9 +108,10 @@ export function renderSmokeTestPanel(onChange) {
       "p",
       { class: "hint" },
       [
-        "Validates the real Premiere connection end to end: inserts one MOGRT, sets text / font size / " +
-          "fill colour / position / duration on it, and logs every step (success or failure) below and in " +
-          "the UDT console. See docs/PREMIERE_HOST_TEST.md for manual steps and how to read the results.",
+        `Validates the real Premiere connection end to end against the ${KERIS_CAPTION_V1.id} contract: inserts one ` +
+          "MOGRT, sets text / font size / fill colour / position / tracking / entrance style on it, and logs every " +
+          "step (success or failure) below and in the UDT console. See docs/PREMIERE_HOST_TEST.md and " +
+          `${KERIS_CAPTION_V1.docPath} for manual steps and the full required-param spec.`,
       ]
     ),
     el("div", { class: "row" }, [pickBtn]),
@@ -109,5 +125,6 @@ export function renderSmokeTestPanel(onChange) {
     ]),
     el("div", { class: "row" }, [runBtn]),
     resultBadge(st.lastResult),
+    complianceBadge(st.lastCompliance),
   ]);
 }

@@ -1,5 +1,17 @@
 # Authoring `.mogrt` templates for Caption Graphics Studio
 
+This is the generic, unconstrained spec — every style field the preset
+schema supports, with no fixed required subset. For the first concrete,
+buildable, smoke-test-validated contract (10 required params, no
+per-word emphasis, split Position X/Y), see
+**[`/mogrt-contracts/KERIS_CAPTION_V1.md`](../mogrt-contracts/KERIS_CAPTION_V1.md)**
+instead — that's what `src/ppro/smokeTest.js` checks against by default and
+what the four example presets in `mogrt-contracts/presets/` are built for.
+Start there; come back here only if you need a param this extension
+supports but KERIS_CAPTION_V1 doesn't require (gradient, blur, per-word
+emphasis, exit animation, background corner radius/padding, shadow
+angle/distance/softness).
+
 ## Why templates, not generated text
 
 Premiere Pro's public UXP scripting API lets an extension **insert** a Motion

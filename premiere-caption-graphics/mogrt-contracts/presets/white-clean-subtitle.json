@@ -1,0 +1,55 @@
+{
+  "id": "keris-white-clean-subtitle",
+  "name": "White Clean Subtitle",
+  "font": { "family": "Inter", "size": 60, "weight": 500, "italic": false },
+  "color": { "fill": "#FFFFFF", "opacity": 100 },
+  "gradient": {
+    "enabled": false,
+    "angleDeg": 90,
+    "stops": [
+      { "color": "#FFFFFF", "position": 0 },
+      { "color": "#CCCCCC", "position": 100 }
+    ]
+  },
+  "backgroundBox": {
+    "enabled": false,
+    "color": "#000000",
+    "opacity": 0,
+    "cornerRadius": 10,
+    "paddingX": 20,
+    "paddingY": 10
+  },
+  "position": {
+    "vertical": "bottom",
+    "horizontal": "center",
+    "offsetX": 0,
+    "offsetY": -160,
+    "safeMarginPct": 8
+  },
+  "tracking": 10,
+  "shadow": {
+    "enabled": true,
+    "color": "#000000",
+    "opacity": 35,
+    "angleDeg": 135,
+    "distance": 4,
+    "softness": 8
+  },
+  "blur": { "enabled": false, "amount": 0 },
+  "animation": {
+    "entrance": { "style": "fade", "durationMs": 140 },
+    "exit": { "style": "fade", "durationMs": 140 }
+  },
+  "emphasis": {
+    "enabled": false,
+    "mode": "auto-keywords",
+    "color": "#FFD400",
+    "scale": 1.0,
+    "weightBoost": 0
+  },
+  "mogrt": {
+    "path": "",
+    "contractId": "KERIS_CAPTION_V1",
+    "paramMap": {}
+  }
+}

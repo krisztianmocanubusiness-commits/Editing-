@@ -57,7 +57,9 @@
  * @property {number} emphasis.weightBoost  added to font.weight, clamped to 900
  * @property {Object} mogrt
  * @property {string} mogrt.path            Local filesystem path to the .mogrt this preset drives.
- * @property {Object.<string,string>} mogrt.paramMap  preset-field-key -> Essential Graphics exposed param display name
+ * @property {string|null} mogrt.contractId Id of a named contract in src/presets/contracts (e.g. "KERIS_CAPTION_V1")
+ *   whose paramMap supplies the default preset-field -> exposed-param-name mapping. See mogrtContract.js resolveParamName().
+ * @property {Object.<string,string>} mogrt.paramMap  Per-preset overrides, highest priority: preset-field-key -> Essential Graphics exposed param display name
  */
 
 /** @returns {Preset} */
@@ -111,7 +113,7 @@ export function createDefaultPreset(name = "Untitled Preset", id) {
       scale: 1.12,
       weightBoost: 100,
     },
-    mogrt: { path: "", paramMap: {} },
+    mogrt: { path: "", contractId: null, paramMap: {} },
   };
 }
 

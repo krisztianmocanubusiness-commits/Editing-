@@ -85,7 +85,7 @@ export function renderPresetPanel(onChange) {
   requestAnimationFrame(() => renderPreview(preview, p, chunkForPreview));
 
   const body = el("section", { class: "panel" }, [
-    el("h2", { text: "4. Style preset" }),
+    el("h2", { text: "5. Style preset" }),
     el("div", { class: "row" }, [
       el("span", { class: "field-label", text: "Base preset:" }),
       presetSelect,

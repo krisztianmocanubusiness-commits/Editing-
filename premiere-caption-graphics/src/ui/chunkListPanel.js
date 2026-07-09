@@ -110,7 +110,7 @@ export function renderChunkListPanel(onChange) {
   );
 
   return el("section", { class: "panel" }, [
-    el("h2", { text: "3. Split into timed caption chunks" }),
+    el("h2", { text: "4. Split into timed caption chunks" }),
     el("div", { class: "options-grid" }, [
       chunkOptionRow("Max chars/chunk", "maxChars", { min: 8, max: 80 }),
       chunkOptionRow("Max words/chunk", "maxWords", { min: 1, max: 20 }),

@@ -50,7 +50,7 @@ export function renderRangePanel(onChange) {
   });
 
   return el("section", { class: "panel" }, [
-    el("h2", { text: "2. Timeline range & track" }),
+    el("h2", { text: "3. Timeline range & track" }),
     el("div", { class: "row" }, [refreshBtn]),
     el("div", { class: "status-line" }, [
       `Range: ${formatSec(state.range.startSec)} – ${formatSec(state.range.endSec)}`,

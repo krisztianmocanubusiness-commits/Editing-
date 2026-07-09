@@ -1,6 +1,7 @@
 import { BUILT_IN_PRESETS } from "../presets/library.js";
 import { clonePreset } from "../presets/types.js";
 import { DEFAULT_CHUNK_OPTIONS } from "../caption/chunker.js";
+import { loadActiveTemplate } from "./settings.js";
 
 /**
  * Minimal observable store for the panel. No framework: subscribers are
@@ -54,5 +55,15 @@ export const store = createStore({
     running: false,
     lastResult: null, // "pass" | "fail" | "partial" | null
     lastCompliance: null, // result of validateAgainstContract(), or null
+  },
+
+  // { path, contractId, compliant, savedAt } | null — see src/state/settings.js.
+  // Loaded once at startup; templateInspectorPanel.js is the only writer.
+  activeTemplate: loadActiveTemplate(),
+
+  templateInspector: {
+    mogrtPath: "",
+    running: false,
+    lastResult: null, // full inspectMogrt() return value, or null
   },
 });

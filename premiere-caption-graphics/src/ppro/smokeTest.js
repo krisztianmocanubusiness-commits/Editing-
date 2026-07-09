@@ -4,9 +4,9 @@
  * /mogrt-contracts/KERIS_CAPTION_V1.md and
  * ../presets/contracts/kerisCaptionV1.js).
  *
- * This deliberately duplicates a little logic from applyCaptions.js /
- * mogrtContract.js rather than reusing the preset pipeline: the point of
- * this module is to be a *minimal, isolated* path from "click a button" to
+ * This deliberately avoids the preset/apply pipeline (only the component-
+ * discovery walk is shared, via ./introspect.js): the point of this module
+ * is to be a *minimal, isolated* path from "click a button" to
  * "one styled MOGRT on the timeline" with maximum logging at every step, so
  * a human watching the UDT console can see exactly which Premiere UXP API
  * calls actually work on their installed host and which don't. Nothing
@@ -30,6 +30,7 @@ import { tickToSec } from "./time.js";
 import { setParamValue, coerceValue } from "./componentParams.js";
 import { KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
 import { validateAgainstContract, describeCompliance } from "../presets/contractValidation.js";
+import { safe, safeAsync, describeValue as describe, dumpComponentChain } from "./introspect.js";
 
 const P = KERIS_CAPTION_V1.paramMap;
 
@@ -44,34 +45,6 @@ const BG_COLOR_CANDIDATES = [P.bgBoxColor, "Background Colour"];
 const TRACKING_CANDIDATES = [P.tracking, "Letter Spacing"];
 const SHADOW_OPACITY_CANDIDATES = [P.shadowOpacity, "Drop Shadow Opacity"];
 const ENTRANCE_STYLE_CANDIDATES = [P.animationStyleIndex, "Animation Style"];
-
-const MAX_COMPONENT_SCAN = 64;
-const MAX_PARAM_SCAN = 64;
-
-function safe(fn) {
-  try {
-    return { ok: true, value: fn() };
-  } catch (err) {
-    return { ok: false, error: err };
-  }
-}
-
-async function safeAsync(fn) {
-  try {
-    return { ok: true, value: await fn() };
-  } catch (err) {
-    return { ok: false, error: err };
-  }
-}
-
-function describe(value) {
-  if (value === undefined) return "undefined";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
 
 /**
  * Best-effort playhead read. Adobe's public sample panel does not
@@ -97,60 +70,6 @@ async function resolveStartTimeSec(sequence, fallbackSec, log) {
     "warn"
   );
   return fallbackSec;
-}
-
-/**
- * Walk every component/param on a track item and log what's actually
- * there — names, best-effort "type", and current value where readable.
- * Scan bounds are defensive (see mogrt.js findExposedParam for the same
- * caveat): no explicit count method appears in Adobe's public sample.
- */
-async function dumpComponentChain(trackItem, log) {
-  log("Reading component chain…", "info");
-  const chainResult = await safeAsync(() => trackItem.getComponentChain());
-  if (!chainResult.ok) {
-    log(`✗ getComponentChain() threw: ${chainResult.error.message || chainResult.error}`, "error");
-    return [];
-  }
-  const chain = chainResult.value;
-  if (!chain) {
-    log("✗ getComponentChain() returned nothing.", "error");
-    return [];
-  }
-
-  const discovered = [];
-  for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
-    const componentResult = safe(() => chain.getComponentAtIndex(ci));
-    if (!componentResult.ok) {
-      log(`Component scan stopped at index ${ci}: ${componentResult.error.message || componentResult.error}`, "info");
-      break;
-    }
-    const component = componentResult.value;
-    if (!component) {
-      log(`Component scan stopped at index ${ci}: no component returned.`, "info");
-      break;
-    }
-
-    const name = safe(() => component.displayName).value ?? safe(() => component.matchName).value ?? `Component[${ci}]`;
-    log(`Component ${ci}: "${name}"`, "info");
-
-    for (let pi = 0; pi < MAX_PARAM_SCAN; pi++) {
-      const paramResult = safe(() => component.getParam(pi));
-      if (!paramResult.ok || !paramResult.value) break;
-      const param = paramResult.value;
-
-      const paramName = safe(() => param.displayName).value ?? `Param[${pi}]`;
-      const paramType = safe(() => param.type).value ?? safe(() => param.paramType).value ?? "unknown";
-      const startValue = await safeAsync(() => param.getStartValue());
-      const currentValueStr = startValue.ok ? describe(startValue.value) : `unreadable (${startValue.error.message || startValue.error})`;
-
-      log(`  Param ${pi}: "${paramName}" — type=${paramType}, currentValue=${currentValueStr}`, "info");
-      discovered.push({ componentIndex: ci, paramIndex: pi, name: paramName, type: paramType, param, component });
-    }
-  }
-
-  log(`Component/param scan complete: ${discovered.length} exposed param(s) found.`, discovered.length ? "success" : "warn");
-  return discovered;
 }
 
 function findByCandidates(discovered, candidateNames) {

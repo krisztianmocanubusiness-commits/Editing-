@@ -1,6 +1,7 @@
 import { clear, el } from "./components/dom.js";
 import { store } from "../state/store.js";
 import { renderSmokeTestPanel } from "./smokeTestPanel.js";
+import { renderTemplateInspectorPanel } from "./templateInspectorPanel.js";
 import { renderTranscriptPanel } from "./transcriptPanel.js";
 import { renderRangePanel } from "./rangePanel.js";
 import { renderChunkListPanel } from "./chunkListPanel.js";
@@ -25,6 +26,7 @@ function renderAll() {
   }
 
   root.appendChild(renderSmokeTestPanel(renderAll));
+  root.appendChild(renderTemplateInspectorPanel(renderAll));
   root.appendChild(renderTranscriptPanel(renderAll));
   root.appendChild(renderRangePanel(renderAll));
   root.appendChild(renderChunkListPanel(renderAll));

@@ -42,9 +42,11 @@ transcript file / clip transcript
 4. Author (or license) at least one `.mogrt` matching
    **[`mogrt-contracts/KERIS_CAPTION_V1.md`](mogrt-contracts/KERIS_CAPTION_V1.md)**
    — the first real, buildable contract this extension ships against (10
-   required exposed params). Point a preset at it via **"Choose .mogrt…"**
-   in the panel, or import one of the four ready-made presets in
-   `mogrt-contracts/presets/` and just fill in its `mogrt.path`.
+   required exposed params). Use the panel's **"1. Template Inspector"**
+   to check it and save it as your active template (see
+   `docs/TEMPLATE_INSPECTOR.md`), or import one of the four ready-made
+   presets in `mogrt-contracts/presets/` and fill in its `mogrt.path`
+   directly.
 
 ## Validate the host connection first
 
@@ -59,30 +61,41 @@ read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
 
 ## Using the panel
 
-1. **Transcript** — pull the transcript already attached to the selected
+0. **Host smoke test** — see above; confirms the Premiere connection works
+   at all before anything else.
+1. **Template Inspector** — pick a `.mogrt`, inspect it against
+   `KERIS_CAPTION_V1` (COMPLIANT/NOT COMPLIANT, missing required params,
+   extra params, detected contract), and **Save as active template**. This
+   is what section 6's apply step uses by default — see
+   **[`docs/TEMPLATE_INSPECTOR.md`](docs/TEMPLATE_INSPECTOR.md)**.
+2. **Transcript** — pull the transcript already attached to the selected
    clip (via Premiere's own Transcript feature), or import a `.srt`, `.vtt`,
    plain `.txt` script, or a Whisper-style word-timed `.json`
    (`sample-data/` has one of each to try the pipeline with).
-2. **Timeline range & track** — read the sequence's current in/out points
+3. **Timeline range & track** — read the sequence's current in/out points
    (or the full sequence if none are set) and pick a target video track.
    Track *creation* isn't something this extension does automatically
    (see Limitations); use an existing, ideally empty, track above your
    footage.
-3. **Split into timed caption chunks** — tune max characters/words per
+4. **Split into timed caption chunks** — tune max characters/words per
    chunk, max/min duration, and the pause-gap that forces a break, then
    **Regenerate captions**. Each chunk is independently editable: fix text,
    toggle emphasis, re-run keyword detection, or exclude a chunk entirely.
-4. **Style preset** — start from a built-in preset (Bold Pop, Neon Gradient,
+5. **Style preset** — start from a built-in preset (Bold Pop, Neon Gradient,
    Minimal Clean, Karaoke Line) or your own, and edit every dimension: font
    family/size/weight/italic, fill colour + gradient, background box, safe-
    margin position, tracking, shadow, blur, entrance/exit animation style +
    duration, and emphasis colour/scale/weight. The canvas above updates
    live so you can approve or keep adjusting before anything touches the
    timeline. Presets can be exported/imported as JSON to share across
-   projects.
-5. **Approve & apply** — once you're happy, apply. Each included chunk
-   becomes its own `.mogrt` instance, trimmed to that chunk's exact time
-   range, styled from the preset. The log at the bottom reports per-chunk
+   projects. A preset's own `.mogrt` (if set) always wins over the active
+   template; leave it unset to use whatever's active.
+6. **Approve & apply** — once you're happy, apply. Each included chunk
+   becomes its own `.mogrt` instance (the preset's own template, or the
+   active template from step 1 if the preset doesn't have one — see
+   `docs/TEMPLATE_INSPECTOR.md`), trimmed to that chunk's exact time range,
+   styled from the preset. If neither is set, Apply is disabled with an
+   explanation of what to do. The log at the bottom reports per-chunk
    success/failure and flags any preset field that had no matching exposed
    parameter on the chosen template.
 
@@ -96,30 +109,40 @@ read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
   (`library.js`), validation/clamping (`validate.js`), the mapping layer
   that resolves preset fields to named Essential Graphics parameters
   (`mogrtContract.js`), the contract-compliance checker
-  (`contractValidation.js`), and the named-contract registry
-  (`contracts/` — currently just `KERIS_CAPTION_V1`).
+  (`contractValidation.js`), the named-contract registry (`contracts/` —
+  currently just `KERIS_CAPTION_V1`), and the active-template fallback
+  used at apply-time (`effectiveMogrt.js`).
 - `mogrt-contracts/` — `KERIS_CAPTION_V1.md`, the first concrete,
   smoke-test-validated contract (10 required params), plus four ready-to-
   import example presets built for it in `mogrt-contracts/presets/`.
 - `src/ppro/` — everything that actually talks to Premiere: project/sequence
   access, timeline range read/write, `.mogrt` insertion, component-parameter
-  get/set/keyframe, the `applyCaptions.js` orchestrator, and
-  `smokeTest.js` (the isolated host-validation pass, see below).
-- `src/ui/` — vanilla-JS panel views plus the canvas-based style preview and
-  `smokeTestPanel.js`.
-- `src/state/store.js` — a ~20-line observable store; no framework.
+  get/set/keyframe, the `applyCaptions.js` orchestrator, the shared
+  component-discovery walk (`introspect.js`), the host-validation pass
+  (`smokeTest.js`), and the read-then-clean-up template inspection flow
+  (`templateInspector.js`).
+- `src/ui/` — vanilla-JS panel views plus the canvas-based style preview,
+  `smokeTestPanel.js`, and `templateInspectorPanel.js`.
+- `src/state/store.js` — the observable store; no framework. `settings.js`
+  persists the "active template" (path + contract id) across panel
+  restarts via `localStorage`, with an in-memory fallback if that's not
+  available in a given UXP host version.
 - `mogrt-authoring/` — the spec for building templates this extension can
   drive, and everything unconfirmed about the live scripting API.
 - `docs/PREMIERE_HOST_TEST.md` — manual, in-Premiere validation steps for
   the smoke test panel, including expected log output and a failure triage
   table.
+- `docs/TEMPLATE_INSPECTOR.md` — the Template Inspector workflow: how
+  inspection works, what "active template" means and where it's stored,
+  and how the apply step resolves which `.mogrt` to use.
 - `test/` — pure-logic unit tests (`node --test`), covering chunking,
-  keyword scoring, all transcript parsers, preset flattening, and the
+  keyword scoring, all transcript parsers, preset flattening, the
   `KERIS_CAPTION_V1` contract (including that its markdown spec and JS
   definition haven't drifted apart, and that all four example presets
-  resolve correctly against it). These run without Premiere; the
-  `src/ppro/*` scripting layer cannot be unit-tested outside a live host —
-  that's what the smoke test panel and `docs/PREMIERE_HOST_TEST.md` are for.
+  resolve correctly against it), settings persistence, and the active-
+  template fallback. These run without Premiere; the `src/ppro/*`
+  scripting layer cannot be unit-tested outside a live host — that's what
+  the smoke test panel, Template Inspector, and their docs are for.
 
 ## Running the tests
 
@@ -172,3 +195,9 @@ flagged as unconfirmed rather than guessed silently:
 - **Track creation isn't automated.** Point the panel at an existing
   (ideally empty) video track; adding a new track programmatically wasn't
   part of the confirmed API surface this was built against.
+- **`localStorage` availability in a UXP panel is assumed, not confirmed.**
+  `src/state/settings.js` (the "active template" persisted by the Template
+  Inspector, see `docs/TEMPLATE_INSPECTOR.md`) uses it and falls back to an
+  in-memory, session-only value with a logged warning if it throws or
+  isn't defined — it won't crash the panel either way, but persistence
+  across restarts isn't guaranteed until confirmed on a real host.

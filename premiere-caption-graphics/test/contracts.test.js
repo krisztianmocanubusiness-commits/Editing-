@@ -4,9 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { KERIS_CAPTION_V1, getContract } from "../src/presets/contracts/index.js";
+import { KERIS_CAPTION_V1, getContract, CONTRACTS } from "../src/presets/contracts/index.js";
 import { resolveParamName, flattenPresetForMogrt } from "../src/presets/mogrtContract.js";
-import { validateAgainstContract, describeCompliance } from "../src/presets/contractValidation.js";
+import { validateAgainstContract, describeCompliance, extraParams, detectContract } from "../src/presets/contractValidation.js";
 import { createDefaultPreset } from "../src/presets/types.js";
 import { makeChunk } from "../src/caption/types.js";
 
@@ -136,4 +136,36 @@ test("beige-background-card.json (the one with backgroundBox enabled) resolves B
   const paramNamesUsed = new Set(flattened.map((i) => i.paramName));
   assert.ok(paramNamesUsed.has("Background Opacity"));
   assert.ok(paramNamesUsed.has("Background Color"));
+});
+
+test("extraParams reports discovered names beyond the contract's required list", () => {
+  const discovered = [...KERIS_CAPTION_V1.requiredParams, "Custom Glow Amount", "Logo Visible"];
+  const extras = extraParams(discovered, KERIS_CAPTION_V1);
+  assert.deepEqual(extras.sort(), ["Custom Glow Amount", "Logo Visible"]);
+});
+
+test("extraParams treats every discovered name as extra when no contract is given", () => {
+  const discovered = ["Text", "Whatever"];
+  assert.deepEqual(extraParams(discovered, null), discovered);
+});
+
+test("detectContract finds an exact match against the registry", () => {
+  const detection = detectContract(KERIS_CAPTION_V1.requiredParams, CONTRACTS);
+  assert.equal(detection.detectedContractId, "KERIS_CAPTION_V1");
+  assert.equal(detection.isExactMatch, true);
+});
+
+test("detectContract reports the closest partial match when nothing is fully compliant", () => {
+  const partial = KERIS_CAPTION_V1.requiredParams.slice(0, 4); // 4 of 10
+  const detection = detectContract(partial, CONTRACTS);
+  assert.equal(detection.detectedContractId, null);
+  assert.equal(detection.isExactMatch, false);
+  assert.equal(detection.bestGuessContractId, "KERIS_CAPTION_V1");
+});
+
+test("detectContract handles an empty registry without throwing", () => {
+  const detection = detectContract(["Text"], {});
+  assert.equal(detection.detectedContractId, null);
+  assert.equal(detection.bestGuessContractId, null);
+  assert.deepEqual(detection.evaluations, []);
 });

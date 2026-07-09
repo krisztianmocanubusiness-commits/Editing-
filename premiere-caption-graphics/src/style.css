@@ -102,3 +102,6 @@ input[type="range"] { width: 100%; }
 .banner-warn { background: #4a3a17; border: 1px solid #6b551f; color: #e8d8a8; }
 
 .panel-smoke-test { border-color: var(--accent); border-width: 2px; }
+.panel-template-inspector { border-color: var(--accent); border-width: 2px; }
+.inspector-results { margin: 6px 0; padding: 6px 8px; background: #1b1b1b; border: 1px solid var(--panel-border); border-radius: 4px; }
+.inspector-results .status-line { margin: 2px 0; }

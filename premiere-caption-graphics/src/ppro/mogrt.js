@@ -107,3 +107,31 @@ export async function findExposedParams(trackItem, displayNames) {
   }
   return { found, missing };
 }
+
+/**
+ * Remove a track item via ripple delete, following the exact confirmed
+ * pattern from Adobe's sample (sequenceEditor.ts `removeSelectedTrackItems`):
+ * build a selection containing just this item, then
+ * `SequenceEditor.createRemoveItemsAction`. Used by the Template Inspector
+ * to clean up the temporary clip it inserts to read a .mogrt's exposed
+ * params, so inspecting a template doesn't leave clutter on the timeline.
+ *
+ * @param {import("@adobe/premierepro").Project} project
+ * @param {import("@adobe/premierepro").Sequence} sequence
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ */
+export async function removeTrackItem(project, sequence, trackItem) {
+  const ppro = getPpro();
+  const sequenceEditor = ppro.SequenceEditor.getEditor(sequence);
+  const selection = await sequence.getSelection();
+  selection.addItem(trackItem, false);
+
+  let success = false;
+  project.lockedAccess(() => {
+    success = project.executeTransaction((compoundAction) => {
+      const removeAction = sequenceEditor.createRemoveItemsAction(selection, true, ppro.Constants.MediaType.VIDEO);
+      compoundAction.addAction(removeAction);
+    }, "Remove temporary inspection clip");
+  });
+  return success;
+}

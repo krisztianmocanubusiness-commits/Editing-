@@ -79,7 +79,7 @@ export function renderTranscriptPanel(onChange) {
   });
 
   return el("section", { class: "panel" }, [
-    el("h2", { text: "1. Transcript" }),
+    el("h2", { text: "2. Transcript" }),
     el("div", { class: "row" }, [clipBtn, fileBtn]),
     el("div", { class: "status-line", text: state.transcriptLabel }),
   ]);

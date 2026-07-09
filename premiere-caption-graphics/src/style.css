@@ -100,3 +100,5 @@ input[type="range"] { width: 100%; }
 
 .banner { padding: 8px 10px; margin: 10px 12px; border-radius: 6px; font-size: 11px; }
 .banner-warn { background: #4a3a17; border: 1px solid #6b551f; color: #e8d8a8; }
+
+.panel-smoke-test { border-color: var(--accent); border-width: 2px; }

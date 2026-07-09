@@ -43,4 +43,15 @@ export const store = createStore({
   activePreset: clonePreset(BUILT_IN_PRESETS[0]),
 
   applying: false,
+
+  smokeTest: {
+    mogrtPath: "",
+    text: "Smoke Test Caption",
+    fontSize: 72,
+    fillColor: "#FFFFFF",
+    positionX: 960,
+    positionY: 980,
+    running: false,
+    lastResult: null, // "pass" | "fail" | "partial" | null
+  },
 });

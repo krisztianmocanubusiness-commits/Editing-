@@ -44,6 +44,15 @@ transcript file / clip transcript
    minimum viable template spec. Point a preset at it via **"Choose
    .mogrt…"** in the panel.
 
+## Validate the host connection first
+
+Before trusting the full pipeline, run the panel's **"0. Host smoke test"**
+section: it inserts one `.mogrt`, sets text/font size/fill colour/position/
+duration on it, and logs every step's real success/failure to both the
+panel and the UXP Developer Tool console — no assumptions, no silent
+fallbacks. Full step-by-step instructions and how to read the output:
+**[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
+
 ## Using the panel
 
 1. **Transcript** — pull the transcript already attached to the selected
@@ -85,16 +94,21 @@ transcript file / clip transcript
   (`mogrtContract.js`).
 - `src/ppro/` — everything that actually talks to Premiere: project/sequence
   access, timeline range read/write, `.mogrt` insertion, component-parameter
-  get/set/keyframe, and the `applyCaptions.js` orchestrator.
-- `src/ui/` — vanilla-JS panel views plus the canvas-based style preview.
+  get/set/keyframe, the `applyCaptions.js` orchestrator, and
+  `smokeTest.js` (the isolated host-validation pass, see below).
+- `src/ui/` — vanilla-JS panel views plus the canvas-based style preview and
+  `smokeTestPanel.js`.
 - `src/state/store.js` — a ~20-line observable store; no framework.
 - `mogrt-authoring/` — the spec for building templates this extension can
   drive, and everything unconfirmed about the live scripting API.
+- `docs/PREMIERE_HOST_TEST.md` — manual, in-Premiere validation steps for
+  the smoke test panel, including expected log output and a failure triage
+  table.
 - `test/` — pure-logic unit tests (`node --test`), covering chunking,
   keyword scoring, all transcript parsers, and preset flattening. These run
   without Premiere; the `src/ppro/*` scripting layer cannot be
-  unit-tested outside a live host and should be smoke-tested in Premiere
-  directly.
+  unit-tested outside a live host — that's what the smoke test panel and
+  `docs/PREMIERE_HOST_TEST.md` are for.
 
 ## Running the tests
 
@@ -123,18 +137,27 @@ flagged as unconfirmed rather than guessed silently:
   captions don't support gradients/box/shadow/blur/custom animation the way
   a `.mogrt` graphic clip does. `sequence.getCaptionTrackCount()` is still
   used read-only for track enumeration.
-- **Two call shapes are unconfirmed against a live host**, both isolated to
-  single functions so they're a one-line fix if wrong:
+- **Several call shapes are unconfirmed against a live host**, each isolated
+  to a single function and now directly testable via the smoke test panel
+  (`src/ppro/smokeTest.js`) rather than just asserted in a comment:
   - Setting a **Source Text** string param and a **Color** param via
     `ComponentParam.createSetValueAction` (`src/ppro/componentParams.js`) —
     Adobe's public sample only demonstrates this call shape for a numeric
     param.
+  - A **Position** param's value shape (single Point control vs split X/Y
+    sliders vs `{horiz, vert}`) — the smoke test tries three encodings in
+    order and reports which one (if any) actually worked.
   - Enumerating a track item's exposed components/params — no explicit
     "count" method appears in the public sample, so `src/ppro/mogrt.js`
-    scans defensively up to a bound instead of an exact count.
+    and `smokeTest.js` scan defensively up to a bound instead of an exact
+    count.
   - A timeline-start getter on track items (`getStartTime`/`getStart`,
     tried in that order in `src/ppro/transcriptBridge.js`) — used only by
     the "from clip transcript" import path.
+  - A playhead/CTI getter on `Sequence` (`getPlayerPosition`/
+    `getPlayheadPosition`/`getCurrentTime`, tried in that order in
+    `smokeTest.js`) — falls back to the selected range's start time if
+    none exist on your host.
 - **Track creation isn't automated.** Point the panel at an existing
   (ideally empty) video track; adding a new track programmatically wasn't
   part of the confirmed API surface this was built against.

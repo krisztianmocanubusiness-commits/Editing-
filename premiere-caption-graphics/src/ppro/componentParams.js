@@ -18,7 +18,7 @@ export function hexToColorObject(hex) {
   };
 }
 
-function coerceValue(kind, value) {
+export function coerceValue(kind, value) {
   switch (kind) {
     case "bool":
       return value ? 1 : 0;
@@ -53,12 +53,18 @@ function coerceValue(kind, value) {
 export function setParamValue(project, param, kind, value) {
   const coerced = coerceValue(kind, value);
   let success = false;
-  project.lockedAccess(() => {
-    success = project.executeTransaction((compoundAction) => {
-      const keyframe = param.createKeyframe(coerced);
-      compoundAction.addAction(param.createSetValueAction(keyframe, true));
-    }, `Set ${param.displayName ?? "param"}`);
-  });
+  try {
+    project.lockedAccess(() => {
+      success = project.executeTransaction((compoundAction) => {
+        const keyframe = param.createKeyframe(coerced);
+        compoundAction.addAction(param.createSetValueAction(keyframe, true));
+      }, `Set ${param.displayName ?? "param"}`);
+    });
+  } catch (err) {
+    // Re-throw with the param name attached so callers logging the error
+    // (see src/ppro/smokeTest.js) don't have to guess which param blew up.
+    throw new Error(`setParamValue(${param.displayName ?? "param"}, ${kind}) failed: ${err.message || err}`);
+  }
   return success;
 }
 

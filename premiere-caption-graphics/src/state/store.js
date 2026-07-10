@@ -8,14 +8,25 @@ import { loadActiveTemplate } from "./settings.js";
  * plain callbacks re-run on every `set`. The panel is small enough that a
  * full render-on-any-change pass is cheap and easy to reason about.
  */
-function createStore(initialState) {
+export function createStore(initialState) {
   let state = initialState;
   const listeners = new Set();
 
   return {
     getState: () => state,
+    // `patch` may be a plain object OR an updater function — either way it
+    // is treated as a *partial* update and merged into existing state, the
+    // same as the object form. It must never replace state wholesale: every
+    // call site in src/ui/ (smokeTestPanel.js, templateInspectorPanel.js,
+    // chunkListPanel.js, presetPanel.js) calls `store.set((s) => ({ someKey:
+    // {...} }))` expecting only `someKey` to change — anything else returned
+    // by `patch` at the top level is merged in, not swapped in for the rest
+    // of the store. (Previously `patch(state)`'s return value replaced
+    // `state` outright, silently deleting every other top-level key on the
+    // very next function-form set() call — see test/store.test.js.)
     set(patch) {
-      state = typeof patch === "function" ? patch(state) : { ...state, ...patch };
+      const partial = typeof patch === "function" ? patch(state) : patch;
+      state = { ...state, ...partial };
       listeners.forEach((fn) => fn(state));
     },
     subscribe(fn) {

@@ -17,7 +17,8 @@
  */
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
-import { safe, safeAsync, safeResolve, resolveHostValue, toSafeString, describeValue } from "./introspect.js";
+import { safe, safeAsync, safeResolve, resolveHostValue, toSafeString } from "./introspect.js";
+import { summarizeHostValue, formatSummaryForLog, probeHostObject } from "./deepProbe.js";
 
 const MAX_COMPONENT_SCAN = 64;
 const MAX_PARAM_SCAN = 64;
@@ -44,13 +45,44 @@ const INTRINSIC_COMPONENT_NAMES = new Set([
   "volume",
 ]);
 
-// Loose signals that a component is the MOGRT/graphic itself (or an
-// After-Effects-authored property group inside one), gathered from Adobe
-// forum threads discussing `matchName`s like "AE.ADBE Text" on MOGRT
-// components (see docs/MOGRT_DIAGNOSTIC.md's research notes) — NOT confirmed
-// against this project's own host output, since no such component has been
-// observed yet as of this diagnostic tool's introduction.
-const GRAPHIC_NAME_SIGNALS = ["graphic", "mogrt", "essential graphics", "ae.adbe", "video/graphic"];
+// AE.ADBE-prefixed matchNames (and, on some hosts, displayNames — see
+// below) for the SAME standard/intrinsic components as
+// INTRINSIC_COMPONENT_NAMES above. Confirmed by a real Diagnostic Inspector
+// run against a Premiere-native (no After Effects) MOGRT on Premiere Pro
+// 26.3, which reported exactly these three components:
+// "AE.ADBE Opacity", "AE.ADBE Motion", "AE.ADBE Graphic Group". Premiere
+// Graphics clips are apparently represented internally via AE-style
+// matchNames even when authored without After Effects — so a bare
+// "ae.adbe" substring is NOT a reliable "this is custom MOGRT content"
+// signal (an earlier version of this classifier used it as one, which
+// misclassified all three of the above as "graphic-or-mogrt" — i.e.
+// reported the scan as having found real controls when it hadn't).
+// "AE.ADBE Graphic Group" specifically is the wrapper/container for
+// whatever custom content the graphic has — intrinsic to every graphic
+// clip the same way Motion/Opacity are intrinsic to every clip, not itself
+// a discovered custom control. If the graphic exposes real editable
+// controls, they must be reachable *inside* this group or via a different
+// route entirely — see the raw probe in diagnoseMogrt()/docs/MOGRT_DIAGNOSTIC.md.
+const INTRINSIC_MATCH_NAMES = new Set([
+  "ae.adbe opacity",
+  "ae.adbe motion",
+  "ae.adbe transform",
+  "ae.adbe time remapping",
+  "ae.adbe crop",
+  "ae.adbe channel volume",
+  "ae.adbe graphic group",
+]);
+
+// Narrow, specific signals that a component is genuinely the MOGRT's own
+// editable content — deliberately NOT including a bare "ae.adbe" (see
+// INTRINSIC_MATCH_NAMES comment above for why that was wrong). "text" is
+// kept because Adobe forum threads specifically describe locating an
+// After-Effects-authored MOGRT's Source Text control via a matchName
+// containing "AE.ADBE Text" (see docs/MOGRT_DIAGNOSTIC.md's research
+// notes) — not confirmed against this project's own host output yet, since
+// no such component has been observed so far, but specific enough to be
+// worth flagging rather than silently grouping with "effect-or-unknown".
+const GRAPHIC_NAME_SIGNALS = ["mogrt", "essential graphics", "video/graphic", "text", "graphic"];
 
 // Safe string-or-empty lowercasing: NEVER calls a string method on
 // anything that isn't already a plain string, so a caller passing through
@@ -73,8 +105,11 @@ export function classifyComponent({ displayName, matchName }) {
   const name = safeLower(displayName);
   const match = safeLower(matchName);
 
-  if (INTRINSIC_COMPONENT_NAMES.has(name)) {
-    return { classification: "intrinsic", reason: `display name "${displayName}" matches a known intrinsic component` };
+  if (INTRINSIC_COMPONENT_NAMES.has(name) || INTRINSIC_COMPONENT_NAMES.has(match)) {
+    return { classification: "intrinsic", reason: `display name/matchName exactly matches a known intrinsic component name` };
+  }
+  if (INTRINSIC_MATCH_NAMES.has(match) || INTRINSIC_MATCH_NAMES.has(name)) {
+    return { classification: "intrinsic", reason: `display name/matchName "${matchName || displayName}" is a known AE.ADBE-prefixed intrinsic component` };
   }
 
   const signalHit = GRAPHIC_NAME_SIGNALS.find((sig) => name.includes(sig) || match.includes(sig));
@@ -225,16 +260,17 @@ export async function deepDumpComponentChain(trackItem, log) {
       const resolvedValue = startValue.ok
         ? await resolveHostValue(startValue.value, undefined, { log, label: `component[${ci}].param[${pi}].value` })
         : undefined;
-      const valueTypeofName = startValue.ok ? typeof resolvedValue : "unreadable";
-      const valueStr = startValue.ok
-        ? describeValue(resolvedValue)
-        : `unreadable (${startValue.error.message || startValue.error})`;
+      // summarizeHostValue() (not JSON.stringify) is what fixes "value: {}":
+      // UXP native-bridge objects apparently expose their real data through
+      // non-enumerable getters, which JSON.stringify silently sees nothing
+      // in — see docs/MOGRT_DIAGNOSTIC.md and src/ppro/deepProbe.js.
+      const valueSummary = startValue.ok ? summarizeHostValue(resolvedValue) : { kind: "unreadable", error: String(startValue.error.message || startValue.error) };
       const isTextLike = textLikeSignal(paramDisplayName, paramMatchNameResult.value);
 
       log(
         `  Param ${pi}: displayName="${paramDisplayName ?? "n/a"}", matchName=${paramMatchNameResult.value ?? "n/a"}` +
           `${paramMatchNameResult.source ? ` (via ${paramMatchNameResult.source})` : ""}, type=${paramType}, ` +
-          `valueType=${valueTypeofName}, currentValue=${valueStr}${isTextLike ? " — TEXT-LIKE NAME" : ""}`,
+          `value=${formatSummaryForLog(valueSummary)}${isTextLike ? " — TEXT-LIKE NAME" : ""}`,
         "info"
       );
 
@@ -244,9 +280,7 @@ export async function deepDumpComponentChain(trackItem, log) {
         matchName: paramMatchNameResult.value,
         matchNameSource: paramMatchNameResult.source,
         type: paramType,
-        valueTypeofName,
-        value: startValue.ok ? resolvedValue : null,
-        valueReadError: startValue.ok ? null : String(startValue.error.message || startValue.error),
+        value: valueSummary,
         textLikeSignal: isTextLike,
       });
     }
@@ -274,6 +308,129 @@ export async function deepDumpComponentChain(trackItem, log) {
   );
 
   return { trackItem: trackItemInfo, components, scanStoppedEarly: false };
+}
+
+/**
+ * Best-effort "does this track item have an associated project item"
+ * reader — tries a property first, then a getter method, same async-safe
+ * pattern as readMatchName()/readDisplayName(). Neither accessor name is
+ * confirmed against official Adobe docs (both blocked from this
+ * environment — see docs/MOGRT_DIAGNOSTIC.md); this tries the two most
+ * plausible shapes rather than assuming either.
+ *
+ * @param {*} trackItem
+ * @param {(message: string, level?: string) => void} [log]
+ */
+async function resolveProjectItem(trackItem, log) {
+  const attempts = [
+    { source: "projectItem (property)", fn: () => trackItem.projectItem },
+    { source: "getProjectItem() (method)", fn: () => (typeof trackItem.getProjectItem === "function" ? trackItem.getProjectItem() : undefined) },
+  ];
+  for (const attempt of attempts) {
+    const result = await safeResolve(attempt.fn, { log, label: `trackItem.${attempt.source}` });
+    if (result.ok && result.value !== undefined && result.value !== null) {
+      return { value: result.value, source: attempt.source };
+    }
+  }
+  return { value: null, source: null };
+}
+
+/**
+ * The deeper raw probe: inspects the real shape (Object.keys,
+ * Object.getOwnPropertyNames, prototype method/property names, constructor,
+ * safely-called zero-arg getters) of the track item, its associated project
+ * item (if any accessor for one is found), every component, every param,
+ * and the resolved objects from both `param.getStartValue()` and
+ * `param.getValue()` (feature-detected — `getValue` is not used anywhere
+ * else in this codebase and its existence is unconfirmed, per the task that
+ * asked for this probe). This is deliberately separate from
+ * deepDumpComponentChain()'s classification-focused walk: it re-walks the
+ * same chain, but everything it records is unconditional — classification
+ * never gates what gets probed, since the whole point is finding controls
+ * the classifier doesn't recognize.
+ *
+ * Returns a plain, JSON-safe object (see src/ppro/deepProbe.js — every
+ * probe result is a summary, never a raw host reference), meant to be
+ * saved to its own file rather than folded into the same JSON as the
+ * classification report (which stays comparatively compact for quick
+ * reading).
+ *
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {(message: string, level?: string) => void} log
+ */
+export async function deepProbeMogrt(trackItem, log) {
+  log("Diagnostic: running deeper raw host-object probe (trackItem, projectItem, every component/param, resolved values)…", "info");
+
+  const trackItemProbe = await probeHostObject(trackItem, "trackItem", log);
+
+  const projectItemResult = await resolveProjectItem(trackItem, log);
+  const projectItemProbe = projectItemResult.value
+    ? { ...(await probeHostObject(projectItemResult.value, "trackItem.projectItem", log)), accessorSource: projectItemResult.source }
+    : { label: "trackItem.projectItem", exists: false, accessorSource: null };
+  log(
+    projectItemResult.value
+      ? `Raw probe: found an associated project item via ${projectItemResult.source}.`
+      : "Raw probe: no associated project item found via either tried accessor.",
+    projectItemResult.value ? "success" : "warn"
+  );
+
+  const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain() (raw probe)" });
+  const components = [];
+  if (chainResult.ok && chainResult.value) {
+    const chain = chainResult.value;
+    let consecutiveMisses = 0;
+    for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
+      const componentResult = await safeResolve(() => chain.getComponentAtIndex(ci), { log, label: `component[${ci}] (raw probe)` });
+      if (!componentResult.ok || !componentResult.value) {
+        consecutiveMisses += 1;
+        if (consecutiveMisses >= CONSECUTIVE_MISS_TOLERANCE) break;
+        continue;
+      }
+      consecutiveMisses = 0;
+      const component = componentResult.value;
+      const componentProbe = await probeHostObject(component, `component[${ci}]`, log);
+
+      const params = [];
+      let paramMisses = 0;
+      for (let pi = 0; pi < MAX_PARAM_SCAN; pi++) {
+        const paramResult = await safeResolve(() => component.getParam(pi), { log, label: `component[${ci}].param[${pi}] (raw probe)` });
+        if (!paramResult.ok || !paramResult.value) {
+          paramMisses += 1;
+          if (paramMisses >= 1) break;
+          continue;
+        }
+        const param = paramResult.value;
+        const paramProbe = await probeHostObject(param, `component[${ci}].param[${pi}]`, log);
+
+        const startValueResult = await safeResolve(() => param.getStartValue(), { log, label: `component[${ci}].param[${pi}].getStartValue()` });
+        const startValueProbe = startValueResult.ok
+          ? await probeHostObject(startValueResult.value, `component[${ci}].param[${pi}].getStartValue()`, log)
+          : { label: `component[${ci}].param[${pi}].getStartValue()`, exists: false, error: String(startValueResult.error.message || startValueResult.error) };
+
+        // `getValue` is not used anywhere else in this codebase — its
+        // existence on ComponentParam is unconfirmed. Feature-detected,
+        // never assumed.
+        let getValueProbe = { label: `component[${ci}].param[${pi}].getValue()`, exists: false, note: "getValue is not a function on this param" };
+        if (typeof param.getValue === "function") {
+          const getValueResult = await safeResolve(() => param.getValue(), { log, label: `component[${ci}].param[${pi}].getValue()` });
+          getValueProbe = getValueResult.ok
+            ? await probeHostObject(getValueResult.value, `component[${ci}].param[${pi}].getValue()`, log)
+            : { label: `component[${ci}].param[${pi}].getValue()`, exists: false, error: String(getValueResult.error.message || getValueResult.error) };
+        }
+
+        params.push({ paramIndex: pi, probe: paramProbe, startValueProbe, getValueProbe });
+      }
+
+      components.push({ componentIndex: ci, probe: componentProbe, params });
+    }
+  }
+
+  log(
+    `Raw probe complete: ${components.length} component(s) probed, ${components.reduce((sum, c) => sum + c.params.length, 0)} param(s) probed in depth.`,
+    "success"
+  );
+
+  return { trackItemProbe, projectItemProbe, components };
 }
 
 /**
@@ -366,15 +523,21 @@ export async function diagnoseMogrt(opts) {
   const trackItem = insertResult.value;
   log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
 
-  // Cleanup is guaranteed even if the scan itself throws unexpectedly —
-  // see runScanWithGuaranteedCleanup()'s doc comment for the failure mode
-  // this fixes.
+  // Cleanup is guaranteed even if either scan throws unexpectedly — see
+  // runScanWithGuaranteedCleanup()'s doc comment for the failure mode this
+  // fixes. Both the classification scan and the deeper raw probe run
+  // against the same single inserted clip, so there's only one insert/
+  // cleanup cycle regardless of how much probing happens.
   const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
-    () => deepDumpComponentChain(trackItem, log),
+    async () => {
+      const componentReport = await deepDumpComponentChain(trackItem, log);
+      const rawProbe = await deepProbeMogrt(trackItem, log);
+      return { ...componentReport, rawProbe };
+    },
     () => safeAsync(() => removeTrackItem(project, sequence, trackItem)),
     log
   );
-  const report = scanReport ?? { trackItem: null, components: [], scanStoppedEarly: true };
+  const report = scanReport ?? { trackItem: null, components: [], scanStoppedEarly: true, rawProbe: null };
 
   if (cleanupResult.ok && cleanupResult.value) {
     log("Removed temporary inspection clip.", "info");

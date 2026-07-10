@@ -106,14 +106,17 @@ Inspector panel section — that:
    elsewhere in this codebase), and whether its name contains a
    text-related signal.
 3. Classifies each component as one of:
-   - **`intrinsic`** — display name is an exact, case-insensitive match
-     against a small known set (`Motion`, `Opacity`, `Time Remapping`,
-     `Crop`, `Channel Volume`, `Volume`) built from what's actually been
-     observed on ordinary clips, not an official Adobe list (none was
-     found).
-   - **`graphic-or-mogrt`** — name or matchName contains a loose signal
-     (`graphic`, `mogrt`, `essential graphics`, `ae.adbe`,
-     `video/graphic`).
+   - **`intrinsic`** — display name/matchName is an exact,
+     case-insensitive match against a small known set: the plain names
+     (`Motion`, `Opacity`, `Time Remapping`, `Crop`, `Channel Volume`,
+     `Volume`) **and** their `AE.ADBE`-prefixed matchName forms
+     (`AE.ADBE Opacity`, `AE.ADBE Motion`, `AE.ADBE Transform`,
+     `AE.ADBE Time Remapping`, `AE.ADBE Crop`, `AE.ADBE Channel Volume`,
+     `AE.ADBE Graphic Group`) — see "First real host run" below for why
+     both forms are needed.
+   - **`graphic-or-mogrt`** — name or matchName contains a *specific*
+     signal (`graphic`, `mogrt`, `essential graphics`, `video/graphic`,
+     `text`) — deliberately NOT a bare `ae.adbe` (see below).
    - **`effect-or-unknown`** — neither of the above. This is the
      "needs a human to look at it" bucket, deliberately not auto-resolved
      — it could be a user-applied effect, or it could be an
@@ -132,25 +135,99 @@ Inspector panel section — that:
 This makes no claim about what the *next* diagnostic run will find — that's
 the point of running it against a real host.
 
-### What to do with the output
+## First real host run: classification was wrong, and values still weren't readable
 
-Run **"Run Diagnostic Inspector"** against:
+[CONFIRMED — real Premiere Pro 26.3 host, a native (no After Effects)
+"Keris Master Caption.mogrt"] The Diagnostic Inspector ran successfully
+(insert → scan → cleanup all completed, `cleanupOk: true`) and settled part
+of the open question above, but also exposed two problems in the tool
+itself:
 
-1. The same Hello World MOGRT as before, **after** actually checking
-   "Expose"/enabling scripting access on some property in Premiere's
-   Properties panel or Graphics Templates panel for at least one control
-   (text, a color, anything) — if the earlier NOT COMPLIANT run happened
-   before any property was exposed at all, finding nothing beyond
-   intrinsic components would be the expected, unremarkable result, not
-   evidence of a platform limitation.
-2. Ideally, one After-Effects-authored `.mogrt` with a known exposed
-   `Source Text` control, for comparison — if that one *does* show a
-   `graphic-or-mogrt`-classified component with an `"AE.ADBE Text"`-ish
-   matchName and the Hello World one still doesn't show anything beyond
-   intrinsic components even after exposing a property, that's a strong
-   signal native Premiere Graphics don't surface exposed controls the same
-   way AE-authored MOGRTs do (or at all, via this API).
+1. **The chain has exactly 3 components on this MOGRT**: `AE.ADBE Opacity`,
+   `AE.ADBE Motion`, `AE.ADBE Graphic Group` — i.e. **Premiere Graphics
+   clips DO carry `AE.ADBE`-prefixed matchNames even when authored without
+   After Effects.** This settles the previously-open question of whether
+   that prefix is AE-authoring-specific — it isn't; it's how Premiere
+   represents every graphic clip's standard components internally,
+   regardless of authoring app. The first version of `classifyComponent()`
+   used a bare `"ae.adbe"` substring as its "this is custom MOGRT content"
+   signal, so it misclassified **all three of these standard components**
+   as `graphic-or-mogrt` — i.e. reported the scan as having found real
+   editable controls when it had only found the same three intrinsic
+   pieces every graphic clip has. Fixed: `"ae.adbe"` was removed as a
+   signal entirely; the three exact AE.ADBE-prefixed names above (plus the
+   plain-name forms of the other known intrinsics) are now recognized as
+   `intrinsic` directly. `AE.ADBE Graphic Group` specifically is the
+   wrapper/container for whatever custom content the graphic has — still
+   intrinsic to every graphic clip, not itself a discovered control.
+2. **All 20 params across those 3 components reported `type: "unknown"`
+   and `value: {}`.** The `{}` was `describeValue()`'s `JSON.stringify()`
+   seeing nothing — UXP's native-bridge param/value objects apparently
+   expose their real data through non-enumerable getters/methods, which
+   `JSON.stringify` (only enumerable own properties) can't see at all. This
+   isn't a crash, just an unhelpful, misleadingly-empty-looking result.
+   Fixed: `describeValue()` was replaced with `summarizeHostValue()` (see
+   `src/ppro/deepProbe.js`), which reads `Object.getOwnPropertyNames()` (not
+   `Object.keys()`/`JSON.stringify`) and reports actual readable primitive
+   fields plus a best-effort shape guess (point/color/text-document/
+   collection/other), instead of an empty-looking `{}`.
 
-Whatever it finds, paste/share the JSON — that's the ground truth the
+Whether `AE.ADBE Graphic Group`'s 20 params are themselves the route to the
+MOGRT's real editable controls (e.g. as nested property groups, each
+needing its OWN component-chain-style walk) or whether they're something
+else entirely is **still not settled** — this is exactly why the deeper raw
+probe below was added, rather than guessing further from outside a real
+host.
+
+## Deeper raw probe (`deepProbeMogrt()` / "Save raw probe JSON…")
+
+Separate from the classification-focused scan above (and run in the same
+insert/cleanup cycle, so there's still only one temporary clip), this walks
+the **track item, its associated project item (tried via a `.projectItem`
+property read, then a `.getProjectItem()` method call — neither name is
+Adobe-confirmed), every component, every param, and the resolved objects
+from both `param.getStartValue()` and `param.getValue()`** (the latter
+feature-detected — `getValue` isn't used anywhere else in this codebase and
+its existence on `ComponentParam` is unconfirmed). For each of those
+objects it safely records, via `src/ppro/deepProbe.js`:
+
+- `Object.keys()` and `Object.getOwnPropertyNames()` (own, not inherited)
+- the prototype chain's property/method names (bounded to 6 levels deep)
+- the constructor name
+- for every own key: whether its raw value was Promise-like, and a
+  best-effort summary of its resolved value (never the raw value itself —
+  everything here is JSON-safe)
+- for every zero-argument, getter-shaped method name (matches
+  `/^(get|is|has)/`, and does **not** contain a state-mutating-sounding verb
+  like `set`/`remove`/`delete`/`create`/`execute`/etc. — see
+  `DANGEROUS_NAME_FRAGMENTS` in `deepProbe.js`) — actually **calls** it and
+  records the result. Every other method name is still listed, just not
+  invoked, so this can never trigger a side-effecting host call.
+
+This is deliberately much more verbose than the classification report, so
+it's saved to its own file (`mogrt-raw-probe.json`, via "Save raw probe
+JSON…") rather than folded into `mogrt-diagnostic.json`.
+
+## Next: run it again
+
+Run **"Run Diagnostic Inspector"** again against the same MOGRT and save
+both JSON files. What to look for in the raw probe:
+
+- Under each of the three components' `params[].probe`/`startValueProbe`/
+  `getValueProbe`, any readable field name that looks like `text`, `size`,
+  `color`/`colour`, `fill`, `stroke`, `position`, or similar — that's the
+  strongest signal of where the real editable controls live, even if
+  `classifyComponent()` still calls the containing component `intrinsic`.
+- Whether `getValue()` exists on any param at all, and if so, whether its
+  resolved shape differs from `getStartValue()`'s.
+- Whether an associated project item was found at all (`projectItemProbe.
+  shape.exists`), and if so, whether ITS method list contains anything
+  graphics/MOGRT/Essential-Graphics-sounding that the track item's own
+  method list doesn't.
+
+Whatever it finds, share both JSON files — that's the ground truth the
 adaptive auto-mapping design (contracts as a fast path + a proposed,
-human-reviewed mapping for anything else) will be built against next.
+human-reviewed mapping for anything else) will be built against next. The
+milestone before that design work resumes is still open: proving at least
+one genuinely custom MOGRT control (ideally the caption text) can be found
+and read.

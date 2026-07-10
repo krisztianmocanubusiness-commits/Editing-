@@ -30,6 +30,43 @@ test("classifyComponent falls back to effect-or-unknown for anything unrecognize
   assert.match(result.reason, /human judgment/);
 });
 
+test("classifyComponent treats AE.ADBE Opacity/Motion/Graphic Group as intrinsic, not as discovered custom controls (real Premiere Pro 26.3 regression)", () => {
+  // Confirmed real-host bug: a Premiere-native "Hello World" MOGRT reported
+  // exactly these three components, and the earlier classifier (which used
+  // a bare "ae.adbe" substring as a "this is custom MOGRT content" signal)
+  // misclassified all three as "graphic-or-mogrt" — i.e. reported the scan
+  // as having found real controls when it had only found the same
+  // intrinsic components every graphic clip has.
+  const cases = [
+    { displayName: "AE.ADBE Opacity", matchName: null },
+    { displayName: null, matchName: "AE.ADBE Opacity" },
+    { displayName: "AE.ADBE Motion", matchName: null },
+    { displayName: null, matchName: "AE.ADBE Motion" },
+    { displayName: "AE.ADBE Graphic Group", matchName: null },
+    { displayName: null, matchName: "AE.ADBE Graphic Group" },
+    { displayName: "Opacity", matchName: "AE.ADBE Opacity" },
+    { displayName: "Motion", matchName: "AE.ADBE Motion" },
+  ];
+  for (const info of cases) {
+    const result = classifyComponent(info);
+    assert.equal(
+      result.classification,
+      "intrinsic",
+      `expected ${JSON.stringify(info)} to classify as intrinsic, got "${result.classification}"`
+    );
+  }
+});
+
+test("classifyComponent still flags a genuinely AE.ADBE-prefixed but otherwise-unrecognized name via a specific signal (text), not the removed blanket ae.adbe signal", () => {
+  // "ae.adbe" alone is no longer a graphic-or-mogrt signal (see the
+  // regression test above for why) — only specific signals like "text"
+  // still flag a component as a possible custom control.
+  assert.equal(classifyComponent({ displayName: null, matchName: "AE.ADBE Text" }).classification, "graphic-or-mogrt");
+  // An AE.ADBE-prefixed name with no specific signal and not in the known
+  // intrinsic list falls through to effect-or-unknown, not graphic-or-mogrt.
+  assert.equal(classifyComponent({ displayName: null, matchName: "AE.ADBE SomeUnknownThing" }).classification, "effect-or-unknown");
+});
+
 test("classifyComponent does not misclassify a param-level name (e.g. Scale) as intrinsic just because it sounds related", () => {
   // "Scale" is a *param* under the "Motion" component in real Premiere usage,
   // not a component name itself — classifyComponent only recognizes exact

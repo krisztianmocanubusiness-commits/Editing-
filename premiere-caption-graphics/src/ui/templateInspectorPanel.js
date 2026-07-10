@@ -118,20 +118,42 @@ async function saveDiagnosticJson() {
   }
   try {
     const uxp = getUxp();
+    // Save the classification report WITHOUT the (much larger) raw probe —
+    // that gets its own file via saveRawProbeJson() below, per
+    // docs/MOGRT_DIAGNOSTIC.md's "two files, two purposes" split.
+    const { rawProbe, ...withoutRawProbe } = lastDiagnostic;
     // @ts-ignore
     const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-diagnostic.json", { types: ["json"] });
     if (!file) return;
-    await file.write(JSON.stringify(lastDiagnostic, null, 2));
+    await file.write(JSON.stringify(withoutRawProbe, null, 2));
     log(`Diagnostic saved to ${file.nativePath}.`, "success");
   } catch (err) {
     log(`Saving diagnostic JSON failed: ${err.message || err}`, "error");
   }
 }
 
+async function saveRawProbeJson() {
+  const { lastDiagnostic } = store.getState().templateInspector;
+  if (!lastDiagnostic || !lastDiagnostic.ok || !lastDiagnostic.rawProbe) {
+    log("Run the Diagnostic Inspector successfully before saving the raw probe.", "error");
+    return;
+  }
+  try {
+    const uxp = getUxp();
+    // @ts-ignore
+    const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-raw-probe.json", { types: ["json"] });
+    if (!file) return;
+    await file.write(JSON.stringify(lastDiagnostic.rawProbe, null, 2));
+    log(`Raw probe saved to ${file.nativePath}.`, "success");
+  } catch (err) {
+    log(`Saving raw probe JSON failed: ${err.message || err}`, "error");
+  }
+}
+
 function diagnosticSummaryBlock(result, diagnosing) {
   if (diagnosing) {
     return el("div", { class: "inspector-results" }, [
-      el("div", { class: "status-line log-info", text: "⏳ Running diagnostic scan — inserting a temporary clip and reading its component chain… see Log below for progress." }),
+      el("div", { class: "status-line log-info", text: "⏳ Running diagnostic scan — inserting a temporary clip, reading its component chain, and running the deeper raw probe… see Log below for progress." }),
     ]);
   }
   if (!result) return null;
@@ -148,11 +170,25 @@ function diagnosticSummaryBlock(result, diagnosing) {
     acc[c.classification] = (acc[c.classification] || 0) + 1;
     return acc;
   }, {});
+  const foundCustomControls = (byClass["graphic-or-mogrt"] ?? 0) > 0;
+
+  // Every component so far classifying as "intrinsic" (or unrecognized)
+  // means nothing that looks like a genuine custom MOGRT control was
+  // found — say so plainly instead of "N graphic-or-mogrt components
+  // found", which read as a success even when it wasn't one. See
+  // docs/MOGRT_DIAGNOSTIC.md.
+  const headline = foundCustomControls
+    ? `${result.components.length} component(s) found: ${byClass.intrinsic ?? 0} intrinsic, ` +
+      `${byClass["graphic-or-mogrt"]} graphic-or-mogrt (possible custom control${byClass["graphic-or-mogrt"] === 1 ? "" : "s"}), ` +
+      `${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.`
+    : `MOGRT inserted, but no custom editable controls were discovered — ${result.components.length} component(s) found, ` +
+      `all intrinsic/standard (${byClass.intrinsic ?? 0} intrinsic, ${byClass["effect-or-unknown"] ?? 0} unrecognized). ` +
+      "See the raw probe (below) for what's actually inside each one.";
+
   return el("div", { class: "inspector-results" }, [
     el("div", {
-      class: "status-line log-success",
-      text: `${result.components.length} component(s) found: ${byClass.intrinsic ?? 0} intrinsic, ` +
-        `${byClass["graphic-or-mogrt"] ?? 0} graphic-or-mogrt, ${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.`,
+      class: `status-line ${foundCustomControls ? "log-success" : "log-warn"}`,
+      text: headline,
     }),
     ...result.components.map((c) =>
       el("div", {
@@ -160,7 +196,7 @@ function diagnosticSummaryBlock(result, diagnosing) {
         text: `  [${c.classification}] "${c.displayName ?? "n/a"}" — ${c.paramCount} param(s)`,
       })
     ),
-    el("div", { class: "status-line", text: "Full detail (every param's name/type/value) is in the Log below and in the saved JSON." }),
+    el("div", { class: "status-line", text: "Component/param detail is in the Log below and the saved diagnostic JSON. For the deeper raw host-object probe (shape/methods of every component, param, and resolved value — use this to find controls the classifier missed), see the saved raw probe JSON." }),
   ]);
 }
 
@@ -215,6 +251,12 @@ export function renderTemplateInspectorPanel(onChange) {
     disabled: !ti.lastDiagnostic || !ti.lastDiagnostic.ok || undefined,
     onClick: () => saveDiagnosticJson(),
   });
+  const saveRawProbeBtn = el("button", {
+    class: "btn",
+    text: "Save raw probe JSON…",
+    disabled: !ti.lastDiagnostic || !ti.lastDiagnostic.ok || !ti.lastDiagnostic.rawProbe || undefined,
+    onClick: () => saveRawProbeJson(),
+  });
 
   return el("section", { class: "panel panel-template-inspector" }, [
     el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
@@ -244,13 +286,16 @@ export function renderTemplateInspectorPanel(onChange) {
       [
         "Dumps the full component/param graph found on this .mogrt with no assumptions about which " +
           "params are meaningful — every component's display name and best-effort match name, classified " +
-          "as intrinsic (Motion/Opacity/Crop/Time Remapping — present on every clip), graphic-or-mogrt " +
-          "(name/matchName suggests it's the template's own content), or effect-or-unknown. Use this to see " +
-          "exactly what Premiere's scripting API can see on a given .mogrt before assuming any param name. " +
-          "See docs/MOGRT_DIAGNOSTIC.md.",
+          "as intrinsic (Motion/Opacity/Crop/Time Remapping, including their AE.ADBE-prefixed forms and the " +
+          "Graphic Group wrapper — all present on every graphic clip, custom or not), graphic-or-mogrt " +
+          "(a specific signal like a text-related name suggests it's the template's own content), or " +
+          "effect-or-unknown. Also runs a deeper raw probe — the real shape (Object.keys, prototype methods, " +
+          "constructor, safely-called zero-arg getters) of the track item, its project item, and every " +
+          "component/param/resolved value — saved as its own JSON, for when nothing classifies as a custom " +
+          "control but the real editable controls must be reachable some other way. See docs/MOGRT_DIAGNOSTIC.md.",
       ]
     ),
-    el("div", { class: "row" }, [diagnosticBtn, saveDiagnosticBtn]),
+    el("div", { class: "row" }, [diagnosticBtn, saveDiagnosticBtn, saveRawProbeBtn]),
     diagnosticSummaryBlock(ti.lastDiagnostic, ti.diagnosing),
   ]);
 }

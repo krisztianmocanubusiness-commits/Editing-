@@ -66,6 +66,7 @@ export const store = createStore({
     running: false,
     lastResult: null, // "pass" | "fail" | "partial" | null
     lastCompliance: null, // result of validateAgainstContract(), or null
+    lastCoreFields: null, // string[] of field names counted toward lastResult, or null
   },
 
   // { path, contractId, compliant, savedAt } | null — see src/state/settings.js.

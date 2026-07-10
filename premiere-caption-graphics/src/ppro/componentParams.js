@@ -69,6 +69,47 @@ export function setParamValue(project, param, kind, value) {
 }
 
 /**
+ * Plausible value shapes for a combined Position (point) control, tried in
+ * order. UNCONFIRMED against a live host — no public Adobe sample
+ * demonstrates a 2D point param's scripted value shape — so every caller
+ * that needs to set one should try all of these rather than assuming the
+ * first is right. Shared (not duplicated) between src/ppro/smokeTest.js's
+ * verbose diagnostic version and setPointParamValue() below, so the two
+ * can't silently drift apart on what "try a Position control" means.
+ */
+export const POINT_VALUE_ENCODINGS = [
+  { label: "array [x, y]", toValue: (x, y) => [x, y] },
+  { label: "object {x, y}", toValue: (x, y) => ({ x, y }) },
+  { label: "object {horiz, vert}", toValue: (x, y) => ({ horiz: x, vert: y }) },
+];
+
+/**
+ * Set a combined Position (point) ComponentParam by trying each of
+ * POINT_VALUE_ENCODINGS in turn, stopping at the first one
+ * setParamValue() doesn't throw or report failure for. Used by the real
+ * apply path (src/ppro/applyCaptions.js) for "point"-kind instructions
+ * from flattenPresetForMogrt() — e.g. KERIS_CAPTION_V1_PPRO's combined
+ * "Position" control (src/presets/contracts/kerisCaptionV1Ppro.js).
+ *
+ * @param {import("@adobe/premierepro").Project} project
+ * @param {import("@adobe/premierepro").ComponentParam} param
+ * @param {number} x
+ * @param {number} y
+ * @returns {{ ok: boolean, encoding?: string }}
+ */
+export function setPointParamValue(project, param, x, y) {
+  for (const encoding of POINT_VALUE_ENCODINGS) {
+    try {
+      const ok = setParamValue(project, param, "raw", encoding.toValue(x, y));
+      if (ok) return { ok: true, encoding: encoding.label };
+    } catch {
+      // Wrong shape for this host — try the next encoding.
+    }
+  }
+  return { ok: false };
+}
+
+/**
  * Add entrance/exit keyframes to a param over the lifetime of one caption
  * chunk, using the time-varying + add-keyframe + interpolation pattern
  * confirmed in Adobe's sample (keyframe.ts `addKeyframe`/`setInterpolation`).

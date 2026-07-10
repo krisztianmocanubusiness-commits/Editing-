@@ -137,8 +137,28 @@ export function flattenPresetForMogrt(preset, chunk) {
     put("bgBoxPaddingY", "number", preset.backgroundBox.paddingY);
   }
 
-  put("positionX", "number", preset.position.offsetX);
-  put("positionY", "number", preset.position.offsetY);
+  // Split "Position X"/"Position Y" (e.g. KERIS_CAPTION_V1, After Effects
+  // templates) vs. one combined "Position" point control (e.g.
+  // KERIS_CAPTION_V1_PPRO, Premiere-only templates — see
+  // src/presets/contracts/kerisCaptionV1Ppro.js) is a mapping decision, not
+  // a preset decision: if positionX and positionY resolve to the same
+  // exposed param name, emit one "point"-kind instruction instead of two
+  // "number"-kind ones. src/ppro/applyCaptions.js and src/ppro/smokeTest.js
+  // both know how to write a "point" value (see setPointParamValue in
+  // src/ppro/componentParams.js).
+  const positionXName = resolveParamName(preset, "positionX");
+  const positionYName = resolveParamName(preset, "positionY");
+  if (positionXName && positionXName === positionYName) {
+    out.push({
+      fieldKey: "position",
+      paramName: positionXName,
+      kind: "point",
+      value: { x: preset.position.offsetX, y: preset.position.offsetY },
+    });
+  } else {
+    put("positionX", "number", preset.position.offsetX);
+    put("positionY", "number", preset.position.offsetY);
+  }
   put("tracking", "number", preset.tracking);
 
   put("shadowEnabled", "bool", preset.shadow.enabled);

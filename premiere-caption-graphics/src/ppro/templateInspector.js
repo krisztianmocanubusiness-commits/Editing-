@@ -1,9 +1,11 @@
 /**
  * Template Inspector: point this at any .mogrt and it tells you, against a
- * real Premiere host, whether it's KERIS_CAPTION_V1-compliant, which
+ * real Premiere host, whether it's compliant with the recommended
+ * KERIS_CAPTION_V1_PPRO contract (Premiere-only compatible), which
  * required params (if any) are missing, which extra params it exposes
- * beyond the contract, and — once more than one contract exists — which
- * contract it best matches.
+ * beyond the contract, and — checking the whole registry, so this also
+ * recognizes a fuller After-Effects-authored KERIS_CAPTION_V1 template —
+ * which contract it best matches.
  *
  * This is a read-mostly operation: it inserts the template on the active
  * sequence's topmost video track just long enough to read its exposed
@@ -16,17 +18,23 @@
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
 import { safeAsync, dumpComponentChain } from "./introspect.js";
-import { CONTRACTS, KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
-import { validateAgainstContract, detectContract, extraParams, describeCompliance } from "../presets/contractValidation.js";
+import { CONTRACTS, KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
+import {
+  validateAgainstContract,
+  detectContract,
+  extraParams,
+  describeCompliance,
+  describeCompatibilityLabel,
+} from "../presets/contractValidation.js";
 
 /**
  * @param {Object} opts
  * @param {string} opts.mogrtPath
  * @param {(message: string, level?: string) => void} opts.log
- * @param {{ id: string, requiredParams: string[] }} [opts.targetContract] Defaults to KERIS_CAPTION_V1.
+ * @param {{ id: string, requiredParams: string[] }} [opts.targetContract] Defaults to KERIS_CAPTION_V1_PPRO, the recommended contract for Premiere-authored MOGRTs.
  */
 export async function inspectMogrt(opts) {
-  const { mogrtPath, log, targetContract = KERIS_CAPTION_V1 } = opts;
+  const { mogrtPath, log, targetContract = KERIS_CAPTION_V1_PPRO } = opts;
 
   log("════ Template Inspector — start ════", "info");
 
@@ -88,14 +96,15 @@ export async function inspectMogrt(opts) {
   const compliance = validateAgainstContract(discoveredNames, targetContract);
   const extras = extraParams(discoveredNames, targetContract);
   const detection = detectContract(discoveredNames, CONTRACTS);
+  const detectedContract = detection.detectedContractId ? getContract(detection.detectedContractId) : null;
 
-  log(describeCompliance(compliance), compliance.isCompliant ? "success" : "error");
+  log(`${describeCompliance(compliance)} (${describeCompatibilityLabel(targetContract)})`, compliance.isCompliant ? "success" : "error");
   log(`Extra params beyond ${targetContract.id}: ${extras.length ? extras.join(", ") : "none"}`, "info");
   log(
-    detection.detectedContractId
-      ? `Detected contract: ${detection.detectedContractId} (exact match).`
+    detectedContract
+      ? `Detected contract: ${detectedContract.id} — ${describeCompatibilityLabel(detectedContract)} (exact match).`
       : `Detected contract: none matched exactly (closest: ${detection.bestGuessContractId ?? "n/a"}).`,
-    detection.detectedContractId ? "success" : "warn"
+    detectedContract ? "success" : "warn"
   );
 
   log("════ Template Inspector — finished ════", "info");
@@ -107,6 +116,9 @@ export async function inspectMogrt(opts) {
     compliance,
     extraParams: extras,
     detection,
+    targetContractId: targetContract.id,
+    targetCompatibility: describeCompatibilityLabel(targetContract),
+    detectedCompatibility: detectedContract ? describeCompatibilityLabel(detectedContract) : null,
     cleanupOk: cleanupResult.ok && cleanupResult.value === true,
   };
 }

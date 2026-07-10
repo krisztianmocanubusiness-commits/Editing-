@@ -1,5 +1,5 @@
 import { insertMogrtAt, setTrackItemEnd, findExposedParams } from "./mogrt.js";
-import { setParamValue, keyframeParam } from "./componentParams.js";
+import { setParamValue, setPointParamValue, keyframeParam } from "./componentParams.js";
 import { flattenPresetForMogrt, resolveParamName } from "../presets/mogrtContract.js";
 
 /**
@@ -45,7 +45,15 @@ export async function applyChunkToTimeline(project, sequence, chunk, preset, vid
   for (const instr of instructions) {
     const param = found.get(instr.paramName);
     if (!param) continue;
-    setParamValue(project, param, instr.kind, instr.value);
+    if (instr.kind === "point") {
+      // Combined Position control (e.g. KERIS_CAPTION_V1_PPRO) — see
+      // flattenPresetForMogrt() in mogrtContract.js and
+      // setPointParamValue()'s doc comment for why this needs to try
+      // multiple value shapes instead of a single coerceValue() kind.
+      setPointParamValue(project, param, instr.value.x, instr.value.y);
+    } else {
+      setParamValue(project, param, instr.kind, instr.value);
+    }
   }
 
   // Graceful degrade: if this .mogrt doesn't implement the baked-in

@@ -3,8 +3,8 @@ import { store } from "../state/store.js";
 import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { runSmokeTest } from "../ppro/smokeTest.js";
-import { KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
-import { describeCompliance } from "../presets/contractValidation.js";
+import { KERIS_CAPTION_V1_PPRO } from "../presets/contracts/index.js";
+import { describeCompliance, describeCompatibilityLabel } from "../presets/contractValidation.js";
 
 function patchSmokeTest(patch) {
   store.set((s) => ({ smokeTest: { ...s.smokeTest, ...patch } }));
@@ -44,16 +44,11 @@ async function run() {
       patchSmokeTest({ lastResult: "fail" });
       return;
     }
-    const checks = [
-      result.results.text.ok,
-      result.results.fontSize.ok,
-      result.results.fillColor.ok,
-      result.results.position.ok,
-      result.results.tracking.ok,
-      result.results.entranceStyle.ok,
-    ];
-    const allCore = checks.every(Boolean);
-    patchSmokeTest({ lastResult: allCore ? "pass" : "partial", lastCompliance: result.compliance });
+    patchSmokeTest({
+      lastResult: result.allCorePassed ? "pass" : "partial",
+      lastCompliance: result.compliance,
+      lastCoreFields: result.coreFields,
+    });
   } catch (err) {
     log(`Smoke test crashed unexpectedly: ${err.message || err}`, "error");
     patchSmokeTest({ lastResult: "fail" });
@@ -62,10 +57,11 @@ async function run() {
   }
 }
 
-function resultBadge(lastResult) {
+function resultBadge(lastResult, coreFields) {
   if (!lastResult) return el("span", { class: "status-line", text: "Not run yet." });
+  const fieldList = coreFields?.length ? coreFields.join(", ") : "core";
   const map = {
-    pass: { text: "PASS — all 6 core params (text, size, colour, position, tracking, entrance style) set successfully.", cls: "log-success" },
+    pass: { text: `PASS — all ${coreFields?.length ?? ""} core params (${fieldList}) set successfully.`, cls: "log-success" },
     partial: { text: "PARTIAL — some params set, others failed. See log for exactly which.", cls: "log-warn" },
     fail: { text: "FAIL — see log for the step that failed.", cls: "log-error" },
   };
@@ -76,7 +72,9 @@ function resultBadge(lastResult) {
 function complianceBadge(compliance) {
   if (!compliance) return null;
   const cls = compliance.isCompliant ? "log-success" : "log-error";
-  return el("div", { class: `status-line ${cls}`, text: describeCompliance(compliance) });
+  const contract = compliance.contractId === KERIS_CAPTION_V1_PPRO.id ? KERIS_CAPTION_V1_PPRO : null;
+  const compatibilitySuffix = contract ? ` (${describeCompatibilityLabel(contract)})` : "";
+  return el("div", { class: `status-line ${cls}`, text: `${describeCompliance(compliance)}${compatibilitySuffix}` });
 }
 
 export function renderSmokeTestPanel(onChange) {
@@ -108,10 +106,13 @@ export function renderSmokeTestPanel(onChange) {
       "p",
       { class: "hint" },
       [
-        `Validates the real Premiere connection end to end against the ${KERIS_CAPTION_V1.id} contract: inserts one ` +
-          "MOGRT, sets text / font size / fill colour / position / tracking / entrance style on it, and logs every " +
-          "step (success or failure) below and in the UDT console. See docs/PREMIERE_HOST_TEST.md and " +
-          `${KERIS_CAPTION_V1.docPath} for manual steps and the full required-param spec.`,
+        `Validates the real Premiere connection end to end against ${KERIS_CAPTION_V1_PPRO.id} ` +
+          `(${describeCompatibilityLabel(KERIS_CAPTION_V1_PPRO)}, the recommended default for Premiere-authored ` +
+          "MOGRTs): inserts one MOGRT, sets text / font size / fill colour / position / tracking / background / " +
+          "shadow on it, and logs every step (success or failure) below and in the UDT console. Building an " +
+          "After-Effects-authored template instead? Pass the fuller KERIS_CAPTION_V1 contract in code — see " +
+          `docs/PREMIERE_HOST_TEST.md and ${KERIS_CAPTION_V1_PPRO.docPath} for manual steps and the full ` +
+          "required-param spec.",
       ]
     ),
     el("div", { class: "row" }, [pickBtn]),
@@ -124,7 +125,7 @@ export function renderSmokeTestPanel(onChange) {
       field("Position Y", numberInput(st.positionY, (v) => patchSmokeTest({ positionY: v }), { min: -4000, max: 4000 })),
     ]),
     el("div", { class: "row" }, [runBtn]),
-    resultBadge(st.lastResult),
+    resultBadge(st.lastResult, st.lastCoreFields),
     complianceBadge(st.lastCompliance),
   ]);
 }

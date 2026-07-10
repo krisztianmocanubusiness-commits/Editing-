@@ -14,6 +14,15 @@ export const KERIS_CAPTION_V1 = {
   label: "Keris Caption v1",
   docPath: "mogrt-contracts/KERIS_CAPTION_V1.md",
 
+  // "premiere-only" | "after-effects" — used by the Template Inspector to
+  // tell an editor plainly whether a matched contract needs After Effects
+  // to author, or can be built in Premiere alone. This contract requires
+  // split Position X/Position Y and an Entrance Style selector, neither of
+  // which Premiere's native graphics can produce (confirmed —
+  // mogrt-authoring/PREMIERE_ONLY_GUIDE.md) — hence "after-effects". For a
+  // Premiere-only-authorable contract, see ./kerisCaptionV1Ppro.js.
+  compatibility: "after-effects",
+
   // Exact Essential Graphics "Expose" display names a .mogrt must have,
   // verbatim, for this contract. Order matches the markdown spec.
   requiredParams: [

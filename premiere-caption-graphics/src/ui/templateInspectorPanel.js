@@ -4,8 +4,8 @@ import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { inspectMogrt } from "../ppro/templateInspector.js";
 import { saveActiveTemplate } from "../state/settings.js";
-import { KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
-import { describeCompliance } from "../presets/contractValidation.js";
+import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
+import { describeCompatibilityLabel } from "../presets/contractValidation.js";
 
 function patchInspector(patch) {
   store.set((s) => ({ templateInspector: { ...s.templateInspector, ...patch } }));
@@ -57,13 +57,14 @@ function saveAsActive() {
   store.set({ activeTemplate: saveResult.value });
 
   if (!lastResult.compliance.isCompliant) {
+    const contract = getContract(lastResult.targetContractId);
     log(
       `⚠ Saved a NON-COMPLIANT template as active (missing: ${lastResult.compliance.missingRequired.join(", ")}). ` +
-        "Timeline apply will still try, but some style fields won't land — see mogrt-contracts/KERIS_CAPTION_V1.md.",
+        `Timeline apply will still try, but some style fields won't land — see ${contract?.docPath ?? "mogrt-authoring/PREMIERE_ONLY_GUIDE.md"}.`,
       "warn"
     );
   } else {
-    log(`✓ Saved as active template: ${lastResult.mogrtPath}`, "success");
+    log(`✓ Saved as active template: ${lastResult.mogrtPath} (${lastResult.targetCompatibility})`, "success");
   }
   if (!saveResult.persisted) {
     log("Note: this session's storage doesn't support persisting settings across restarts — the active template will need to be re-saved next time you open the panel. See docs/TEMPLATE_INSPECTOR.md.", "warn");
@@ -77,14 +78,14 @@ function complianceSummaryBlock(result) {
   return el("div", { class: "inspector-results" }, [
     el("div", {
       class: `status-line ${compliance.isCompliant ? "log-success" : "log-error"}`,
-      text: compliance.isCompliant ? "COMPLIANT with KERIS_CAPTION_V1" : "NOT COMPLIANT with KERIS_CAPTION_V1",
+      text: `${compliance.isCompliant ? "COMPLIANT" : "NOT COMPLIANT"} with ${result.targetContractId} (${result.targetCompatibility})`,
     }),
     el("div", { class: "status-line", text: `Missing required: ${compliance.missingRequired.length ? compliance.missingRequired.join(", ") : "none"}` }),
     el("div", { class: "status-line", text: `Extra params: ${extraParams.length ? extraParams.join(", ") : "none"}` }),
     el("div", {
       class: "status-line",
       text: detection.detectedContractId
-        ? `Detected contract: ${detection.detectedContractId}`
+        ? `Detected contract: ${detection.detectedContractId} (${result.detectedCompatibility})`
         : `Detected contract: none matched exactly${detection.bestGuessContractId ? ` (closest: ${detection.bestGuessContractId})` : ""}`,
     }),
   ]);
@@ -94,9 +95,11 @@ function activeTemplateLine(activeTemplate) {
   if (!activeTemplate) {
     return el("div", { class: "status-line log-warn", text: "No active template saved yet." });
   }
+  const contract = getContract(activeTemplate.contractId);
+  const compatibilitySuffix = contract ? ` — ${describeCompatibilityLabel(contract)}` : "";
   return el("div", {
     class: `status-line ${activeTemplate.compliant ? "log-success" : "log-warn"}`,
-    text: `Active template: ${activeTemplate.path} (contract: ${activeTemplate.contractId ?? "unknown"}${activeTemplate.compliant ? "" : ", NOT compliant"})`,
+    text: `Active template: ${activeTemplate.path} (contract: ${activeTemplate.contractId ?? "unknown"}${compatibilitySuffix}${activeTemplate.compliant ? "" : ", NOT compliant"})`,
   });
 }
 
@@ -125,14 +128,18 @@ export function renderTemplateInspectorPanel(onChange) {
   });
 
   return el("section", { class: "panel panel-template-inspector" }, [
-    el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1.id} template` }),
+    el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
     el(
       "p",
       { class: "hint" },
       [
-        "Select a .mogrt, inspect it against the real Premiere host, and see exactly which required params are " +
-          "present, missing, or extra. Save a template as \"active\" here once, and the timeline apply step below " +
-          "uses it by default. See docs/TEMPLATE_INSPECTOR.md.",
+        `Select a .mogrt, inspect it against the real Premiere host, and see exactly which required params are ` +
+          `present, missing, or extra — checked by default against ${KERIS_CAPTION_V1_PPRO.id} ` +
+          `(${describeCompatibilityLabel(KERIS_CAPTION_V1_PPRO)}, the recommended contract for templates built in ` +
+          "Premiere alone). If your template also satisfies the fuller After Effects contract " +
+          "(KERIS_CAPTION_V1 — split Position X/Y, a baked Entrance Style rig), the \"Detected contract\" line " +
+          "below says so. Save a template as \"active\" here once, and the timeline apply step below uses it by " +
+          "default. See docs/TEMPLATE_INSPECTOR.md and mogrt-authoring/PREMIERE_ONLY_GUIDE.md.",
       ]
     ),
     el("div", { class: "row" }, [pickBtn]),

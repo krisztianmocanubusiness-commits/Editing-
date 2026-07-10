@@ -57,6 +57,26 @@ export function extraParams(discoveredParamNames, contract) {
   return discoveredParamNames.filter((name) => !required.has(name));
 }
 
+const COMPATIBILITY_LABELS = {
+  "premiere-only": "Premiere-only compatible",
+  "after-effects": "After Effects / full contract",
+};
+
+/**
+ * Human-readable compatibility tier for a contract, for surfacing in the
+ * Template Inspector: "Premiere-only compatible" (buildable with Premiere's
+ * native graphics alone, e.g. KERIS_CAPTION_V1_PPRO) vs. "After Effects /
+ * full contract" (needs AE features Premiere's native graphics can't
+ * produce, e.g. split Position X/Y or a baked Entrance Style rig, like
+ * KERIS_CAPTION_V1).
+ *
+ * @param {{ compatibility?: string }|null} contract
+ */
+export function describeCompatibilityLabel(contract) {
+  if (!contract) return "Unknown";
+  return COMPATIBILITY_LABELS[contract.compatibility] ?? contract.compatibility ?? "Unknown";
+}
+
 /**
  * Try to identify which registered contract (if any) a template's real
  * discovered param names satisfy. If more than one contract is fully

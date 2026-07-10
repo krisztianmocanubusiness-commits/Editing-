@@ -1,8 +1,15 @@
 # MOGRT Contract: KERIS_CAPTION_V1
 
-Status: **first shipped contract**. This is the concrete, buildable spec the
-smoke test (`src/ppro/smokeTest.js`) validates against by default, and the
-one the four example presets in `mogrt-contracts/presets/` are authored for.
+Status: **the fuller, After-Effects-authored contract.** Requires split
+`Position X`/`Position Y` and a baked `Entrance Style` animation-selector
+rig — neither of which Premiere's native graphics can produce (confirmed —
+see `mogrt-authoring/PREMIERE_ONLY_GUIDE.md`). If you're authoring in
+**Premiere alone, with no After Effects**, use
+**[`KERIS_CAPTION_V1_PPRO`](../mogrt-authoring/PREMIERE_ONLY_GUIDE.md)**
+instead — it's the recommended/default contract this extension's smoke
+test and Template Inspector check against, and the one the four example
+presets in `mogrt-contracts/presets/` are now authored for. This document
+stays fully supported for anyone building the richer AE version.
 
 This document and `src/presets/contracts/kerisCaptionV1.js` must always
 agree — the JS file is the source of truth the code resolves against, this
@@ -24,9 +31,15 @@ what that looks like in practice.
 
 Every param below **must** be exposed (checked "Expose" in the Essential
 Graphics panel, verbatim display name, before export) for a `.mogrt` to be
-`KERIS_CAPTION_V1`-compliant. The smoke test's contract-compliance check
-(step 8 in its log output) fails on any missing name here — no aliasing,
-no guessing.
+`KERIS_CAPTION_V1`-compliant. The contract-compliance check (see
+`validateAgainstContract()` in `src/presets/contractValidation.js`) fails
+on any missing name here — no aliasing, no guessing. Note that
+`src/ppro/smokeTest.js` and the Template Inspector now check against
+`KERIS_CAPTION_V1_PPRO` **by default**, not this contract — to check a
+template against this fuller contract instead, pass `contract:
+KERIS_CAPTION_V1` explicitly (see that file's JSDoc), or just read the
+Template Inspector's "Detected contract" line, which always checks the
+whole registry regardless of which one is the default target.
 
 | # | Display name (exact) | Essential Graphics control type | Preset field it drives | Notes |
 |---|---|---|---|---|
@@ -43,13 +56,19 @@ no guessing.
 
 ### Why split Position X / Position Y, not a single Point control
 
-Earlier, pre-contract smoke tests against ad-hoc templates showed a single
-"Position" Point control's real scripted value shape (array vs `{x,y}` vs
-`{horiz,vert}`) is unconfirmed and host-dependent. Two plain number sliders
-sidestep that entirely — `setParamValue()` already has a confirmed, working
-path for numeric params (see `src/ppro/componentParams.js`). Every contract
-from V1 onward should prefer split numeric controls over a compound
-control wherever possible, for the same reason.
+Two plain number sliders sidestep a real problem: a single "Position"
+Point control's scripted value shape (array vs `{x,y}` vs `{horiz,vert}`)
+is unconfirmed and host-dependent (see `setPointParamValue()` in
+`src/ppro/componentParams.js`, which has to try all three), whereas
+`setParamValue()` has a confirmed, working path for plain numeric params.
+**However**, splitting Position this way turns out to only be buildable in
+After Effects — Premiere's native graphics don't support "Separate
+Dimensions" on Position at all (confirmed, see
+`mogrt-authoring/PREMIERE_ONLY_GUIDE.md`). So this is a real tradeoff, not
+a strictly-better choice: `KERIS_CAPTION_V1` (this contract) takes the
+split-and-more-reliable-to-script path, at the cost of requiring After
+Effects; `KERIS_CAPTION_V1_PPRO` takes the combined-and-Premiere-buildable
+path, at the cost of a less certain value encoding.
 
 ## What's deliberately *not* required by V1
 
@@ -64,9 +83,15 @@ control wherever possible, for the same reason.
 
 ## Building a compliant template
 
-1. In After Effects (or Premiere's own Graphics → New Layer → Text), build
-   one comp with: a text layer, a rounded-rect background shape behind it,
-   and a Drop Shadow layer style on the text.
+This contract requires After Effects — split `Position X`/`Position Y`
+and a baked `Entrance Style` rig are both architecturally unavailable in
+Premiere's native graphics (confirmed; see
+`mogrt-authoring/PREMIERE_ONLY_GUIDE.md` for the research). If you don't
+have After Effects, build against `KERIS_CAPTION_V1_PPRO` instead — same
+guide covers that end to end.
+
+1. In After Effects, build one comp with: a text layer, a rounded-rect
+   background shape behind it, and a Drop Shadow layer style on the text.
 2. Wire an integer slider control ("Entrance Style", 0-5) to an expression
    on the text/background layers' Position, Opacity, and Scale that
    selects between a handful of pre-built keyframed rigs (fade, pop,
@@ -80,12 +105,17 @@ control wherever possible, for the same reason.
    `Background Opacity`, `Background Color`, `Tracking`, `Shadow Opacity`,
    `Entrance Style`.
 4. Export via **Export as Motion Graphics Template…**.
-5. Validate it: open the panel's smoke test section, pick the exported
-   `.mogrt`, click **Run Smoke Test**, and read the "KERIS_CAPTION_V1:
-   COMPLIANT / NOT COMPLIANT" line. If NOT COMPLIANT, it lists exactly
-   which of the 10 names above weren't found — go back to the Essential
-   Graphics panel, fix the naming/exposure, re-export, re-run. See
-   `docs/PREMIERE_HOST_TEST.md` for the full manual procedure.
+5. Validate it: open the panel's **"1. Template Inspector"** section, pick
+   the exported `.mogrt`, click **Inspect Template**, and read the
+   "Detected contract" line — it checks the whole contract registry, so it
+   will report `KERIS_CAPTION_V1` there once all 10 names are found, even
+   though the panel's primary compliance check now targets
+   `KERIS_CAPTION_V1_PPRO` by default. If not detected, the "Missing
+   required" line (checked against whichever contract is the target) lists
+   exactly which names weren't found — go back to the Essential Graphics
+   panel, fix the naming/exposure, re-export, re-run. See
+   `docs/PREMIERE_HOST_TEST.md` and `docs/TEMPLATE_INSPECTOR.md` for the
+   full manual procedure.
 
 ## Binding a preset to this contract
 
@@ -112,23 +142,18 @@ preset field to a param name in this priority order:
    used when `contractId` is unset.
 
 This is why a preset only needs `contractId` set, not a hand-written
-`paramMap` for all ten fields — see `mogrt-contracts/presets/` for four
-presets that do exactly this.
+`paramMap` for all ten fields.
 
 ## Example presets
 
-`mogrt-contracts/presets/` ships four ready-to-import `Preset` JSON files
-(load via the panel's **"Import preset…"** button), each bound to this
-contract:
-
-- **`white-clean-subtitle.json`** — plain white body-copy subtitle, no
-  background card, light shadow.
-- **`blue-keyword.json`** — bold blue whole-line treatment for a
-  keyword-carrying chunk.
-- **`yellow-impact-word.json`** — large, bold, yellow, wide-tracking — for
-  a single high-impact word/short chunk.
-- **`beige-background-card.json`** — dark text on a solid beige background
-  card, exercising `Background Opacity`/`Background Color`.
-
-Each still needs its `mogrt.path` filled in to point at your own exported
-`.mogrt` — they're style data, not a bundled binary template.
+The four example presets that used to live here
+(`white-clean-subtitle.json`, `blue-keyword.json`, `yellow-impact-word.json`,
+`beige-background-card.json` in `mogrt-contracts/presets/`) are now bound
+to `KERIS_CAPTION_V1_PPRO` instead, since that's the contract they're
+actually achievable against without After Effects — see
+`mogrt-authoring/PREMIERE_ONLY_GUIDE.md` §9 for the same four looks and
+why one Premiere-only master template covers all of them. If you're
+building a full AE-authored `KERIS_CAPTION_V1` template, those four JSON
+files are still a reasonable starting point for style values — just set
+`mogrt.contractId` back to `"KERIS_CAPTION_V1"` (and `mogrt.path` to your
+own exported `.mogrt`, either way).

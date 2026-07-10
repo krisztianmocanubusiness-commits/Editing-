@@ -1,7 +1,11 @@
-# Building a KERIS_CAPTION_V1 master `.mogrt` — Premiere Pro only, no After Effects
+# Building a KERIS_CAPTION_V1_PPRO master `.mogrt` — Premiere Pro only, no After Effects
 
-**Target version:** Premiere Pro 26.3. **Scope:** this is a documentation-only
-deliverable — nothing in `src/` or `test/` changed to produce this guide.
+**Target version:** Premiere Pro 26.3. **Status:** §5's replacement contract,
+`KERIS_CAPTION_V1_PPRO`, is now real, shipped code — see
+`src/presets/contracts/kerisCaptionV1Ppro.js` — and is the recommended
+**default** contract `src/ppro/smokeTest.js` and the Template Inspector
+check against. Everything below reflects the real, implemented parameter
+names; this guide is that contract's `docPath`.
 
 ## Read this first: what's actually confirmed vs. best-effort
 
@@ -205,18 +209,10 @@ expression engine and custom parameter controls.
 
 ## 5. Recommended replacement contract: `KERIS_CAPTION_V1_PPRO`
 
-This is a proposal for a new, second contract this extension could
-register alongside `KERIS_CAPTION_V1` — **not implemented in code yet**,
-per this task's scope. If/when it is, it would live at
-`src/presets/contracts/kerisCaptionV1Ppro.js`, registered in
-`src/presets/contracts/index.js`, and documented at
-`mogrt-contracts/KERIS_CAPTION_V1_PPRO.md`, mirroring how
-`KERIS_CAPTION_V1` itself is structured.
-
-**8 required params** (drops `Entrance Style` entirely; collapses
-`Position X`/`Position Y` into one combined `Position`), **plus 1
-recommended-but-not-required param** (`Fill Opacity`) so the existing
-entrance/exit fade fallback actually has something to animate:
+This is now real, shipped code — `src/presets/contracts/kerisCaptionV1Ppro.js`,
+registered first (i.e. preferred/default) in
+`src/presets/contracts/index.js` alongside `KERIS_CAPTION_V1`, which
+remains fully supported for After-Effects-authored templates. Full text:
 
 ```js
 export const KERIS_CAPTION_V1_PPRO = {
@@ -224,6 +220,8 @@ export const KERIS_CAPTION_V1_PPRO = {
   version: 1,
   label: "Keris Caption v1 (Premiere-only)",
   docPath: "mogrt-authoring/PREMIERE_ONLY_GUIDE.md",
+  compatibility: "premiere-only",
+
   requiredParams: [
     "Text",
     "Font Size",
@@ -234,23 +232,27 @@ export const KERIS_CAPTION_V1_PPRO = {
     "Tracking",
     "Shadow Opacity",
   ],
-  // Not in requiredParams (so a template missing it still reports
-  // COMPLIANT) but strongly recommended: expose it too if your build of
-  // Premiere supports a separate Fill opacity control (see §1).
+
+  // Not required — a template missing it still reports COMPLIANT — but
+  // exposing it is what lets applyChunkToTimeline()'s entrance/exit fade
+  // fallback actually animate something.
   recommendedOptionalParams: ["Fill Opacity"],
+
   paramMap: {
     captionText: "Text",
     fontSize: "Font Size",
     fillColor: "Fill Color",
     fillOpacity: "Fill Opacity",
-    // NOTE: a single "Position" control, not positionX/positionY.
-    // src/ppro/applyCaptions.js's flattenPresetForMogrt() currently emits
-    // separate positionX/positionY instructions unconditionally — driving
-    // a combined Position control would need a small code change (a
-    // position-merging branch analogous to the one already written for
-    // src/ppro/smokeTest.js's trySetPosition(), which already tries a
-    // combined "Position" control as a fallback — that fallback exists
-    // only in the smoke test today, not in the real apply path).
+    // Both keys resolve to the SAME name on purpose: flattenPresetForMogrt()
+    // in src/presets/mogrtContract.js detects when positionX and positionY
+    // resolve to one shared name and emits a single "point"-kind
+    // instruction instead of two "number"-kind ones. The real apply path
+    // (src/ppro/applyCaptions.js) and the smoke test
+    // (src/ppro/smokeTest.js) both write it via setPointParamValue() in
+    // src/ppro/componentParams.js, which tries the same three plausible
+    // value encodings (array, {x,y}, {horiz,vert}) either way.
+    positionX: "Position",
+    positionY: "Position",
     bgBoxOpacity: "Background Opacity",
     bgBoxColor: "Background Color",
     tracking: "Tracking",
@@ -258,30 +260,27 @@ export const KERIS_CAPTION_V1_PPRO = {
     // animationStyleIndex intentionally omitted — no Entrance Style.
     // applyChunkToTimeline()'s existing "no baked animation found" fallback
     // (a plain opacity fade on Fill Opacity) covers this gap with zero
-    // code changes IF Fill Opacity is exposed (see §1) — that's the whole
-    // reason it's listed above even though it's not one of the 8 required
-    // fields.
+    // extra code IF Fill Opacity is exposed (see §1).
   },
 };
 ```
 
-(`recommendedOptionalParams` above is illustrative for this proposal, not
-a field the current `Contract` shape in `src/presets/contracts/` actually
-reads — today, `validateAgainstContract()` only looks at `requiredParams`.
-Implementing this contract for real would mean deciding whether to add
-that concept to the schema or just leave `Fill Opacity` undocumented as a
-"nice to have" outside the object entirely.)
+Two notes on how this is actually wired up, since "the mapping layer" is
+more than just this one file:
 
-Until the position-merging code change lands, **use `preset.mogrt.paramMap`
-per-preset**
-to point `positionX`/`positionY` at whatever single `Position`-adjacent
-name your template actually exposes, and accept that only one of the two
-will actually land (the other will show as "no param matched" in the
-apply log) — or, more simply, leave position values close enough to
-Premiere's default authored position that the mismatch doesn't matter
-until the position-merging code change is made. This is a real, current
-limitation of pairing a Premiere-only `.mogrt` with today's code, not
-just a documentation gap — flagging it here rather than glossing over it.
+- `recommendedOptionalParams` is documentation-only — `validateAgainstContract()`
+  in `src/presets/contractValidation.js` only reads `requiredParams`. A
+  template missing `Fill Opacity` still reports COMPLIANT; it just means
+  the entrance/exit fade fallback has nothing to animate, so caption
+  graphics hard-cut in and out instead of fading.
+- The combined-`Position` handling isn't a per-contract special case
+  scattered through the codebase — it's one generic rule in
+  `flattenPresetForMogrt()`: if `positionX` and `positionY` resolve to the
+  *same* param name (true for any contract or `paramMap` override that
+  maps them that way, not just this one), it emits the combined
+  instruction; otherwise it emits the split one. `KERIS_CAPTION_V1`-bound
+  presets are unaffected — their `positionX`/`positionY` still resolve to
+  two different names, so they keep getting two separate instructions.
 
 ## 6. Exact parameter names to use
 
@@ -339,21 +338,30 @@ already built for exactly this:
      param — this is the ground truth for whatever Premiere actually
      called each property, resolving the §2/§6 uncertainty definitively
      for your build);
-   - COMPLIANT/NOT COMPLIANT against `KERIS_CAPTION_V1` (expect NOT
-     COMPLIANT — missing `Position X`, `Position Y`, `Entrance Style` — if
-     you followed this guide, since those are the fields §4 says aren't
-     achievable);
+   - COMPLIANT/NOT COMPLIANT against `KERIS_CAPTION_V1_PPRO` — the panel's
+     compliance check now targets this contract by default, since it's the
+     one this guide builds toward — with a **"Premiere-only compatible"**
+     label right next to the verdict;
+   - a **"Detected contract"** line that checks the *whole* registry, not
+     just the default target — if your template happens to also satisfy
+     the fuller `KERIS_CAPTION_V1` (e.g. you exposed split `Position X`/
+     `Position Y` in After Effects after all), it reports that instead,
+     labeled **"After Effects / full contract"**;
    - which extra params (if any) it found beyond what's required.
 4. If a discovered name doesn't match what you intended (e.g. Premiere
    exposed `Source Text` instead of `Text`), that's your signal to either
    go back and try renaming it in Premiere, or set `paramMap` as described
    in §6.
 5. As a second, stronger check, run panel section **"0. Host smoke test"**
-   against the same file — it doesn't just detect names, it actually
-   *writes* test values to each field and reports per-field success/
-   failure, catching cases where a name matches but the value type Premiere
-   expects turns out to differ from what `src/ppro/componentParams.js`
-   sends (see that file's docs on unconfirmed color/string call shapes).
+   against the same file — it also targets `KERIS_CAPTION_V1_PPRO` by
+   default, and doesn't just detect names: it actually *writes* test
+   values to each field and reports per-field success/failure, catching
+   cases where a name matches but the value type Premiere expects turns
+   out to differ from what `src/ppro/componentParams.js` sends (see that
+   file's docs on unconfirmed color/string/point call shapes). Only fields
+   `KERIS_CAPTION_V1_PPRO` actually requires count toward its PASS/PARTIAL
+   badge, so a template built exactly to this guide's spec (no
+   `Entrance Style`) can still show PASS.
 
 Both tools already exist in the shipped extension — no code changes
 needed to use them.
@@ -361,11 +369,12 @@ needed to use them.
 ## 9. Can a single master MOGRT support all four presets?
 
 **Yes.** `white-clean-subtitle`, `blue-keyword`, `yellow-impact-word`, and
-`beige-background-card` (`mogrt-contracts/presets/*.json`) were designed
-against the full `KERIS_CAPTION_V1` field set without needing gradient,
-blur, or a second text layer — checking each file confirms
-`gradient.enabled: false` and `emphasis.enabled: false` in all four, and
-only `beige-background-card.json` turns `backgroundBox.enabled` on. That
+`beige-background-card` (`mogrt-contracts/presets/*.json`) are now bound
+to `mogrt.contractId: "KERIS_CAPTION_V1_PPRO"` and were designed without
+needing gradient, blur, or a second text layer — checking each file
+confirms `gradient.enabled: false` and `emphasis.enabled: false` in all
+four, and only `beige-background-card.json` turns `backgroundBox.enabled`
+on. That
 means every visual difference between the four is expressible as **value
 changes on the same eight required fields** (plus optional `Fill Opacity`)
 this guide's master template exposes. Four representative columns shown

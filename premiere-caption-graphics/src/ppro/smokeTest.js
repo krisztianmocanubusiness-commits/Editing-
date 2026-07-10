@@ -1,8 +1,12 @@
 /**
- * Host validation pass for the Premiere scripting layer, checked against the
- * first real MOGRT contract this extension ships: KERIS_CAPTION_V1 (see
- * /mogrt-contracts/KERIS_CAPTION_V1.md and
- * ../presets/contracts/kerisCaptionV1.js).
+ * Host validation pass for the Premiere scripting layer, checked by default
+ * against KERIS_CAPTION_V1_PPRO — the recommended contract for
+ * Premiere-authored MOGRTs (see
+ * /mogrt-authoring/PREMIERE_ONLY_GUIDE.md and
+ * ../presets/contracts/kerisCaptionV1Ppro.js). Pass `opts.contract` to
+ * check against KERIS_CAPTION_V1 instead for an After-Effects-authored
+ * template that implements the fuller contract (split Position X/Y, a
+ * baked Entrance Style rig).
  *
  * This deliberately avoids the preset/apply pipeline (only the component-
  * discovery walk is shared, via ./introspect.js): the point of this module
@@ -16,35 +20,46 @@
  * Two independent checks come out of this, and they answer different
  * questions:
  *   - the per-field "trySetByCandidates" writes are best-effort — they try
- *     the contract's exact param name plus a couple of legacy aliases, so
- *     this still reports something useful against a non-contract template.
+ *     the target contract's exact param name plus a couple of legacy
+ *     aliases (including the *other* contract's names), so this still
+ *     reports something useful against a template built for either
+ *     contract, or no contract at all.
  *   - the "contract compliance" check (step 8) is strict — it compares the
- *     template's real discovered param names against KERIS_CAPTION_V1's
- *     required list with no aliasing, so it can tell an editor *exactly*
- *     which named control is missing and needs to be added/renamed in
- *     After Effects.
+ *     template's real discovered param names against the target
+ *     contract's required list with no aliasing, so it can tell an editor
+ *     *exactly* which named control is missing.
+ *
+ * Only fields the target contract actually requires count toward the
+ * PASS/PARTIAL core-check summary — e.g. Entrance Style is never required
+ * against the default KERIS_CAPTION_V1_PPRO target, so a Premiere-only
+ * template that doesn't have it can still show PASS.
  */
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, setTrackItemEnd } from "./mogrt.js";
 import { tickToSec } from "./time.js";
-import { setParamValue, coerceValue } from "./componentParams.js";
-import { KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
-import { validateAgainstContract, describeCompliance } from "../presets/contractValidation.js";
+import { setParamValue, coerceValue, POINT_VALUE_ENCODINGS } from "./componentParams.js";
+import { KERIS_CAPTION_V1_PPRO, KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
+import { validateAgainstContract, describeCompliance, describeCompatibilityLabel } from "../presets/contractValidation.js";
 import { safe, safeAsync, describeValue as describe, dumpComponentChain } from "./introspect.js";
 
-const P = KERIS_CAPTION_V1.paramMap;
+const P = KERIS_CAPTION_V1_PPRO.paramMap;
+const P_AE = KERIS_CAPTION_V1.paramMap;
 
-// Contract name first (exact match this template is expected to have),
-// then legacy aliases kept only so this test still says something useful
-// against an older/non-contract template.
+// Target contract's name first (exact match this template is expected to
+// have), then legacy aliases — including the *other* contract's name where
+// relevant — kept only so this test still says something useful against a
+// template built for the other contract, or no contract at all.
 const TEXT_CANDIDATES = [P.captionText, "Caption Text", "Source Text"];
 const FONT_SIZE_CANDIDATES = [P.fontSize, "Size"];
 const FILL_COLOR_CANDIDATES = [P.fillColor, "Fill Colour", "Color", "Colour"];
+const FILL_OPACITY_CANDIDATES = [P.fillOpacity, "Fill Opacity"];
 const BG_OPACITY_CANDIDATES = [P.bgBoxOpacity, "Background Enabled", "Opacity"];
 const BG_COLOR_CANDIDATES = [P.bgBoxColor, "Background Colour"];
 const TRACKING_CANDIDATES = [P.tracking, "Letter Spacing"];
 const SHADOW_OPACITY_CANDIDATES = [P.shadowOpacity, "Drop Shadow Opacity"];
-const ENTRANCE_STYLE_CANDIDATES = [P.animationStyleIndex, "Animation Style"];
+// Entrance Style only exists on the fuller (After Effects) contract — this
+// is a best-effort check even against the Premiere-only default target.
+const ENTRANCE_STYLE_CANDIDATES = [P_AE.animationStyleIndex, "Animation Style"];
 
 /**
  * Best-effort playhead read. Adobe's public sample panel does not
@@ -74,6 +89,7 @@ async function resolveStartTimeSec(sequence, fallbackSec, log) {
 
 function findByCandidates(discovered, candidateNames) {
   for (const name of candidateNames) {
+    if (!name) continue;
     const hit = discovered.find((d) => d.name === name);
     if (hit) return hit;
   }
@@ -84,7 +100,7 @@ function findByCandidates(discovered, candidateNames) {
 function trySetByCandidates(project, discovered, candidateNames, kind, value, label, log) {
   const hit = findByCandidates(discovered, candidateNames);
   if (!hit) {
-    log(`✗ ${label}: no param matched (tried: ${candidateNames.join(", ")})`, "error");
+    log(`✗ ${label}: no param matched (tried: ${candidateNames.filter(Boolean).join(", ")})`, "error");
     return { ok: false, tried: candidateNames };
   }
   const attemptResult = safe(() => setParamValue(project, hit.param, kind, value));
@@ -101,44 +117,63 @@ function trySetByCandidates(project, discovered, candidateNames, kind, value, la
 }
 
 /**
- * KERIS_CAPTION_V1 requires split "Position X" / "Position Y" number
- * params, so that exact shape is tried first (no guessing needed — they're
- * plain numbers). A single "Position" point control is still tried as a
- * fallback for non-contract templates, with a few plausible value
- * encodings since that shape is otherwise unconfirmed; every attempt is
- * logged rather than assuming the first one worked.
+ * KERIS_CAPTION_V1_PPRO (the default target) requires one combined
+ * "Position" point control, so that's tried first, using the shared
+ * POINT_VALUE_ENCODINGS list (see componentParams.js) since its real value
+ * shape is otherwise unconfirmed — every encoding attempt is logged rather
+ * than assuming the first one worked. Split "Position X"/"Position Y"
+ * (KERIS_CAPTION_V1, After Effects-authored templates) is tried as a
+ * fallback for templates built against the fuller contract.
  */
 function trySetPosition(project, discovered, x, y, log) {
-  const xHit = findByCandidates(discovered, [P.positionX, "Position X"]);
-  const yHit = findByCandidates(discovered, [P.positionY, "Position Y"]);
+  const single = findByCandidates(discovered, [P.positionX, "Position"]);
+  if (single) {
+    for (const encoding of POINT_VALUE_ENCODINGS) {
+      const value = encoding.toValue(x, y);
+      const attemptResult = safe(() => setParamValue(project, single.param, "raw", value));
+      if (attemptResult.ok && attemptResult.value) {
+        log(`✓ Position: set "${single.name}" using encoding ${encoding.label} = ${describe(value)}`, "success");
+        return { ok: true, paramName: single.name, encoding: encoding.label };
+      }
+      const reason = attemptResult.ok ? "returned false" : `threw: ${attemptResult.error.message || attemptResult.error}`;
+      log(`  Position encoding ${encoding.label} ${reason}`, "warn");
+    }
+    log(`✗ Position: found "${single.name}" param but no value encoding succeeded.`, "error");
+    return { ok: false, paramName: single.name };
+  }
+
+  const xHit = findByCandidates(discovered, [P_AE.positionX, "Position X"]);
+  const yHit = findByCandidates(discovered, [P_AE.positionY, "Position Y"]);
   if (xHit && yHit) {
     const rx = trySetByCandidates(project, discovered, [xHit.name], "number", x, "Position X", log);
     const ry = trySetByCandidates(project, discovered, [yHit.name], "number", y, "Position Y", log);
     return { ok: rx.ok && ry.ok, paramName: "Position X / Position Y" };
   }
 
-  const single = findByCandidates(discovered, ["Position"]);
-  if (single) {
-    const encodings = [
-      { label: "array [x, y]", value: [x, y] },
-      { label: "object {x, y}", value: { x, y } },
-      { label: "object {horiz, vert}", value: { horiz: x, vert: y } },
-    ];
-    for (const encoding of encodings) {
-      const attemptResult = safe(() => setParamValue(project, single.param, "raw", encoding.value));
-      if (attemptResult.ok && attemptResult.value) {
-        log(`✓ Position: set "Position" using encoding ${encoding.label} = ${describe(encoding.value)}`, "success");
-        return { ok: true, paramName: "Position", encoding: encoding.label };
-      }
-      const reason = attemptResult.ok ? "returned false" : `threw: ${attemptResult.error.message || attemptResult.error}`;
-      log(`  Position encoding ${encoding.label} ${reason}`, "warn");
-    }
-    log(`✗ Position: found "Position" param but no value encoding succeeded.`, "error");
-    return { ok: false, paramName: "Position" };
-  }
-
-  log(`✗ Position: no "${P.positionX}"/"${P.positionY}" or "Position" param found on this .mogrt.`, "error");
+  log(`✗ Position: no "${P.positionX}" or "Position X"/"Position Y" param found on this .mogrt.`, "error");
   return { ok: false };
+}
+
+// Maps each field this test checks to the preset-field-key its contract
+// paramMap would use, so "is this field required by the target contract"
+// can be derived generically instead of hardcoded per contract. See
+// isFieldRequired() below.
+const FIELD_TO_MAP_KEY = {
+  text: "captionText",
+  fontSize: "fontSize",
+  fillColor: "fillColor",
+  position: "positionX", // proxy: tracks whichever position scheme (split or combined) the contract requires
+  tracking: "tracking",
+  entranceStyle: "animationStyleIndex",
+  backgroundOpacity: "bgBoxOpacity",
+  backgroundColor: "bgBoxColor",
+  shadowOpacity: "shadowOpacity",
+  fillOpacity: "fillOpacity",
+};
+
+function isFieldRequired(contract, field) {
+  const name = contract.paramMap?.[FIELD_TO_MAP_KEY[field]];
+  return Boolean(name) && contract.requiredParams.includes(name);
 }
 
 /**
@@ -151,12 +186,15 @@ function trySetPosition(project, discovered, x, y, log) {
  * @param {number} opts.positionY
  * @param {number} [opts.testDurationSec]
  * @param {(message: string, level?: string) => void} opts.log
- * @param {{ id: string, requiredParams: string[] }} [opts.contract] Defaults to KERIS_CAPTION_V1.
+ * @param {{ id: string, requiredParams: string[], paramMap: object }} [opts.contract] Defaults to KERIS_CAPTION_V1_PPRO.
  */
 export async function runSmokeTest(opts) {
-  const { mogrtPath, text, fontSize, fillColorHex, positionX, positionY, testDurationSec = 3, log, contract = KERIS_CAPTION_V1 } = opts;
+  const { mogrtPath, text, fontSize, fillColorHex, positionX, positionY, testDurationSec = 3, log, contract = KERIS_CAPTION_V1_PPRO } = opts;
 
-  log(`════ Caption Studio host smoke test — start (contract: ${contract.id}) ════`, "info");
+  log(
+    `════ Caption Studio host smoke test — start (contract: ${contract.id}, ${describeCompatibilityLabel(contract)}) ════`,
+    "info"
+  );
 
   // 1. Active project + sequence.
   let project, sequence;
@@ -238,7 +276,9 @@ export async function runSmokeTest(opts) {
   const compliance = validateAgainstContract(discoveredNames, contract);
   log(describeCompliance(compliance), compliance.isCompliant ? "success" : "error");
 
-  // 9. Best-effort writes for the 10 KERIS_CAPTION_V1 fields, each logged.
+  // 9. Best-effort writes for every field this test knows how to check,
+  // each logged. Only the ones the target contract actually requires (see
+  // isFieldRequired()) count toward the PASS/PARTIAL summary below.
   log("Setting exposed parameters…", "info");
   const results = {
     trim: trimResult.ok && trimResult.value,
@@ -249,6 +289,11 @@ export async function runSmokeTest(opts) {
     tracking: trySetByCandidates(project, discovered, TRACKING_CANDIDATES, "number", 0, "Tracking", log),
     entranceStyle: trySetByCandidates(project, discovered, ENTRANCE_STYLE_CANDIDATES, "number", 1, "Entrance style", log),
   };
+
+  const fillOpacityHit = findByCandidates(discovered, FILL_OPACITY_CANDIDATES);
+  results.fillOpacity = fillOpacityHit
+    ? trySetByCandidates(project, discovered, FILL_OPACITY_CANDIDATES, "percent", 100, "Fill opacity", log)
+    : (log("… Fill opacity: no matching param found on this .mogrt — skipping (recommended, not required).", "warn"), { ok: false, skipped: true });
 
   const bgOpacityHit = findByCandidates(discovered, BG_OPACITY_CANDIDATES);
   results.backgroundOpacity = bgOpacityHit
@@ -265,14 +310,21 @@ export async function runSmokeTest(opts) {
     ? trySetByCandidates(project, discovered, SHADOW_OPACITY_CANDIDATES, "percent", 75, "Shadow opacity", log)
     : (log("… Shadow opacity: no matching param found on this .mogrt — skipping.", "warn"), { ok: false, skipped: true });
 
+  const coreFields = Object.keys(results).filter((field) => field !== "trim" && isFieldRequired(contract, field));
+  const coreChecks = coreFields.map((field) => results[field]);
+  const passCount = coreChecks.filter((r) => r.ok).length;
+
   const summary = {
     contract: contract.id,
+    compatibility: contract.compatibility,
     contractCompliant: compliance.isCompliant,
     missingRequired: compliance.missingRequired,
     trim: results.trim,
+    coreFieldsChecked: coreFields,
     text: results.text.ok,
     fontSize: results.fontSize.ok,
     fillColor: results.fillColor.ok,
+    fillOpacity: results.fillOpacity.ok || results.fillOpacity.skipped,
     position: results.position.ok,
     tracking: results.tracking.ok,
     entranceStyle: results.entranceStyle.ok,
@@ -280,14 +332,22 @@ export async function runSmokeTest(opts) {
     backgroundColor: results.backgroundColor.ok || results.backgroundColor.skipped,
     shadowOpacity: results.shadowOpacity.ok || results.shadowOpacity.skipped,
   };
-  const coreChecks = [results.text, results.fontSize, results.fillColor, results.position, results.tracking, results.entranceStyle];
-  const passCount = coreChecks.filter((r) => r.ok).length;
   log(`Summary: ${describe(summary)}`, "info");
   log(
-    `════ Caption Studio host smoke test — finished (${passCount}/${coreChecks.length} core param checks passed, ` +
-      `contract ${compliance.isCompliant ? "COMPLIANT" : "NOT COMPLIANT"}) ════`,
+    `════ Caption Studio host smoke test — finished (${passCount}/${coreChecks.length} core param checks passed for ` +
+      `${contract.id}, contract ${compliance.isCompliant ? "COMPLIANT" : "NOT COMPLIANT"}) ════`,
     passCount === coreChecks.length && compliance.isCompliant ? "success" : "warn"
   );
 
-  return { ok: true, trackItem, discovered, results, compliance };
+  return {
+    ok: true,
+    trackItem,
+    discovered,
+    results,
+    compliance,
+    coreFields,
+    // Precomputed so callers (see src/ui/smokeTestPanel.js) don't need to
+    // re-derive "which fields are core for this contract" themselves.
+    allCorePassed: coreChecks.length > 0 && passCount === coreChecks.length,
+  };
 }

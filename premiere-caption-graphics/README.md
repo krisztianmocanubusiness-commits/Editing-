@@ -63,14 +63,17 @@ transcript file / clip transcript
 4. Click **Load** (and **Debug**, to see the console) next to the plugin
    entry, with Premiere Pro already running and a project open. The panel
    appears under Window → Extensions → **Caption Graphics Studio**.
-5. Author (or license) at least one `.mogrt` matching
-   **[`mogrt-contracts/KERIS_CAPTION_V1.md`](mogrt-contracts/KERIS_CAPTION_V1.md)**
-   — the first real, buildable contract this extension ships against (10
-   required exposed params). Use the panel's **"1. Template Inspector"**
-   to check it and save it as your active template (see
-   `docs/TEMPLATE_INSPECTOR.md`), or import one of the four ready-made
-   presets in `mogrt-contracts/presets/` and fill in its `mogrt.path`
-   directly.
+5. Author (or license) at least one `.mogrt`. Two contracts are supported:
+   **[`KERIS_CAPTION_V1_PPRO`](mogrt-authoring/PREMIERE_ONLY_GUIDE.md)**
+   (8 required params, buildable in Premiere alone — **recommended
+   default**) or the fuller
+   **[`KERIS_CAPTION_V1`](mogrt-contracts/KERIS_CAPTION_V1.md)** (10
+   required params, needs After Effects for split Position X/Y and a baked
+   Entrance Style rig). Use the panel's **"1. Template Inspector"** to
+   check which one your template satisfies and save it as your active
+   template (see `docs/TEMPLATE_INSPECTOR.md`), or import one of the four
+   ready-made presets in `mogrt-contracts/presets/` (bound to
+   `KERIS_CAPTION_V1_PPRO`) and fill in its `mogrt.path` directly.
 
 If the panel loads but shows only the static header and an empty Log box —
 no sections, silence in the console — that's exactly the symptom this build
@@ -81,22 +84,24 @@ the plugin in UDT.
 ## Validate the host connection first
 
 Before trusting the full pipeline, run the panel's **"0. Host smoke test"**
-section: it inserts one `.mogrt`, sets all 10 `KERIS_CAPTION_V1` fields
-(text/font size/fill colour/position/background/tracking/shadow/entrance
-style/duration) on it, and logs every step's real success/failure — plus a
-strict contract-compliance check naming exactly which required param is
-missing, if any — to both the panel and the UXP Developer Tool console. No
-assumptions, no silent fallbacks. Full step-by-step instructions and how to
-read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
+section: it inserts one `.mogrt`, sets every `KERIS_CAPTION_V1_PPRO` field
+(text/font size/fill colour/position/background/tracking/shadow, plus a
+best-effort Entrance Style check) on it, and logs every step's real
+success/failure — plus a strict contract-compliance check naming exactly
+which required param is missing, if any — to both the panel and the UXP
+Developer Tool console. No assumptions, no silent fallbacks. Full
+step-by-step instructions and how to read the output:
+**[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
 
 ## Using the panel
 
 0. **Host smoke test** — see above; confirms the Premiere connection works
    at all before anything else.
 1. **Template Inspector** — pick a `.mogrt`, inspect it against
-   `KERIS_CAPTION_V1` (COMPLIANT/NOT COMPLIANT, missing required params,
-   extra params, detected contract), and **Save as active template**. This
-   is what section 6's apply step uses by default — see
+   `KERIS_CAPTION_V1_PPRO` by default (COMPLIANT/NOT COMPLIANT, missing
+   required params, extra params, and a "Detected contract" line that also
+   recognizes a fuller `KERIS_CAPTION_V1` template), and **Save as active
+   template**. This is what section 6's apply step uses by default — see
    **[`docs/TEMPLATE_INSPECTOR.md`](docs/TEMPLATE_INSPECTOR.md)**.
 2. **Transcript** — pull the transcript already attached to the selected
    clip (via Premiere's own Transcript feature), or import a `.srt`, `.vtt`,
@@ -137,14 +142,18 @@ read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
   scoring heuristic), both pure functions, unit-tested.
 - `src/presets/` — the `Preset` schema (`types.js`), built-in library
   (`library.js`), validation/clamping (`validate.js`), the mapping layer
-  that resolves preset fields to named Essential Graphics parameters
+  that resolves preset fields to named Essential Graphics parameters,
+  including the combined-vs-split `Position` handling
   (`mogrtContract.js`), the contract-compliance checker
   (`contractValidation.js`), the named-contract registry (`contracts/` —
-  currently just `KERIS_CAPTION_V1`), and the active-template fallback
-  used at apply-time (`effectiveMogrt.js`).
-- `mogrt-contracts/` — `KERIS_CAPTION_V1.md`, the first concrete,
-  smoke-test-validated contract (10 required params), plus four ready-to-
-  import example presets built for it in `mogrt-contracts/presets/`.
+  `KERIS_CAPTION_V1_PPRO`, the recommended default, and the fuller
+  `KERIS_CAPTION_V1`), and the active-template fallback used at
+  apply-time (`effectiveMogrt.js`).
+- `mogrt-contracts/` — `KERIS_CAPTION_V1.md`, the fuller After-Effects-
+  authored contract (10 required params). The recommended, Premiere-only
+  `KERIS_CAPTION_V1_PPRO` (8 required params) is documented at
+  `mogrt-authoring/PREMIERE_ONLY_GUIDE.md` instead; the four ready-to-
+  import example presets in `mogrt-contracts/presets/` are built for it.
 - `src/ppro/` — everything that actually talks to Premiere: project/sequence
   access, timeline range read/write, `.mogrt` insertion, component-parameter
   get/set/keyframe, the `applyCaptions.js` orchestrator, the shared
@@ -171,11 +180,12 @@ read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
   inspection works, what "active template" means and where it's stored,
   and how the apply step resolves which `.mogrt` to use.
 - `test/` — pure-logic unit tests (`node --test`), covering chunking,
-  keyword scoring, all transcript parsers, preset flattening, the
-  `KERIS_CAPTION_V1` contract (including that its markdown spec and JS
-  definition haven't drifted apart, and that all four example presets
-  resolve correctly against it), settings persistence, the active-
-  template fallback, and `entrypoint.test.js` (a static regression guard
+  keyword scoring, all transcript parsers, preset flattening, both
+  contracts and contract detection (including that `KERIS_CAPTION_V1`'s
+  markdown spec and JS definition haven't drifted apart, and that all
+  four example presets resolve correctly against `KERIS_CAPTION_V1_PPRO`),
+  settings persistence, the active-template fallback, and
+  `entrypoint.test.js` (a static regression guard
   making sure `index.html` never goes back to `<script type="module">`
   and always loads `dist/main.js`). These run without Premiere; the
   `src/ppro/*` scripting layer cannot be unit-tested outside a live host —

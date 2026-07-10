@@ -8,16 +8,19 @@
  * anti-aliasing will differ from Premiere's).
  *
  * UXP host note: Premiere Pro 26.3's UXP canvas implementation does not
- * expose the full browser Canvas 2D API — confirmed missing:
- * `measureText` (`ctx.measureText is not a function`, thrown from this
- * file). This module now feature-detects every non-guaranteed Canvas 2D
- * member it uses (measureText, createLinearGradient; `filter` was already
- * guarded) and falls back to a deterministic approximation instead of
- * crashing. `ctx.roundRect()`/`ctx.setTransform()`/`ctx.resetTransform()`
- * are not called anywhere in this file (the background box uses a local
- * `roundRect()` helper built from beginPath/moveTo/arcTo instead of the
- * native method) — see test/canvasApi.test.js for the regression guard
- * that keeps all of this true.
+ * expose the full browser Canvas 2D API — confirmed missing: `measureText`
+ * (`ctx.measureText is not a function`) and `save`/`restore`
+ * (`ctx.save is not a function`), both thrown from this file against a real
+ * host. This module now feature-detects every non-guaranteed Canvas 2D
+ * member it uses (measureText, createLinearGradient, save/restore; `filter`
+ * was already guarded) and falls back to a deterministic approximation (or,
+ * for save/restore, manual property snapshot/restore via ctxSave()/
+ * ctxRestore() below) instead of crashing. `ctx.roundRect()`/
+ * `ctx.setTransform()`/`ctx.resetTransform()` are not called anywhere in
+ * this file (the background box uses a local `roundRect()` helper built
+ * from beginPath/moveTo/arcTo instead of the native method) — see
+ * test/canvasApi.test.js for the regression guard that keeps all of this
+ * true.
  *
  * @param {HTMLCanvasElement} canvas
  * @param {import("../presets/types.js").Preset} preset
@@ -66,7 +69,7 @@ export function renderPreview(canvas, preset, chunk) {
   if (preset.backgroundBox.enabled) {
     const padX = preset.backgroundBox.paddingX * scale;
     const padY = preset.backgroundBox.paddingY * scale;
-    ctx.save();
+    const savedState = ctxSave(ctx);
     ctx.globalAlpha = preset.backgroundBox.opacity / 100;
     ctx.fillStyle = preset.backgroundBox.color;
     roundRect(
@@ -78,7 +81,7 @@ export function renderPreview(canvas, preset, chunk) {
       preset.backgroundBox.cornerRadius * scale
     );
     ctx.fill();
-    ctx.restore();
+    ctxRestore(ctx, savedState);
   }
 
   if (preset.blur.enabled && "filter" in ctx) {
@@ -96,7 +99,7 @@ export function renderPreview(canvas, preset, chunk) {
   let cursorX = x;
   for (const word of words) {
     const isEmphasis = preset.emphasis.enabled && keywords.has(word);
-    ctx.save();
+    const savedWordState = ctxSave(ctx);
     const wordFontSize = isEmphasis ? fontSize * preset.emphasis.scale : fontSize;
     const wordWeight = isEmphasis ? Math.min(preset.font.weight + preset.emphasis.weightBoost, 900) : weight;
     if (isEmphasis) {
@@ -114,7 +117,7 @@ export function renderPreview(canvas, preset, chunk) {
       wordWeight,
       family
     );
-    ctx.restore();
+    ctxRestore(ctx, savedWordState);
     cursorX += measureTracked(ctx, word, tracking, fontSize, weight, family) + spaceWidth;
   }
 
@@ -134,6 +137,77 @@ function warnOnce(key, message) {
   if (warnedOnce.has(key)) return;
   warnedOnce.add(key);
   console.warn(message);
+}
+
+// Canvas 2D state properties this file mutates inside a save/restore-guarded
+// block. Used only as the manual-snapshot fallback below — a fixed, slightly
+// generous list rather than trying to detect exactly which properties a
+// given block touches, so a future edit inside one of those blocks can't
+// silently start leaking unrestored state.
+const TRACKED_CTX_STATE_PROPS = [
+  "fillStyle",
+  "strokeStyle",
+  "globalAlpha",
+  "font",
+  "textBaseline",
+  "shadowColor",
+  "shadowOffsetX",
+  "shadowOffsetY",
+  "shadowBlur",
+  "filter",
+];
+
+// Sentinel returned by ctxSave() when the host's real save()/restore() were
+// used, so ctxRestore() knows which path to take without re-probing.
+const REAL_SAVE_RESTORE = Symbol("real-save-restore");
+
+/**
+ * Safe stand-in for `ctx.save()`. Uses the real method only when BOTH
+ * `save` and `restore` are functions (calling one without the other would
+ * corrupt state, not preserve it); otherwise manually snapshots the state
+ * properties this file cares about and returns them for ctxRestore() to
+ * reapply. Never throws.
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @returns {typeof REAL_SAVE_RESTORE | Record<string, *>}
+ */
+export function ctxSave(ctx) {
+  if (typeof ctx.save === "function" && typeof ctx.restore === "function") {
+    ctx.save();
+    return REAL_SAVE_RESTORE;
+  }
+  warnOnce(
+    "save-restore",
+    "[Caption Graphics Studio] canvas save/restore unavailable; manually preserving state"
+  );
+  const snapshot = {};
+  for (const prop of TRACKED_CTX_STATE_PROPS) {
+    if (prop in ctx) snapshot[prop] = ctx[prop];
+  }
+  return snapshot;
+}
+
+/**
+ * Pairs with ctxSave(): calls the real `ctx.restore()` if that's what was
+ * used, otherwise manually reapplies the snapshotted properties. Tolerates
+ * a host rejecting a given property write (e.g. a read-only member) instead
+ * of throwing.
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {typeof REAL_SAVE_RESTORE | Record<string, *>} saved
+ */
+export function ctxRestore(ctx, saved) {
+  if (saved === REAL_SAVE_RESTORE) {
+    if (typeof ctx.restore === "function") ctx.restore();
+    return;
+  }
+  for (const [prop, value] of Object.entries(saved)) {
+    try {
+      ctx[prop] = value;
+    } catch {
+      // Read-only or unsupported property on this host — nothing more we can do.
+    }
+  }
 }
 
 // Coarse per-character width table, used only when ctx.measureText() isn't

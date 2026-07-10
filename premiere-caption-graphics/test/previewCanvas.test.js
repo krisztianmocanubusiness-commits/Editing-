@@ -1,18 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderPreview, measureTextWidth } from "../src/ui/previewCanvas.js";
+import { renderPreview, measureTextWidth, ctxSave, ctxRestore } from "../src/ui/previewCanvas.js";
 import { createDefaultPreset } from "../src/presets/types.js";
 import { makeChunk } from "../src/caption/types.js";
 
-// Minimal CanvasRenderingContext2D stand-in. `withMeasureText`/`withGradient`
-// control whether those two methods exist at all, so tests can simulate
-// Premiere Pro 26.3's UXP canvas, which is missing both.
-function createStubContext({ withMeasureText = true, withGradient = true } = {}) {
+// Minimal CanvasRenderingContext2D stand-in. `withMeasureText`/`withGradient`/
+// `withSaveRestore` control whether those methods exist at all, so tests can
+// simulate Premiere Pro 26.3's UXP canvas, which is missing all three
+// (`ctx.measureText is not a function`, `ctx.save is not a function`).
+function createStubContext({ withMeasureText = true, withGradient = true, withSaveRestore = true } = {}) {
   const ctx = {
     clearRect() {},
     fillRect() {},
-    save() {},
-    restore() {},
     beginPath() {},
     moveTo() {},
     arcTo() {},
@@ -20,6 +19,10 @@ function createStubContext({ withMeasureText = true, withGradient = true } = {})
     fill() {},
     fillText() {},
   };
+  if (withSaveRestore) {
+    ctx.save = () => {};
+    ctx.restore = () => {};
+  }
   if (withMeasureText) {
     ctx.measureText = (text) => ({ width: text.length * 10 });
   }
@@ -53,6 +56,73 @@ test("measureTextWidth's missing-measureText warning fires exactly once, with th
     console.warn = originalWarn;
   }
   assert.deepEqual(warnings, ["[Caption Graphics Studio] canvas measureText unavailable; using width approximation"]);
+});
+
+// Must run before any other test exercises a save/restore-less ctx (see the
+// comment on the measureText warn-once test above — same per-file module
+// state caveat, just for the "save-restore" warnOnce key instead).
+test("canvas save/restore missing-method warning fires exactly once, with the exact required message", () => {
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (msg) => warnings.push(msg);
+  try {
+    const ctx = createStubContext({ withSaveRestore: false });
+    ctxSave(ctx);
+    ctxSave(ctx);
+    ctxSave(ctx);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(warnings, ["[Caption Graphics Studio] canvas save/restore unavailable; manually preserving state"]);
+});
+
+test("ctxSave/ctxRestore delegate to the real save()/restore() when both exist", () => {
+  let saveCalls = 0;
+  let restoreCalls = 0;
+  const ctx = { save: () => saveCalls++, restore: () => restoreCalls++, fillStyle: "red" };
+  const saved = ctxSave(ctx);
+  ctx.fillStyle = "blue";
+  ctxRestore(ctx, saved);
+  assert.equal(saveCalls, 1);
+  assert.equal(restoreCalls, 1);
+});
+
+test("ctxSave/ctxRestore manually preserve and restore tracked properties when save/restore are unavailable", () => {
+  const ctx = { fillStyle: "red", globalAlpha: 1, font: "10px sans-serif", shadowBlur: 0 };
+  const saved = ctxSave(ctx);
+  ctx.fillStyle = "blue";
+  ctx.globalAlpha = 0.5;
+  ctx.font = "20px sans-serif";
+  ctx.shadowBlur = 8;
+  ctxRestore(ctx, saved);
+  assert.equal(ctx.fillStyle, "red");
+  assert.equal(ctx.globalAlpha, 1);
+  assert.equal(ctx.font, "10px sans-serif");
+  assert.equal(ctx.shadowBlur, 0);
+});
+
+test("ctxSave falls back to manual snapshot if only one of save/restore exists (never calls save without a matching restore)", () => {
+  const ctx = { save: () => assert.fail("save() should not be called without restore() also being present"), fillStyle: "red" };
+  const saved = ctxSave(ctx);
+  ctx.fillStyle = "blue";
+  ctxRestore(ctx, saved);
+  assert.equal(ctx.fillStyle, "red");
+});
+
+test("ctxRestore never throws even if reassigning a snapshotted property throws (e.g. a read-only host property)", () => {
+  const ctx = {};
+  Object.defineProperty(ctx, "fillStyle", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      return "red";
+    },
+    set() {
+      throw new Error("read-only on this host");
+    },
+  });
+  const saved = ctxSave(ctx);
+  assert.doesNotThrow(() => ctxRestore(ctx, saved));
 });
 
 test("measureTextWidth delegates to ctx.measureText when it's available", () => {
@@ -102,4 +172,16 @@ test("renderPreview handles no chunk (placeholder text) without a canvas context
   const preset = createDefaultPreset("Test");
   const canvas = createStubCanvas(400, 225, { withMeasureText: false, withGradient: false });
   assert.doesNotThrow(() => renderPreview(canvas, preset, undefined));
+});
+
+test("renderPreview does not throw when the canvas context also lacks save/restore (matches Premiere Pro 26.3 UXP: \"ctx.save is not a function\")", () => {
+  const preset = createDefaultPreset("Test");
+  preset.backgroundBox.enabled = true; // exercises the background-box save/restore block
+  preset.shadow.enabled = true;
+  preset.emphasis.enabled = true; // exercises the per-word save/restore block's font/fillStyle changes
+  const chunk = makeChunk({ startSec: 0, endSec: 1, words: [{ text: "hello world", start: 0, end: 1 }] });
+  chunk.keywords = ["HELLO"];
+  const canvas = createStubCanvas(400, 225, { withMeasureText: false, withGradient: false, withSaveRestore: false });
+
+  assert.doesNotThrow(() => renderPreview(canvas, preset, chunk));
 });

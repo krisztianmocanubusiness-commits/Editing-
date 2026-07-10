@@ -35,6 +35,90 @@ export function describeValue(value) {
 }
 
 /**
+ * Is this value awaitable (a real Promise, or a thenable)? Some UXP host
+ * getters (confirmed: `TrackItem.matchName` on Premiere Pro 26.3, which
+ * returned a live Promise instead of a string — see
+ * docs/MOGRT_DIAGNOSTIC.md) return a Promise from what looks like a plain
+ * property, not just from an explicit async method. Every host-value read
+ * in this codebase should treat "might be a Promise" as the default
+ * assumption, not something only method calls need.
+ */
+export function isPromiseLike(value) {
+  return !!value && (typeof value === "object" || typeof value === "function") && typeof value.then === "function";
+}
+
+/**
+ * Await a host-returned value if it's Promise-like, otherwise return it as
+ * is. Never throws: a rejected promise (or a synchronous throw while
+ * awaiting a thenable's `.then`) is caught and reported via `opts.log` (if
+ * given), returning `fallback` instead. This is the one place a raw,
+ * possibly-unresolved host value should be normalized before any string
+ * method (`.trim()`, `.toLowerCase()`, etc.) or classification logic runs
+ * on it — calling those directly on an unresolved Promise is exactly what
+ * produced `(matchName || "").trim is not a function` in
+ * src/ppro/diagnostics.js.
+ *
+ * @param {*} value
+ * @param {*} fallback
+ * @param {{ log?: (message: string, level?: string) => void, label?: string }} [opts]
+ */
+export async function resolveHostValue(value, fallback, opts = {}) {
+  const { log, label = "value" } = opts;
+  try {
+    const resolved = isPromiseLike(value) ? await value : value;
+    return resolved === undefined ? fallback : resolved;
+  } catch (err) {
+    if (log) log(`Couldn't resolve host ${label} (rejected): ${err.message || err}`, "warn");
+    return fallback;
+  }
+}
+
+/**
+ * Call `fn()`, then resolve whatever it returns if that's Promise-like —
+ * i.e. `safe()` + `resolveHostValue()` combined into one call, for the
+ * common case of "call this host getter, it might throw synchronously OR
+ * return a Promise that rejects, either way I just want {ok, value/error}".
+ * Never throws.
+ *
+ * @param {() => *} fn
+ * @param {{ log?: (message: string, level?: string) => void, label?: string }} [opts]
+ * @returns {Promise<{ ok: boolean, value?: *, error?: Error }>}
+ */
+export async function safeResolve(fn, opts = {}) {
+  const { log, label = "value" } = opts;
+  let raw;
+  try {
+    raw = fn();
+  } catch (err) {
+    if (log) log(`${label} threw synchronously: ${err.message || err}`, "warn");
+    return { ok: false, error: err };
+  }
+  try {
+    const value = isPromiseLike(raw) ? await raw : raw;
+    return { ok: true, value };
+  } catch (err) {
+    if (log) log(`${label} rejected: ${err.message || err}`, "warn");
+    return { ok: false, error: err };
+  }
+}
+
+/**
+ * Normalize any resolved host value to a string or null — never returns a
+ * raw object (a Promise that slipped through, or any other non-string
+ * value) for callers that are about to call string methods on the result.
+ * If the value is already a string, returned as is; otherwise converted via
+ * `String()`, guarded in case that itself throws.
+ *
+ * @param {*} value
+ */
+export function toSafeString(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value;
+  const result = safe(() => String(value));
+  return result.ok ? result.value : null;
+}
+
+/**
  * Walk every component/param on a track item and log what's actually
  * there — names, best-effort "type", and current value where readable.
  * Scan bounds are defensive: no explicit count method appears in Adobe's

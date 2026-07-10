@@ -128,15 +128,29 @@ async function saveDiagnosticJson() {
   }
 }
 
-function diagnosticSummaryBlock(result) {
-  if (!result || !result.ok) return null;
+function diagnosticSummaryBlock(result, diagnosing) {
+  if (diagnosing) {
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-info", text: "⏳ Running diagnostic scan — inserting a temporary clip and reading its component chain… see Log below for progress." }),
+    ]);
+  }
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    return el("div", { class: "inspector-results" }, [
+      el("div", {
+        class: "status-line log-error",
+        text: `✗ Diagnostic Inspector failed${stepLabel}${result.error ? `: ${result.error}` : ""}. The temporary clip is removed either way — see Log below.`,
+      }),
+    ]);
+  }
   const byClass = result.components.reduce((acc, c) => {
     acc[c.classification] = (acc[c.classification] || 0) + 1;
     return acc;
   }, {});
   return el("div", { class: "inspector-results" }, [
     el("div", {
-      class: "status-line",
+      class: "status-line log-success",
       text: `${result.components.length} component(s) found: ${byClass.intrinsic ?? 0} intrinsic, ` +
         `${byClass["graphic-or-mogrt"] ?? 0} graphic-or-mogrt, ${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.`,
     }),
@@ -237,6 +251,6 @@ export function renderTemplateInspectorPanel(onChange) {
       ]
     ),
     el("div", { class: "row" }, [diagnosticBtn, saveDiagnosticBtn]),
-    diagnosticSummaryBlock(ti.lastDiagnostic),
+    diagnosticSummaryBlock(ti.lastDiagnostic, ti.diagnosing),
   ]);
 }

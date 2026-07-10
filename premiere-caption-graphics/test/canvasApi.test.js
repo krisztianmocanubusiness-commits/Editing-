@@ -118,7 +118,11 @@ test("src/ui/previewCanvas.js is the only file that references a canvas context 
  * demonstrates it's aware the member might be missing. That's a
  * deliberate simplicity/robustness tradeoff (no real JS parser involved),
  * and it's exactly the check that would have failed on the original,
- * unguarded `ctx.measureText(text).width` calls before this fix.
+ * unguarded `ctx.measureText(text).width` calls before this fix — and
+ * again on the original, unguarded `ctx.save()`/`ctx.restore()` calls
+ * (confirmed missing too: `ctx.save is not a function`, Premiere Pro
+ * 26.3), fixed by routing every save/restore through the ctxSave()/
+ * ctxRestore() helpers in previewCanvas.js.
  */
 const RISKY_CANVAS_2D_MEMBERS = [
   "measureText",
@@ -129,6 +133,8 @@ const RISKY_CANVAS_2D_MEMBERS = [
   "setTransform",
   "resetTransform",
   "filter",
+  "save",
+  "restore",
 ];
 
 function hasAvailabilityGuard(source, member) {

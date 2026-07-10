@@ -17,7 +17,7 @@
  */
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
-import { safe, safeAsync, describeValue } from "./introspect.js";
+import { safe, safeAsync, safeResolve, resolveHostValue, toSafeString, describeValue } from "./introspect.js";
 
 const MAX_COMPONENT_SCAN = 64;
 const MAX_PARAM_SCAN = 64;
@@ -52,13 +52,26 @@ const INTRINSIC_COMPONENT_NAMES = new Set([
 // observed yet as of this diagnostic tool's introduction.
 const GRAPHIC_NAME_SIGNALS = ["graphic", "mogrt", "essential graphics", "ae.adbe", "video/graphic"];
 
+// Safe string-or-empty lowercasing: NEVER calls a string method on
+// anything that isn't already a plain string, so a caller passing through
+// an unresolved Promise (or any other unexpected host value) can't crash
+// classification — confirmed root cause of "(matchName || "").trim is not a
+// function" on Premiere Pro 26.3, where `TrackItem.matchName` returned a
+// live Promise instead of a string. Callers are still expected to resolve
+// Promise-like host values via resolveHostValue()/toSafeString() BEFORE
+// calling classifyComponent()/textLikeSignal() — this is a second,
+// belt-and-suspenders guard, not a substitute for doing that.
+function safeLower(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
 /**
  * @param {{ displayName?: string|null, matchName?: string|null }} info
  * @returns {{ classification: "intrinsic"|"graphic-or-mogrt"|"effect-or-unknown", reason: string }}
  */
 export function classifyComponent({ displayName, matchName }) {
-  const name = (displayName || "").trim().toLowerCase();
-  const match = (matchName || "").trim().toLowerCase();
+  const name = safeLower(displayName);
+  const match = safeLower(matchName);
 
   if (INTRINSIC_COMPONENT_NAMES.has(name)) {
     return { classification: "intrinsic", reason: `display name "${displayName}" matches a known intrinsic component` };
@@ -75,24 +88,65 @@ export function classifyComponent({ displayName, matchName }) {
   };
 }
 
-/** Best-effort matchName reader: tries every plausible accessor shape and reports which (if any) worked. */
-export function readMatchName(obj) {
+/**
+ * Best-effort matchName reader: tries every plausible accessor shape
+ * (property, then a getMatchName() method) and reports which one worked —
+ * treating BOTH as possibly async, since Premiere Pro 26.3 returned a live
+ * Promise from a plain `matchName` property read, not just from an
+ * explicit method call (see resolveHostValue() in ./introspect.js). Every
+ * value returned here is guaranteed to already be a plain string or null —
+ * never a raw Promise/object — so callers never need to re-check.
+ *
+ * @param {*} obj
+ * @param {(message: string, level?: string) => void} [log]
+ */
+export async function readMatchName(obj, log) {
   const attempts = [
     { source: "matchName (property)", fn: () => obj.matchName },
     { source: "getMatchName() (method)", fn: () => (typeof obj.getMatchName === "function" ? obj.getMatchName() : undefined) },
   ];
   for (const attempt of attempts) {
-    const result = safe(attempt.fn);
-    if (result.ok && result.value !== undefined && result.value !== null) {
-      return { value: result.value, source: attempt.source };
-    }
+    const raw = safe(attempt.fn);
+    if (!raw.ok || raw.value === undefined || raw.value === null) continue;
+    const resolved = await resolveHostValue(raw.value, null, { log, label: `matchName via ${attempt.source}` });
+    const asString = toSafeString(resolved);
+    if (asString !== null) return { value: asString, source: attempt.source };
   }
   return { value: null, source: null };
 }
 
+/**
+ * Best-effort displayName reader, same async-safe treatment as
+ * readMatchName() above — `displayName` is host-returned metadata too, so
+ * it gets the same "might be a Promise" treatment rather than being
+ * special-cased as always-synchronous.
+ *
+ * @param {*} obj
+ * @param {(message: string, level?: string) => void} [log]
+ */
+export async function readDisplayName(obj, log) {
+  const raw = safe(() => obj.displayName);
+  if (!raw.ok || raw.value === undefined || raw.value === null) return null;
+  const resolved = await resolveHostValue(raw.value, null, { log, label: "displayName" });
+  return toSafeString(resolved);
+}
+
 export function textLikeSignal(displayName, matchName) {
-  const name = `${displayName || ""} ${matchName || ""}`.toLowerCase();
+  const name = `${safeLower(displayName)} ${safeLower(matchName)}`;
   return name.includes("text") || name.includes("source text");
+}
+
+/** Best-effort param type reader: tries `.type`, then `.paramType`, either of which might throw, reject, or resolve async. */
+async function readParamType(param, ci, pi, log) {
+  const attempts = [
+    () => param.type,
+    () => param.paramType,
+  ];
+  for (const fn of attempts) {
+    const result = await safeResolve(fn, { log, label: `component[${ci}].param[${pi}].type` });
+    if (result.ok && result.value !== undefined && result.value !== null) return result.value;
+  }
+  return "unknown";
 }
 
 /**
@@ -106,15 +160,17 @@ export function textLikeSignal(displayName, matchName) {
 export async function deepDumpComponentChain(trackItem, log) {
   log("Diagnostic: reading full component chain (no name assumptions)…", "info");
 
+  const typeNameResult = await safeResolve(() => trackItem.constructor?.name, { log, label: "trackItem type" });
+  const trackItemMatchName = await readMatchName(trackItem, log);
   const trackItemInfo = {
-    typeName: safe(() => trackItem.constructor?.name).value ?? "unknown",
-    matchName: readMatchName(trackItem).value,
+    typeName: (typeNameResult.ok && typeNameResult.value) || "unknown",
+    matchName: trackItemMatchName.value,
   };
   log(`TrackItem: type=${trackItemInfo.typeName}, matchName=${trackItemInfo.matchName ?? "n/a"}`, "info");
 
-  const chainResult = await safeAsync(() => trackItem.getComponentChain());
+  const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain()" });
   if (!chainResult.ok) {
-    log(`✗ getComponentChain() threw: ${chainResult.error.message || chainResult.error}`, "error");
+    log(`✗ getComponentChain() failed: ${chainResult.error.message || chainResult.error}`, "error");
     return { trackItem: trackItemInfo, components: [], scanStoppedEarly: true };
   }
   const chain = chainResult.value;
@@ -127,11 +183,11 @@ export async function deepDumpComponentChain(trackItem, log) {
   let consecutiveMisses = 0;
 
   for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
-    const componentResult = safe(() => chain.getComponentAtIndex(ci));
+    const componentResult = await safeResolve(() => chain.getComponentAtIndex(ci), { log, label: `component[${ci}]` });
     if (!componentResult.ok || !componentResult.value) {
       consecutiveMisses += 1;
       log(
-        `Component index ${ci}: ${componentResult.ok ? "no component returned" : `threw (${componentResult.error.message || componentResult.error})`} ` +
+        `Component index ${ci}: ${componentResult.ok ? "no component returned" : `failed (${componentResult.error.message || componentResult.error})`} ` +
           `(${consecutiveMisses}/${CONSECUTIVE_MISS_TOLERANCE} consecutive misses before stopping)`,
         "info"
       );
@@ -141,8 +197,8 @@ export async function deepDumpComponentChain(trackItem, log) {
     consecutiveMisses = 0;
     const component = componentResult.value;
 
-    const displayName = safe(() => component.displayName).value ?? null;
-    const matchNameResult = readMatchName(component);
+    const displayName = await readDisplayName(component, log);
+    const matchNameResult = await readMatchName(component, log);
     const { classification, reason } = classifyComponent({ displayName, matchName: matchNameResult.value });
 
     log(
@@ -154,7 +210,7 @@ export async function deepDumpComponentChain(trackItem, log) {
     const params = [];
     let paramMisses = 0;
     for (let pi = 0; pi < MAX_PARAM_SCAN; pi++) {
-      const paramResult = safe(() => component.getParam(pi));
+      const paramResult = await safeResolve(() => component.getParam(pi), { log, label: `component[${ci}].param[${pi}]` });
       if (!paramResult.ok || !paramResult.value) {
         paramMisses += 1;
         if (paramMisses >= 1) break; // params are dense within a component; one miss ends it (unlike the component-level scan)
@@ -162,13 +218,16 @@ export async function deepDumpComponentChain(trackItem, log) {
       }
       const param = paramResult.value;
 
-      const paramDisplayName = safe(() => param.displayName).value ?? null;
-      const paramMatchNameResult = readMatchName(param);
-      const paramType = safe(() => param.type).value ?? safe(() => param.paramType).value ?? "unknown";
+      const paramDisplayName = await readDisplayName(param, log);
+      const paramMatchNameResult = await readMatchName(param, log);
+      const paramType = await readParamType(param, ci, pi, log);
       const startValue = await safeAsync(() => param.getStartValue());
-      const valueTypeofName = startValue.ok ? typeof startValue.value : "unreadable";
+      const resolvedValue = startValue.ok
+        ? await resolveHostValue(startValue.value, undefined, { log, label: `component[${ci}].param[${pi}].value` })
+        : undefined;
+      const valueTypeofName = startValue.ok ? typeof resolvedValue : "unreadable";
       const valueStr = startValue.ok
-        ? describeValue(startValue.value)
+        ? describeValue(resolvedValue)
         : `unreadable (${startValue.error.message || startValue.error})`;
       const isTextLike = textLikeSignal(paramDisplayName, paramMatchNameResult.value);
 
@@ -186,7 +245,7 @@ export async function deepDumpComponentChain(trackItem, log) {
         matchNameSource: paramMatchNameResult.source,
         type: paramType,
         valueTypeofName,
-        value: startValue.ok ? startValue.value : null,
+        value: startValue.ok ? resolvedValue : null,
         valueReadError: startValue.ok ? null : String(startValue.error.message || startValue.error),
         textLikeSignal: isTextLike,
       });
@@ -215,6 +274,40 @@ export async function deepDumpComponentChain(trackItem, log) {
   );
 
   return { trackItem: trackItemInfo, components, scanStoppedEarly: false };
+}
+
+/**
+ * Runs `scanFn()`, then ALWAYS runs `cleanupFn()` afterward — regardless of
+ * whether `scanFn` threw — so a diagnostic scan crash can never leave the
+ * temporary inspection clip stranded on the timeline. Confirmed
+ * reproducible failure mode this fixes: the previous version only ran
+ * cleanup after a successful scan, so a thrown error partway through left
+ * the inserted clip behind.
+ *
+ * `scanFn`'s error (if any) is captured and returned rather than
+ * re-thrown, so the caller has one place to decide what to do with both
+ * the scan outcome and the cleanup outcome. Extracted as its own function
+ * (rather than inlined in diagnoseMogrt) so this guarantee is unit-testable
+ * without a live Premiere host — see test/diagnostics.test.js.
+ *
+ * @param {() => Promise<*>} scanFn
+ * @param {() => Promise<{ ok: boolean, value?: *, error?: Error }>} cleanupFn
+ * @param {(message: string, level?: string) => void} [log]
+ * @returns {Promise<{ report: *, scanError: Error|null, cleanupResult: { ok: boolean, value?: *, error?: Error } }>}
+ */
+export async function runScanWithGuaranteedCleanup(scanFn, cleanupFn, log) {
+  let report;
+  let scanError = null;
+  let cleanupResult;
+  try {
+    report = await scanFn();
+  } catch (err) {
+    scanError = err;
+    if (log) log(`✗ Diagnostic scan crashed: ${err.message || err}`, "error");
+  } finally {
+    cleanupResult = await cleanupFn();
+  }
+  return { report, scanError, cleanupResult };
 }
 
 /**
@@ -273,9 +366,16 @@ export async function diagnoseMogrt(opts) {
   const trackItem = insertResult.value;
   log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
 
-  const report = await deepDumpComponentChain(trackItem, log);
+  // Cleanup is guaranteed even if the scan itself throws unexpectedly —
+  // see runScanWithGuaranteedCleanup()'s doc comment for the failure mode
+  // this fixes.
+  const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
+    () => deepDumpComponentChain(trackItem, log),
+    () => safeAsync(() => removeTrackItem(project, sequence, trackItem)),
+    log
+  );
+  const report = scanReport ?? { trackItem: null, components: [], scanStoppedEarly: true };
 
-  const cleanupResult = await safeAsync(() => removeTrackItem(project, sequence, trackItem));
   if (cleanupResult.ok && cleanupResult.value) {
     log("Removed temporary inspection clip.", "info");
   } else {
@@ -287,6 +387,21 @@ export async function diagnoseMogrt(opts) {
     );
   }
 
+  const cleanupOk = cleanupResult.ok && cleanupResult.value === true;
+
+  if (scanError) {
+    log("════ Diagnostic Inspector — finished with errors (cleanup still ran) ════", "error");
+    return {
+      ok: false,
+      step: "scan",
+      mogrtPath,
+      error: String(scanError.message || scanError),
+      generatedAt: new Date().toISOString(),
+      ...report,
+      cleanupOk,
+    };
+  }
+
   log("════ Diagnostic Inspector — finished ════", "info");
 
   return {
@@ -294,6 +409,6 @@ export async function diagnoseMogrt(opts) {
     mogrtPath,
     generatedAt: new Date().toISOString(),
     ...report,
-    cleanupOk: cleanupResult.ok && cleanupResult.value === true,
+    cleanupOk,
   };
 }

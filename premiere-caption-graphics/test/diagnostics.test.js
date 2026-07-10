@@ -10,6 +10,8 @@ import {
   discoverComponents,
   prioritizeTextFirst,
   probeTextComponentDeep,
+  stabilizeComponentChain,
+  MOGRT_INIT_TIMEOUT_MESSAGE,
 } from "../src/ppro/diagnostics.js";
 import { resolveHostValue, safeResolve, toSafeString, isPromiseLike } from "../src/ppro/introspect.js";
 import { createScanBudget } from "../src/ppro/deepProbe.js";
@@ -433,4 +435,143 @@ test("probeTextComponentDeep stops early and marks partial when the budget expir
   const result = await probeTextComponentDeep(componentInfo, noopLog, budget);
   assert.equal(result.partial, true);
   assert.ok(result.params.length < 22, `expected fewer than 22 params to have been probed, got ${result.params.length}`);
+});
+
+// --- Regression tests: component-chain stabilization (a host chain that
+// evolves asynchronously after MOGRT insertion — confirmed real-host
+// behavior: AE.ADBE Text can take a couple of seconds to appear). ---
+
+test("stabilizeComponentChain polls until AE.ADBE Text appears, reacquiring a fresh chain object every time (poll 1: 3, poll 2: 3, poll 3: 4 including AE.ADBE Text)", async () => {
+  const threeIntrinsic = [
+    fakeComponent({ matchName: "AE.ADBE Opacity", displayName: "Opacity", params: [] }),
+    fakeComponent({ matchName: "AE.ADBE Motion", displayName: "Motion", params: [] }),
+    fakeComponent({ matchName: "AE.ADBE Graphic Group", displayName: "Graphic", params: [] }),
+  ];
+  const fourWithText = [
+    ...threeIntrinsic,
+    fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: Array.from({ length: 22 }, (_, i) => fakeParam({ displayName: `Param ${i}` })) }),
+  ];
+  const componentListsPerCall = [threeIntrinsic, threeIntrinsic, fourWithText];
+
+  const chainObjects = [];
+  let callCount = 0;
+  const trackItem = {
+    getComponentChain: () => {
+      const idx = Math.min(callCount, componentListsPerCall.length - 1);
+      const components = componentListsPerCall[idx];
+      const chain = { getComponentAtIndex: (i) => components[i] ?? null };
+      chainObjects.push(chain);
+      callCount += 1;
+      return chain;
+    },
+  };
+
+  const result = await stabilizeComponentChain(trackItem, noopLog, {
+    startedAt: Date.now(),
+    sleepFn: async () => {},
+  });
+
+  assert.equal(callCount, 3, "expected exactly 3 polls (stopping as soon as Text appears)");
+  assert.equal(new Set(chainObjects).size, 3, "every poll must reacquire a distinct chain object, not reuse a previous one");
+  assert.equal(result.textFound, true);
+  assert.equal(result.discovery.components.length, 4);
+  assert.ok(result.discovery.components.some((c) => c.classification === "text-editing"));
+  assert.equal(result.timeline.length, 3);
+  assert.deepEqual(result.timeline.map((t) => t.componentCount), [3, 3, 4]);
+  assert.ok(result.timeline[2].components.includes("AE.ADBE Text"));
+});
+
+test("stabilizeComponentChain's final discovery uses fresh Component references from the LAST poll, not a stale earlier one", async () => {
+  const pollAOpacity = fakeComponent({ matchName: "AE.ADBE Opacity", displayName: "Opacity", params: [] });
+  pollAOpacity.__pollTag = "A";
+  const pollBOpacity = fakeComponent({ matchName: "AE.ADBE Opacity", displayName: "Opacity", params: [] });
+  pollBOpacity.__pollTag = "B";
+  const pollBText = fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: [] });
+
+  const lists = [[pollAOpacity], [pollBOpacity, pollBText]];
+  let callCount = 0;
+  const trackItem = {
+    getComponentChain: () => {
+      const components = lists[Math.min(callCount, lists.length - 1)];
+      callCount += 1;
+      return { getComponentAtIndex: (i) => components[i] ?? null };
+    },
+  };
+
+  const result = await stabilizeComponentChain(trackItem, noopLog, { startedAt: Date.now(), sleepFn: async () => {} });
+
+  assert.equal(result.textFound, true);
+  assert.equal(callCount, 2, "expected exactly 2 polls (stopping once Text appears on poll 2)");
+  const opacityEntry = result.discovery.components.find((c) => c.matchName === "AE.ADBE Opacity");
+  assert.equal(opacityEntry.component.__pollTag, "B", "expected the fresh (2nd-poll) Opacity reference, not the stale 1st-poll one");
+});
+
+test("stabilizeComponentChain exits polling immediately once Text is found, without extra polls", async () => {
+  let callCount = 0;
+  const withText = [fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: [] })];
+  const trackItem = {
+    getComponentChain: () => {
+      callCount += 1;
+      return { getComponentAtIndex: (i) => withText[i] ?? null };
+    },
+  };
+  await stabilizeComponentChain(trackItem, noopLog, { startedAt: Date.now(), sleepFn: async () => {} });
+  assert.equal(callCount, 1, "Text found on the very first poll — no further polls should happen");
+});
+
+test("stabilizeComponentChain times out and produces a discovery timeline when AE.ADBE Text never appears, logging the exact required message", async () => {
+  const threeIntrinsic = [
+    fakeComponent({ matchName: "AE.ADBE Opacity", displayName: "Opacity", params: [] }),
+    fakeComponent({ matchName: "AE.ADBE Motion", displayName: "Motion", params: [] }),
+    fakeComponent({ matchName: "AE.ADBE Graphic Group", displayName: "Graphic", params: [] }),
+  ];
+  const trackItem = { getComponentChain: () => ({ getComponentAtIndex: (i) => threeIntrinsic[i] ?? null }) };
+
+  const loggedLines = [];
+  const result = await stabilizeComponentChain(trackItem, (msg, level) => loggedLines.push({ msg, level }), {
+    startedAt: Date.now(),
+    sleepFn: async () => {},
+    maxWaitMs: 0,
+  });
+
+  assert.equal(result.textFound, false);
+  assert.ok(result.timeline.length >= 1);
+  assert.equal(result.timeline[0].componentCount, 3);
+  assert.ok(loggedLines.some((l) => l.msg.includes(MOGRT_INIT_TIMEOUT_MESSAGE) && l.level === "warn"));
+  // Never claims categorically that the template has no Text component.
+  assert.ok(!loggedLines.some((l) => /does not have|has no AE\.ADBE Text|lacks an? AE\.ADBE Text/i.test(l.msg)));
+});
+
+test("stabilizeComponentChain stops polling when cancelled, without waiting for the (much longer) timeout or minimum wait", async () => {
+  const threeIntrinsic = [fakeComponent({ matchName: "AE.ADBE Opacity", displayName: "Opacity", params: [] })];
+  const cancelToken = { cancelled: false };
+  let callCount = 0;
+  const trackItem = {
+    getComponentChain: () => {
+      callCount += 1;
+      if (callCount === 1) cancelToken.cancelled = true;
+      return { getComponentAtIndex: (i) => threeIntrinsic[i] ?? null };
+    },
+  };
+  const result = await stabilizeComponentChain(trackItem, noopLog, {
+    startedAt: Date.now(),
+    sleepFn: async () => {},
+    cancelToken,
+    maxWaitMs: 60000,
+    minWaitMs: 60000,
+  });
+  assert.equal(callCount, 1, "expected polling to stop right after cancellation, not continue toward the very long timeout");
+  assert.equal(result.textFound, false);
+});
+
+test("stabilizeComponentChain never throws even when getComponentChain fails on every poll, and still terminates (so cleanup is never skipped)", async () => {
+  const trackItem = {
+    getComponentChain: () => {
+      throw new Error("host getComponentChain failed");
+    },
+  };
+  const result = await stabilizeComponentChain(trackItem, noopLog, { startedAt: Date.now(), sleepFn: async () => {}, maxWaitMs: 0 });
+  assert.equal(result.textFound, false);
+  assert.equal(result.discovery.components.length, 0);
+  assert.equal(result.timeline.length, 1);
 });

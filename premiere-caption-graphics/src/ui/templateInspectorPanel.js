@@ -167,8 +167,9 @@ function diagnosticSummaryBlock(result, diagnosing) {
     return el("div", { class: "inspector-results" }, [
       el("div", {
         class: "status-line log-info",
-        text: "⏳ Running diagnostic scan — inserting a temporary clip, reading its component chain, and running the deeper raw probe… " +
-          "bounded to finish within ~12s even if something hangs; see Log below for live per-component/per-param progress, or click Cancel to stop early.",
+        text: "⏳ Running diagnostic scan — inserting a temporary clip, then waiting (up to ~6s) for Premiere to finish materializing the MOGRT's " +
+          "components before running the deeper raw probe (a fresh, separate ~12s budget) — bounded to finish either way, even if something hangs; " +
+          "see Log below for live per-component/per-param progress, or click Cancel to stop early.",
       }),
     ]);
   }
@@ -205,6 +206,7 @@ function diagnosticSummaryBlock(result, diagnosing) {
       "See the raw probe (below) for what's actually inside each one.";
 
   const textProbe = result.textComponentProbe;
+  const timeline = result.componentDiscoveryTimeline ?? [];
   const textProbeLine = textProbe
     ? el("div", {
         class: `status-line ${textProbe.partial ? "log-warn" : "log-success"}`,
@@ -212,7 +214,23 @@ function diagnosticSummaryBlock(result, diagnosing) {
           `${textProbe.params.length}${textProbe.paramCount ? `/${textProbe.paramCount}` : ""} parameter(s) probed in depth` +
           `${textProbe.partial ? " — STOPPED EARLY, only partially inspected (see raw probe JSON for what was captured, re-run to continue)" : ""}.`,
       })
-    : el("div", { class: "status-line log-warn", text: "No AE.ADBE Text component was found during discovery — see the Log for the full component list found." });
+    : el("div", {
+        class: "status-line log-warn",
+        // Never state categorically that the template has no Text
+        // component — a previous scan already proved this one does; the
+        // stabilization wait (see the discovery timeline below) may simply
+        // not have been long enough this run. See docs/MOGRT_DIAGNOSTIC.md.
+        text: `MOGRT component chain did not fully initialise before timeout. AE.ADBE Text was not found within the wait window` +
+          `${timeline.length ? ` (${timeline.length} discovery attempt${timeline.length === 1 ? "" : "s"}, see the Log/saved JSON for the full timeline)` : ""}` +
+          " — this does not mean the template lacks one. Try again, or check the Log for exactly which components stabilized.",
+      });
+
+  const timelineLine = timeline.length
+    ? el("div", {
+        class: "status-line",
+        text: `Component discovery timeline: ${timeline.map((t) => `attempt ${t.attempt} @${t.elapsedMs}ms → ${t.componentCount} found`).join("; ")}.`,
+      })
+    : null;
 
   return el("div", { class: "inspector-results" }, [
     result.partial
@@ -223,6 +241,7 @@ function diagnosticSummaryBlock(result, diagnosing) {
         })
       : null,
     textProbeLine,
+    timelineLine,
     el("div", {
       class: `status-line ${foundCustomControls ? "log-success" : "log-warn"}`,
       text: headline,

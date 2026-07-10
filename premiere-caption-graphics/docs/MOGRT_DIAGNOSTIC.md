@@ -379,3 +379,71 @@ pass over 22 params should comfortably finish. Run the Diagnostic Inspector
 again — the next milestone is a JSON result listing all 22 `AE.ADBE Text`
 parameter display names and their resolved `getStartValue().value`/
 `.position`.
+
+## Fourth real host run: a timing regression, and the fix
+
+[CONFIRMED — real Premiere Pro 26.3 host, "Keris Master Caption.mogrt"]
+With `getValueAtTime` no longer wasting the budget, the very next run
+completed fast and cleanly (`partial: false`, `cleanupOk: true`) — but
+reported only the 3 intrinsic components again (`Opacity`, `Motion`,
+`AE.ADBE Graphic Group`), `textComponentProbe: null`. The SAME MOGRT's
+earlier (slower, pre-fix) raw probe had definitely found a 4th component,
+`AE.ADBE Text`, at index 3.
+
+**Root cause: Premiere apparently materializes a MOGRT's components
+asynchronously after insertion.** The old, slow probe's repeated
+`getValueAtTime` timeouts (400ms × dozens of calls) accidentally gave
+Premiere enough wall-clock time to finish exposing `AE.ADBE Text` by the
+time the scan reached component index 3. The new discovery-first pass
+(previous section) is fast specifically *because* it no longer wastes that
+time — but that same speed meant it queried
+`trackItem.getComponentChain()` before Premiere had finished, and got a
+smaller, real-but-incomplete answer (3 components) that just happened to
+look internally consistent (both the classification report and the raw
+probe agreed on 3, since both now share one discovery pass — the
+consistency fix worked exactly as intended, it just consistently agreed on
+a *stale* snapshot).
+
+### The fix: a stabilization phase before the deep probe
+
+`stabilizeComponentChain()` in `src/ppro/diagnostics.js` now runs
+immediately after insertion, **before** any deep probing:
+
+- Repeatedly calls `trackItem.getComponentChain()` — a genuinely **fresh**
+  chain object every single poll, never reused — and runs the same
+  lightweight `discoverComponents()` pass (matchName/displayName/
+  paramCount only, no per-param work) against it.
+- Stops the moment `AE.ADBE Text` appears in a poll's results.
+- Otherwise keeps polling (300ms before the 2nd attempt, 250ms between
+  later ones) until the discovered component *signature* has been
+  unchanged for 2 consecutive polls **and** at least 2s have elapsed
+  (a deliberately enforced minimum — evidence shows Text can appear late,
+  so an early "looks stable" read is not trusted on its own), or a hard
+  6s ceiling is reached.
+- Every poll is recorded in `componentDiscoveryTimeline` — exactly when
+  Premiere exposed each component, e.g.:
+  ```json
+  [
+    { "elapsedMs": 0, "attempt": 1, "componentCount": 3, "components": ["AE.ADBE Opacity", "AE.ADBE Motion", "AE.ADBE Graphic Group"] },
+    { "elapsedMs": 1240, "attempt": 5, "componentCount": 4, "components": ["AE.ADBE Opacity", "AE.ADBE Motion", "AE.ADBE Graphic Group", "AE.ADBE Text"] }
+  ]
+  ```
+- If `AE.ADBE Text` still hasn't appeared once the wait ends, the log and
+  UI say exactly **"MOGRT component chain did not fully initialise before
+  timeout."** — never that the template lacks a Text component (a
+  previous scan already proved it has one).
+- The stabilization wait uses its **own** budget, entirely separate from
+  the deep-probe budget: `diagnoseMogrt()` only creates the probing
+  `createScanBudget({ totalMs: scanBudgetMs, ... })` (still ~12s) *after*
+  stabilization finishes, so up to ~6s of MOGRT-startup waiting never eats
+  into the ~12s meant for actually reading params.
+- Once stabilized, the classification report, raw probe, and dedicated
+  `probeTextComponentDeep()` pass all reuse that ONE final, fresh
+  discovery result (fresh `Component` references from the last poll, not
+  an earlier one) — so they still can't disagree with each other, and
+  `AE.ADBE Text` (once found) is still probed first.
+
+Net effect: total worst-case wall-clock time for one diagnostic run is now
+bounded by stabilization (~6s) plus a fresh probing budget (~12s) — around
+18s — instead of a single shared 12s budget that a slow MOGRT startup could
+silently eat into before any real probing even began.

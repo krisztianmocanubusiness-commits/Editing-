@@ -306,6 +306,138 @@ export function prioritizeTextFirst(components) {
   return [...text, ...rest];
 }
 
+// Stabilization defaults — CONFIRMED real-host behavior this exists for:
+// Premiere apparently materializes a MOGRT's components asynchronously
+// after insertion. A run whose deep probe was slow (repeated
+// getValueAtTime timeouts, since fixed) happened to still find AE.ADBE
+// Text at index 3; a run using the new, much faster discovery-first pass
+// queried the chain too early and only ever saw the 3 intrinsic
+// components that exist immediately. See docs/MOGRT_DIAGNOSTIC.md.
+const STABILIZATION_INITIAL_DELAY_MS = 300;
+const STABILIZATION_POLL_INTERVAL_MS = 250;
+const STABILIZATION_MAX_WAIT_MS = 6000;
+// Never declare "stable, give up" before this much time has passed, even
+// if the signature looks unchanged early — evidence shows Text can appear
+// late, so a too-early "it's stable" conclusion would be premature.
+const STABILIZATION_MIN_WAIT_MS = 2000;
+const STABILIZATION_STABLE_POLLS_REQUIRED = 2;
+
+export const MOGRT_INIT_TIMEOUT_MESSAGE = "MOGRT component chain did not fully initialise before timeout.";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function componentSignature(components) {
+  return components.map((c) => c.matchName ?? c.displayName ?? `component[${c.componentIndex}]`).join("|");
+}
+
+/**
+ * Polls `trackItem.getComponentChain()` repeatedly — reacquiring a FRESH
+ * chain object every single time, never reusing a previous one, per the
+ * confirmed real-host finding that a MOGRT's components can still be
+ * asynchronously materializing right after insertion — until either an
+ * AE.ADBE Text component appears, the discovered component signature has
+ * been unchanged for `stablePollsRequired` consecutive polls (and at least
+ * `minWaitMs` has elapsed), or `maxWaitMs` is reached. Every poll is
+ * itself just a `discoverComponents()` call (matchName/displayName/
+ * paramCount only — no per-param deep-probing during stabilization).
+ *
+ * Cooperatively cancellable via `cancelToken` (same shared token as the
+ * rest of a diagnostic run), checked between polls.
+ *
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {(message: string, level?: string) => void} log
+ * @param {Object} [opts]
+ * @param {number} [opts.initialDelayMs]
+ * @param {number} [opts.pollIntervalMs]
+ * @param {number} [opts.maxWaitMs]
+ * @param {number} [opts.minWaitMs]
+ * @param {number} [opts.stablePollsRequired]
+ * @param {{ cancelled: boolean }|null} [opts.cancelToken]
+ * @param {number} [opts.startedAt] Override for Date.now() at the start — test-only.
+ * @param {(ms: number) => Promise<void>} [opts.sleepFn] Override for the wait between polls — test-only.
+ * @returns {Promise<{ discovery: { components: Array, partial: boolean }, timeline: Array, textFound: boolean, elapsedMs: number }>}
+ */
+export async function stabilizeComponentChain(trackItem, log, opts = {}) {
+  const {
+    initialDelayMs = STABILIZATION_INITIAL_DELAY_MS,
+    pollIntervalMs = STABILIZATION_POLL_INTERVAL_MS,
+    maxWaitMs = STABILIZATION_MAX_WAIT_MS,
+    minWaitMs = STABILIZATION_MIN_WAIT_MS,
+    stablePollsRequired = STABILIZATION_STABLE_POLLS_REQUIRED,
+    cancelToken = null,
+    startedAt = Date.now(),
+    sleepFn = sleep,
+  } = opts;
+
+  const timeline = [];
+  let attempt = 0;
+  let lastSignature = null;
+  let stableCount = 0;
+  let textFound = false;
+  let finalDiscovery = { components: [], partial: false };
+
+  for (;;) {
+    attempt += 1;
+    const elapsedMs = Date.now() - startedAt;
+
+    const chainResult = await safeResolve(() => trackItem.getComponentChain(), {
+      log,
+      label: `getComponentChain() (stabilization attempt ${attempt})`,
+    });
+    let discovery = { components: [], partial: false };
+    if (chainResult.ok && chainResult.value) {
+      discovery = await discoverComponents(chainResult.value, log, undefined);
+    }
+    finalDiscovery = discovery;
+
+    const names = discovery.components.map((c) => c.matchName ?? c.displayName ?? `component[${c.componentIndex}]`);
+    timeline.push({ elapsedMs, attempt, componentCount: discovery.components.length, components: names });
+
+    const hasText = discovery.components.some((c) => c.classification === "text-editing");
+    log(
+      `[stage] waiting for MOGRT components — attempt ${attempt}, ${discovery.components.length} found` + (hasText ? " (AE.ADBE Text present)" : ""),
+      hasText ? "success" : "info"
+    );
+
+    if (hasText) {
+      textFound = true;
+      log("[stage] AE.ADBE Text discovered.", "success");
+      break;
+    }
+
+    if (cancelToken && cancelToken.cancelled) {
+      log("Component stabilization cancelled.", "warn");
+      break;
+    }
+
+    const signature = componentSignature(discovery.components);
+    if (signature === lastSignature) {
+      stableCount += 1;
+    } else {
+      stableCount = 0;
+      lastSignature = signature;
+    }
+
+    const elapsedNow = Date.now() - startedAt;
+    if (elapsedNow >= maxWaitMs) {
+      log(`${MOGRT_INIT_TIMEOUT_MESSAGE} No AE.ADBE Text component appeared within ${maxWaitMs}ms. A previous scan already proved this MOGRT has one — this does not mean it doesn't; it may just need more time or another attempt.`, "warn");
+      break;
+    }
+    if (elapsedNow >= minWaitMs && stableCount >= stablePollsRequired) {
+      log(`Component signature stable for ${stableCount} consecutive polls after ${elapsedNow}ms — stopping wait (no AE.ADBE Text found yet).`, "warn");
+      break;
+    }
+
+    const wantedWaitMs = attempt === 1 ? initialDelayMs : pollIntervalMs;
+    const remainingMs = Math.max(0, maxWaitMs - (Date.now() - startedAt));
+    await sleepFn(Math.min(wantedWaitMs, remainingMs));
+  }
+
+  return { discovery: finalDiscovery, timeline, textFound, elapsedMs: Date.now() - startedAt };
+}
+
 /**
  * Builds the classification/detail report (per-component displayName/
  * matchName/classification, per-param displayName/matchName/type/value)
@@ -427,12 +559,14 @@ export async function buildComponentDetailReport(trackItem, orderedComponents, d
 }
 
 /**
- * Self-contained convenience wrapper: fetches its own component chain,
- * discovers + prioritizes components, and builds the detail report — for
- * standalone use. diagnoseMogrt() below does NOT call this; it shares one
- * chain-fetch and one discoverComponents() pass across the classification
- * report, the raw probe, and the dedicated text-component pass instead, to
- * guarantee all three agree on what components exist.
+ * Self-contained convenience wrapper: fetches its own component chain
+ * ONCE (no stabilization wait — see stabilizeComponentChain(), which
+ * diagnoseMogrt() uses instead), discovers + prioritizes components, and
+ * builds the detail report — for standalone use. diagnoseMogrt() below
+ * does NOT call this; it stabilizes first, then shares one post-
+ * stabilization discovery result across the classification report, the
+ * raw probe, and the dedicated text-component pass instead, to guarantee
+ * all three agree on what components exist.
  *
  * @param {import("@adobe/premierepro").TrackItem} trackItem
  * @param {(message: string, level?: string) => void} log
@@ -822,21 +956,27 @@ export function cancelActiveDiagnostic() {
 }
 
 /**
- * Insert a .mogrt on the active sequence, discover its components once,
- * then run the classification detail report, the deep raw probe, and (if
- * an AE.ADBE Text component was found) the dedicated text extraction pass
- * — all from that ONE discovery, in priority order (text first) — clean
- * up the temporary clip, and return the full structured report. Reuses the
- * exact same insert/cleanup plumbing as templateInspector.js (see
- * ./mogrt.js) so this mode's insertion behavior can't drift from the
- * regular inspector's.
+ * Insert a .mogrt on the active sequence, WAIT for its component chain to
+ * stabilize (see stabilizeComponentChain() — confirmed real-host behavior:
+ * Premiere can still be asynchronously materializing a MOGRT's components
+ * for a couple of seconds after insertion, so querying immediately can
+ * genuinely under-report what's there), then run the classification detail
+ * report, the deep raw probe, and (if an AE.ADBE Text component was found)
+ * the dedicated text extraction pass — all from that ONE post-stabilization
+ * discovery, in priority order (text first) — clean up the temporary clip,
+ * and return the full structured report. Reuses the exact same insert/
+ * cleanup plumbing as templateInspector.js (see ./mogrt.js) so this mode's
+ * insertion behavior can't drift from the regular inspector's.
  *
- * Bounded to finish within `opts.scanBudgetMs` (default
- * DEFAULT_SCAN_BUDGET_MS, ~12s) regardless of how much there is to probe or
- * whether anything in the probed object graph hangs — see
- * src/ppro/deepProbe.js's module doc-comment for the three independent
+ * Two DELIBERATELY SEPARATE time budgets: up to ~6s (stabilization's own
+ * internal max wait) for Premiere to finish materializing components, then
+ * a FRESH `opts.scanBudgetMs` (default DEFAULT_SCAN_BUDGET_MS, ~12s) for
+ * the actual probing — so a slow MOGRT startup never eats into the budget
+ * meant for reading its params. Bounded to finish regardless of how much
+ * there is to probe or whether anything in the probed object graph hangs —
+ * see src/ppro/deepProbe.js's module doc-comment for the three independent
  * bounds (per-call timeout, shared scan budget, structural caps) that make
- * this guarantee hold.
+ * the probing phase's guarantee hold.
  *
  * @param {Object} opts
  * @param {string} opts.mogrtPath
@@ -856,10 +996,11 @@ export async function diagnoseMogrt(opts) {
   // One cancel token per run, published to the module-level slot so the
   // UI's Cancel button can reach it (see activeCancelToken above). Cleared
   // in `finally` no matter how this function returns, so a stale token can
-  // never linger and "cancel" a future, unrelated run.
+  // never linger and "cancel" a future, unrelated run. Checked throughout
+  // BOTH the stabilization wait and the deep-probe budget below, so Cancel
+  // works during either phase.
   const cancelToken = { cancelled: false };
   activeCancelToken = cancelToken;
-  const budget = createScanBudget({ totalMs: scanBudgetMs, cancelToken });
 
   try {
     let project, sequence;
@@ -897,14 +1038,16 @@ export async function diagnoseMogrt(opts) {
     const trackItem = insertResult.value;
     log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
 
-    // Cleanup is guaranteed even if any phase throws OR the scan budget/
+    // Cleanup is guaranteed even if any phase throws OR either budget/
     // cancellation cuts it short — see runScanWithGuaranteedCleanup()'s doc
     // comment for the crash failure mode, and deepProbe.js's module
-    // doc-comment for the hang failure mode this budget fixes. Every phase
-    // below shares the SAME single discovery pass and the SAME budget, so
-    // there's only one insert/cleanup cycle, one overall time bound, and no
-    // possibility of the classification report and raw probe disagreeing
-    // on what components exist.
+    // doc-comment for the hang failure mode. The stabilization wait and the
+    // deep-probe budget are DELIBERATELY SEPARATE (see stabilizeComponentChain()
+    // above) so time spent waiting for Premiere to finish materializing
+    // components never eats into the budget actually used for probing —
+    // every phase after stabilization shares one discovery result and one
+    // probe budget, so the classification report and raw probe can't
+    // disagree on what components exist.
     const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
       async () => {
         const typeNameResult = await safeResolve(() => trackItem.constructor?.name, { log, label: "trackItem type" });
@@ -912,39 +1055,34 @@ export async function diagnoseMogrt(opts) {
         const trackItemInfo = { typeName: (typeNameResult.ok && typeNameResult.value) || "unknown", matchName: trackItemMatchName.value };
         log(`TrackItem: type=${trackItemInfo.typeName}, matchName=${trackItemInfo.matchName ?? "n/a"}`, "info");
 
-        const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain()" });
-        if (!chainResult.ok || !chainResult.value) {
-          log(`✗ getComponentChain() failed: ${chainResult.ok ? "returned nothing" : (chainResult.error.message || chainResult.error)}`, "error");
-          return {
-            trackItem: trackItemInfo,
-            components: [],
-            scanStoppedEarly: true,
-            classificationPartial: false,
-            rawProbe: null,
-            textComponentProbe: null,
-            partial: false,
-          };
-        }
-        const chain = chainResult.value;
-
-        log("[stage] discovering components (lightweight: matchName, displayName, paramCount only)…", "info");
-        const discovery = await discoverComponents(chain, log, budget);
+        log("[stage] waiting for MOGRT components to finish initializing…", "info");
+        const stabilization = await stabilizeComponentChain(trackItem, log, { cancelToken });
+        const discovery = stabilization.discovery;
         const ordered = prioritizeTextFirst(discovery.components);
-
         const textInfo = discovery.components.find((c) => c.classification === "text-editing") ?? null;
+
+        // A fresh, separate budget for the deep-probe phase, starting its
+        // clock now — the stabilization wait above does NOT consume any of
+        // it, per the task that required this split.
+        const probeBudget = createScanBudget({ totalMs: scanBudgetMs, cancelToken });
+
         let textComponentProbe = null;
         if (textInfo) {
           log(
             `[stage] AE.ADBE Text component found at index ${textInfo.componentIndex} (${textInfo.paramCount ?? "?"} params declared) — probing it first, with priority.`,
             "success"
           );
-          textComponentProbe = await probeTextComponentDeep(textInfo, log, budget);
-        } else {
-          log("No AE.ADBE Text component found during discovery.", "warn");
+          textComponentProbe = await probeTextComponentDeep(textInfo, log, probeBudget);
+        } else if (stabilization.timeline.length > 0 && discovery.components.length > 0) {
+          // Components exist, just none classified as text-editing — a
+          // genuine (if not fully certain) "not found this time" result.
+          log("No AE.ADBE Text component was found among the components that stabilized within the wait window.", "warn");
         }
+        // If discovery.components.length === 0 entirely, stabilizeComponentChain
+        // already logged the exact required MOGRT_INIT_TIMEOUT_MESSAGE.
 
-        const componentReport = await buildComponentDetailReport(trackItem, ordered, discovery.partial, log, budget);
-        const rawProbeInner = await probeComponentsDeep(trackItem, ordered, log, budget);
+        const componentReport = await buildComponentDetailReport(trackItem, ordered, discovery.partial, log, probeBudget);
+        const rawProbeInner = await probeComponentsDeep(trackItem, ordered, log, probeBudget);
         const rawProbe = { ...rawProbeInner, partial: rawProbeInner.partial || discovery.partial };
 
         log("[stage] serializing results…", "info");
@@ -953,6 +1091,8 @@ export async function diagnoseMogrt(opts) {
           ...componentReport,
           rawProbe,
           textComponentProbe,
+          componentDiscoveryTimeline: stabilization.timeline,
+          stabilizationTimedOut: !stabilization.textFound,
           partial: Boolean(componentReport.classificationPartial || rawProbe.partial || (textComponentProbe && textComponentProbe.partial)),
         };
       },
@@ -969,6 +1109,8 @@ export async function diagnoseMogrt(opts) {
       classificationPartial: false,
       rawProbe: null,
       textComponentProbe: null,
+      componentDiscoveryTimeline: [],
+      stabilizationTimedOut: true,
       partial: true,
     };
 

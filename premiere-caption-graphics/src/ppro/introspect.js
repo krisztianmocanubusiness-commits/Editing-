@@ -47,42 +47,120 @@ export function isPromiseLike(value) {
   return !!value && (typeof value === "object" || typeof value === "function") && typeof value.then === "function";
 }
 
+// Default hard timeout for any single Promise-like host value this codebase
+// awaits, in milliseconds. Confirmed reproducible failure mode this guards
+// against: the Diagnostic Inspector's deep host-object probe (added in
+// commit 3371e29) hung indefinitely on a real Premiere Pro 26.3 host —
+// something in the probed object graph is Promise-like (has a `.then`) but
+// never settles, so a bare `await` on it blocks forever. 400ms is generous
+// for a real host round-trip but short enough that even a fully-hung probe
+// finishes within a bounded total time (see src/ppro/deepProbe.js's
+// createScanBudget for the overall-scan-level bound on top of this
+// per-call one).
+const DEFAULT_TIMEOUT_MS = 400;
+
 /**
- * Await a host-returned value if it's Promise-like, otherwise return it as
- * is. Never throws: a rejected promise (or a synchronous throw while
- * awaiting a thenable's `.then`) is caught and reported via `opts.log` (if
- * given), returning `fallback` instead. This is the one place a raw,
- * possibly-unresolved host value should be normalized before any string
- * method (`.trim()`, `.toLowerCase()`, etc.) or classification logic runs
- * on it — calling those directly on an unresolved Promise is exactly what
- * produced `(matchName || "").trim is not a function` in
- * src/ppro/diagnostics.js.
+ * Race a Promise-like value against a hard timeout. Never leaves the
+ * timer running past settlement, and — critically — never lets the
+ * original (possibly still-pending-forever) promise's eventual
+ * settlement do anything once this has already timed out or settled;
+ * this function's own returned promise only ever settles once.
+ *
+ * Note: this can't cancel whatever host-side work produced the original
+ * promise (JS promises aren't cancellable) — it only stops *this call site*
+ * from waiting on it past `ms`. The abandoned original promise, if it does
+ * eventually settle, is simply ignored.
+ *
+ * @param {*} promiseLike
+ * @param {number} ms
+ * @param {Object} [meta] Extra fields merged onto the timeout Error (e.g. `{ label }`).
+ */
+export function withTimeout(promiseLike, ms, meta = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const err = new Error(`timed out after ${ms}ms`);
+      err.isTimeout = true;
+      Object.assign(err, meta);
+      reject(err);
+    }, ms);
+    Promise.resolve(promiseLike).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+/**
+ * Resolve a possibly-Promise-like host value with a hard timeout, reporting
+ * exactly what happened: resolved, rejected, or timed out. Never throws,
+ * never waits past `opts.timeoutMs`. This is the one place a raw,
+ * possibly-unresolved-forever host value should be normalized before any
+ * string method (`.trim()`, `.toLowerCase()`, etc.) or classification logic
+ * runs on it — calling those directly on an unresolved Promise is what
+ * produced `(matchName || "").trim is not a function`; awaiting one
+ * without a timeout is what produced the Diagnostic Inspector hanging
+ * indefinitely (see docs/MOGRT_DIAGNOSTIC.md for both).
  *
  * @param {*} value
- * @param {*} fallback
- * @param {{ log?: (message: string, level?: string) => void, label?: string }} [opts]
+ * @param {{ log?: (message: string, level?: string) => void, label?: string, timeoutMs?: number }} [opts]
+ * @returns {Promise<{ ok: boolean, value?: *, timedOut: boolean, error?: Error }>}
  */
-export async function resolveHostValue(value, fallback, opts = {}) {
-  const { log, label = "value" } = opts;
+export async function resolveHostValueDetailed(value, opts = {}) {
+  const { log, label = "value", timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+  if (!isPromiseLike(value)) return { ok: true, value, timedOut: false };
   try {
-    const resolved = isPromiseLike(value) ? await value : value;
-    return resolved === undefined ? fallback : resolved;
+    const resolved = await withTimeout(value, timeoutMs, { label });
+    return { ok: true, value: resolved, timedOut: false };
   } catch (err) {
+    if (err && err.isTimeout) {
+      if (log) log(`${label} timed out after ${timeoutMs}ms — treating as unreadable and moving on`, "warn");
+      return { ok: false, timedOut: true, error: err };
+    }
     if (log) log(`Couldn't resolve host ${label} (rejected): ${err.message || err}`, "warn");
-    return fallback;
+    return { ok: false, timedOut: false, error: err };
   }
 }
 
 /**
+ * Await a host-returned value if it's Promise-like, otherwise return it as
+ * is — same contract as before, now built on resolveHostValueDetailed() so
+ * every caller gets the timeout guard automatically. Returns `fallback` on
+ * timeout, rejection, or an `undefined` resolved value.
+ *
+ * @param {*} value
+ * @param {*} fallback
+ * @param {{ log?: (message: string, level?: string) => void, label?: string, timeoutMs?: number }} [opts]
+ */
+export async function resolveHostValue(value, fallback, opts = {}) {
+  const result = await resolveHostValueDetailed(value, opts);
+  if (!result.ok) return fallback;
+  return result.value === undefined ? fallback : result.value;
+}
+
+/**
  * Call `fn()`, then resolve whatever it returns if that's Promise-like —
- * i.e. `safe()` + `resolveHostValue()` combined into one call, for the
- * common case of "call this host getter, it might throw synchronously OR
- * return a Promise that rejects, either way I just want {ok, value/error}".
- * Never throws.
+ * i.e. `safe()` + `resolveHostValueDetailed()` combined into one call, for
+ * the common case of "call this host getter, it might throw synchronously,
+ * return a Promise that rejects, or return a Promise that never settles —
+ * either way I just want {ok, value/error/timedOut}". Never throws, never
+ * hangs past `opts.timeoutMs`.
  *
  * @param {() => *} fn
- * @param {{ log?: (message: string, level?: string) => void, label?: string }} [opts]
- * @returns {Promise<{ ok: boolean, value?: *, error?: Error }>}
+ * @param {{ log?: (message: string, level?: string) => void, label?: string, timeoutMs?: number }} [opts]
+ * @returns {Promise<{ ok: boolean, value?: *, error?: Error, timedOut?: boolean }>}
  */
 export async function safeResolve(fn, opts = {}) {
   const { log, label = "value" } = opts;
@@ -93,13 +171,9 @@ export async function safeResolve(fn, opts = {}) {
     if (log) log(`${label} threw synchronously: ${err.message || err}`, "warn");
     return { ok: false, error: err };
   }
-  try {
-    const value = isPromiseLike(raw) ? await raw : raw;
-    return { ok: true, value };
-  } catch (err) {
-    if (log) log(`${label} rejected: ${err.message || err}`, "warn");
-    return { ok: false, error: err };
-  }
+  const resolved = await resolveHostValueDetailed(raw, opts);
+  if (!resolved.ok) return { ok: false, error: resolved.error, timedOut: resolved.timedOut };
+  return { ok: true, value: resolved.value };
 }
 
 /**

@@ -18,7 +18,7 @@
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
 import { safe, safeAsync, safeResolve, resolveHostValue, toSafeString } from "./introspect.js";
-import { summarizeHostValue, formatSummaryForLog, probeHostObject } from "./deepProbe.js";
+import { summarizeHostValue, formatSummaryForLog, probeHostObject, createScanBudget, DEFAULT_SCAN_BUDGET_MS } from "./deepProbe.js";
 
 const MAX_COMPONENT_SCAN = 64;
 const MAX_PARAM_SCAN = 64;
@@ -187,13 +187,16 @@ async function readParamType(param, ci, pi, log) {
 /**
  * Walk every component/param on a track item with full detail, logging
  * progressively and returning a JSON-serializable report. See module
- * doc-comment for what this is trying to settle.
+ * doc-comment for what this is trying to settle. Stops early (marking
+ * `partial: true`) the moment `budget` (if given) expires — see
+ * src/ppro/deepProbe.js's createScanBudget().
  *
  * @param {import("@adobe/premierepro").TrackItem} trackItem
  * @param {(message: string, level?: string) => void} log
+ * @param {ReturnType<typeof createScanBudget>} [budget]
  */
-export async function deepDumpComponentChain(trackItem, log) {
-  log("Diagnostic: reading full component chain (no name assumptions)…", "info");
+export async function deepDumpComponentChain(trackItem, log, budget) {
+  log("[stage] reading track item — component chain (no name assumptions)…", "info");
 
   const typeNameResult = await safeResolve(() => trackItem.constructor?.name, { log, label: "trackItem type" });
   const trackItemMatchName = await readMatchName(trackItem, log);
@@ -216,8 +219,14 @@ export async function deepDumpComponentChain(trackItem, log) {
 
   const components = [];
   let consecutiveMisses = 0;
+  let partial = false;
 
   for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
+    if (budget && budget.isExpired()) {
+      log(`Component scan stopped early at index ${ci}: ${budget.reason()}.`, "warn");
+      partial = true;
+      break;
+    }
     const componentResult = await safeResolve(() => chain.getComponentAtIndex(ci), { log, label: `component[${ci}]` });
     if (!componentResult.ok || !componentResult.value) {
       consecutiveMisses += 1;
@@ -245,6 +254,11 @@ export async function deepDumpComponentChain(trackItem, log) {
     const params = [];
     let paramMisses = 0;
     for (let pi = 0; pi < MAX_PARAM_SCAN; pi++) {
+      if (budget && budget.isExpired()) {
+        log(`Param scan on component ${ci} stopped early at index ${pi}: ${budget.reason()}.`, "warn");
+        partial = true;
+        break;
+      }
       const paramResult = await safeResolve(() => component.getParam(pi), { log, label: `component[${ci}].param[${pi}]` });
       if (!paramResult.ok || !paramResult.value) {
         paramMisses += 1;
@@ -303,11 +317,12 @@ export async function deepDumpComponentChain(trackItem, log) {
   }, {});
   log(
     `Diagnostic scan complete: ${components.length} component(s) — ` +
-      `${byClass.intrinsic ?? 0} intrinsic, ${byClass["graphic-or-mogrt"] ?? 0} graphic-or-mogrt, ${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.`,
-    "success"
+      `${byClass.intrinsic ?? 0} intrinsic, ${byClass["graphic-or-mogrt"] ?? 0} graphic-or-mogrt, ${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.` +
+      (partial ? " (STOPPED EARLY — time budget or cancellation, see above)" : ""),
+    partial ? "warn" : "success"
   );
 
-  return { trackItem: trackItemInfo, components, scanStoppedEarly: false };
+  return { trackItem: trackItemInfo, components, scanStoppedEarly: false, classificationPartial: partial };
 }
 
 /**
@@ -357,29 +372,47 @@ async function resolveProjectItem(trackItem, log) {
  *
  * @param {import("@adobe/premierepro").TrackItem} trackItem
  * @param {(message: string, level?: string) => void} log
+ * @param {Object} [opts]
+ * @param {ReturnType<typeof createScanBudget>} [opts.budget]
+ * @param {number} [opts.expectedComponentCount] From the classification scan, for "component i/N" progress logs — purely cosmetic, never gates behavior.
+ * @param {number[]} [opts.expectedParamCounts] Same, per component, for "param j/M" progress logs.
  */
-export async function deepProbeMogrt(trackItem, log) {
-  log("Diagnostic: running deeper raw host-object probe (trackItem, projectItem, every component/param, resolved values)…", "info");
+export async function deepProbeMogrt(trackItem, log, opts = {}) {
+  const { budget, expectedComponentCount, expectedParamCounts } = opts;
 
-  const trackItemProbe = await probeHostObject(trackItem, "trackItem", log);
+  log("[stage] probing deeper (raw host-object probe): trackItem, projectItem, every component/param, resolved values…", "info");
 
-  const projectItemResult = await resolveProjectItem(trackItem, log);
+  if (budget && budget.isExpired()) {
+    log(`Raw probe skipped entirely: ${budget.reason()} before it could start.`, "warn");
+    return { trackItemProbe: { label: "trackItem", skipped: true, reason: budget.reason() }, projectItemProbe: { label: "trackItem.projectItem", skipped: true, reason: budget.reason() }, components: [], partial: true };
+  }
+
+  const trackItemProbe = await probeHostObject(trackItem, "trackItem", log, budget);
+
+  log("[stage] probing project item…", "info");
+  const projectItemResult = budget && budget.isExpired() ? { value: null, source: null } : await resolveProjectItem(trackItem, log);
   const projectItemProbe = projectItemResult.value
-    ? { ...(await probeHostObject(projectItemResult.value, "trackItem.projectItem", log)), accessorSource: projectItemResult.source }
+    ? { ...(await probeHostObject(projectItemResult.value, "trackItem.projectItem", log, budget)), accessorSource: projectItemResult.source }
     : { label: "trackItem.projectItem", exists: false, accessorSource: null };
   log(
     projectItemResult.value
       ? `Raw probe: found an associated project item via ${projectItemResult.source}.`
-      : "Raw probe: no associated project item found via either tried accessor.",
+      : "Raw probe: no associated project item found via either tried accessor (or the scan budget ran out first).",
     projectItemResult.value ? "success" : "warn"
   );
 
   const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain() (raw probe)" });
   const components = [];
+  let partial = false;
   if (chainResult.ok && chainResult.value) {
     const chain = chainResult.value;
     let consecutiveMisses = 0;
     for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
+      if (budget && budget.isExpired()) {
+        log(`Raw probe stopped early before component ${ci}: ${budget.reason()}.`, "warn");
+        partial = true;
+        break;
+      }
       const componentResult = await safeResolve(() => chain.getComponentAtIndex(ci), { log, label: `component[${ci}] (raw probe)` });
       if (!componentResult.ok || !componentResult.value) {
         consecutiveMisses += 1;
@@ -388,11 +421,18 @@ export async function deepProbeMogrt(trackItem, log) {
       }
       consecutiveMisses = 0;
       const component = componentResult.value;
-      const componentProbe = await probeHostObject(component, `component[${ci}]`, log);
+      log(`[stage] probing component ${ci + 1}${expectedComponentCount ? `/${expectedComponentCount}` : ""}…`, "info");
+      const componentProbe = await probeHostObject(component, `component[${ci}]`, log, budget);
 
       const params = [];
       let paramMisses = 0;
+      const expectedParamCount = expectedParamCounts?.[ci];
       for (let pi = 0; pi < MAX_PARAM_SCAN; pi++) {
+        if (budget && budget.isExpired()) {
+          log(`Raw probe stopped early before param ${pi} on component ${ci + 1}: ${budget.reason()}.`, "warn");
+          partial = true;
+          break;
+        }
         const paramResult = await safeResolve(() => component.getParam(pi), { log, label: `component[${ci}].param[${pi}] (raw probe)` });
         if (!paramResult.ok || !paramResult.value) {
           paramMisses += 1;
@@ -400,21 +440,25 @@ export async function deepProbeMogrt(trackItem, log) {
           continue;
         }
         const param = paramResult.value;
-        const paramProbe = await probeHostObject(param, `component[${ci}].param[${pi}]`, log);
+        log(
+          `  [stage] probing parameter ${pi + 1}${expectedParamCount ? `/${expectedParamCount}` : ""} on component ${ci + 1}${expectedComponentCount ? `/${expectedComponentCount}` : ""}…`,
+          "info"
+        );
+        const paramProbe = await probeHostObject(param, `component[${ci}].param[${pi}]`, log, budget);
 
         const startValueResult = await safeResolve(() => param.getStartValue(), { log, label: `component[${ci}].param[${pi}].getStartValue()` });
         const startValueProbe = startValueResult.ok
-          ? await probeHostObject(startValueResult.value, `component[${ci}].param[${pi}].getStartValue()`, log)
+          ? await probeHostObject(startValueResult.value, `component[${ci}].param[${pi}].getStartValue()`, log, budget)
           : { label: `component[${ci}].param[${pi}].getStartValue()`, exists: false, error: String(startValueResult.error.message || startValueResult.error) };
 
         // `getValue` is not used anywhere else in this codebase — its
         // existence on ComponentParam is unconfirmed. Feature-detected,
         // never assumed.
         let getValueProbe = { label: `component[${ci}].param[${pi}].getValue()`, exists: false, note: "getValue is not a function on this param" };
-        if (typeof param.getValue === "function") {
+        if (typeof param.getValue === "function" && !(budget && budget.isExpired())) {
           const getValueResult = await safeResolve(() => param.getValue(), { log, label: `component[${ci}].param[${pi}].getValue()` });
           getValueProbe = getValueResult.ok
-            ? await probeHostObject(getValueResult.value, `component[${ci}].param[${pi}].getValue()`, log)
+            ? await probeHostObject(getValueResult.value, `component[${ci}].param[${pi}].getValue()`, log, budget)
             : { label: `component[${ci}].param[${pi}].getValue()`, exists: false, error: String(getValueResult.error.message || getValueResult.error) };
         }
 
@@ -422,15 +466,18 @@ export async function deepProbeMogrt(trackItem, log) {
       }
 
       components.push({ componentIndex: ci, probe: componentProbe, params });
+      if (partial) break;
     }
   }
 
+  log("[stage] serializing raw probe results…", "info");
   log(
-    `Raw probe complete: ${components.length} component(s) probed, ${components.reduce((sum, c) => sum + c.params.length, 0)} param(s) probed in depth.`,
-    "success"
+    `Raw probe complete: ${components.length} component(s) probed, ${components.reduce((sum, c) => sum + c.params.length, 0)} param(s) probed in depth.` +
+      (partial ? " (STOPPED EARLY — time budget or cancellation)" : ""),
+    partial ? "warn" : "success"
   );
 
-  return { trackItemProbe, projectItemProbe, components };
+  return { trackItemProbe, projectItemProbe, components, partial };
 }
 
 /**
@@ -467,6 +514,31 @@ export async function runScanWithGuaranteedCleanup(scanFn, cleanupFn, log) {
   return { report, scanError, cleanupResult };
 }
 
+// The single in-flight diagnostic run's cancel token, if any — module-level
+// because the UI's Cancel button (src/ui/templateInspectorPanel.js) has no
+// other way to reach a scan already in progress inside diagnoseMogrt(). Only
+// one diagnostic can run at a time (the panel disables the run button while
+// `diagnosing` is true), so a single slot is enough. This is a *cooperative*
+// cancel: it doesn't abort any in-flight host call, it just makes the next
+// budget check (between fields/methods/params/components) stop early — see
+// src/ppro/deepProbe.js's createScanBudget().
+let activeCancelToken = null;
+
+/**
+ * Ask the currently-running diagnostic scan (if any) to stop at its next
+ * checkpoint. Returns true if there was one to cancel. A reload of the
+ * panel (rather than clicking Cancel) can't be intercepted the same way —
+ * the whole JS context is torn down, so nothing can run its cleanup after
+ * that point; Cancel first if you can.
+ */
+export function cancelActiveDiagnostic() {
+  if (activeCancelToken) {
+    activeCancelToken.cancelled = true;
+    return true;
+  }
+  return false;
+}
+
 /**
  * Insert a .mogrt on the active sequence, run the deep component dump on it,
  * clean up the temporary clip, and return the full structured report. Reuses
@@ -474,12 +546,20 @@ export async function runScanWithGuaranteedCleanup(scanFn, cleanupFn, log) {
  * ./mogrt.js) so this mode's insertion behavior can't drift from the regular
  * inspector's.
  *
+ * Bounded to finish within `opts.scanBudgetMs` (default
+ * DEFAULT_SCAN_BUDGET_MS, ~12s) regardless of how much there is to probe or
+ * whether anything in the probed object graph hangs — see
+ * src/ppro/deepProbe.js's module doc-comment for the three independent
+ * bounds (per-call timeout, shared scan budget, structural caps) that make
+ * this guarantee hold.
+ *
  * @param {Object} opts
  * @param {string} opts.mogrtPath
  * @param {(message: string, level?: string) => void} opts.log
+ * @param {number} [opts.scanBudgetMs]
  */
 export async function diagnoseMogrt(opts) {
-  const { mogrtPath, log } = opts;
+  const { mogrtPath, log, scanBudgetMs = DEFAULT_SCAN_BUDGET_MS } = opts;
 
   log("════ Diagnostic Inspector — start ════", "info");
 
@@ -488,90 +568,120 @@ export async function diagnoseMogrt(opts) {
     return { ok: false, step: "mogrt-path" };
   }
 
-  let project, sequence;
+  // One cancel token per run, published to the module-level slot so the
+  // UI's Cancel button can reach it (see activeCancelToken above). Cleared
+  // in `finally` no matter how this function returns, so a stale token can
+  // never linger and "cancel" a future, unrelated run.
+  const cancelToken = { cancelled: false };
+  activeCancelToken = cancelToken;
+  const budget = createScanBudget({ totalMs: scanBudgetMs, cancelToken });
+
   try {
-    ({ project, sequence } = await requireActiveProjectAndSequence());
-  } catch (err) {
-    log(`✗ No active project/sequence: ${err.message || err}`, "error");
-    log("════ Diagnostic Inspector aborted ════", "error");
-    return { ok: false, step: "sequence" };
-  }
+    let project, sequence;
+    try {
+      ({ project, sequence } = await requireActiveProjectAndSequence());
+    } catch (err) {
+      log(`✗ No active project/sequence: ${err.message || err}`, "error");
+      log("════ Diagnostic Inspector aborted ════", "error");
+      return { ok: false, step: "sequence" };
+    }
 
-  const tracksResult = await safeAsync(() => listVideoTracks(sequence));
-  if (!tracksResult.ok || tracksResult.value.length === 0) {
-    log(
-      tracksResult.ok
-        ? "✗ No video track available to insert a temporary inspection clip onto."
-        : `✗ listVideoTracks() threw: ${tracksResult.error.message || tracksResult.error}`,
-      "error"
+    const tracksResult = await safeAsync(() => listVideoTracks(sequence));
+    if (!tracksResult.ok || tracksResult.value.length === 0) {
+      log(
+        tracksResult.ok
+          ? "✗ No video track available to insert a temporary inspection clip onto."
+          : `✗ listVideoTracks() threw: ${tracksResult.error.message || tracksResult.error}`,
+        "error"
+      );
+      log("════ Diagnostic Inspector aborted ════", "error");
+      return { ok: false, step: "track" };
+    }
+    const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
+
+    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
+    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+
+    log(`[stage] inserting clip from: ${mogrtPath}`, "info");
+    const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex));
+    if (!insertResult.ok) {
+      log(`✗ Couldn't insert this .mogrt: ${insertResult.error.message || insertResult.error}`, "error");
+      log("════ Diagnostic Inspector aborted — nothing to inspect ════", "error");
+      return { ok: false, step: "insert" };
+    }
+    const trackItem = insertResult.value;
+    log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
+
+    // Cleanup is guaranteed even if either scan throws OR the scan budget/
+    // cancellation cuts it short — see runScanWithGuaranteedCleanup()'s doc
+    // comment for the crash failure mode, and deepProbe.js's module
+    // doc-comment for the hang failure mode this budget fixes. Both the
+    // classification scan and the deeper raw probe run against the same
+    // single inserted clip and share the SAME budget, so there's only one
+    // insert/cleanup cycle and one overall time bound regardless of how
+    // much probing happens.
+    const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
+      async () => {
+        const componentReport = await deepDumpComponentChain(trackItem, log, budget);
+        const rawProbe = await deepProbeMogrt(trackItem, log, {
+          budget,
+          expectedComponentCount: componentReport.components.length,
+          expectedParamCounts: componentReport.components.map((c) => c.paramCount),
+        });
+        log("[stage] serializing results…", "info");
+        return { ...componentReport, rawProbe, partial: Boolean(componentReport.classificationPartial || rawProbe.partial) };
+      },
+      () => {
+        log("[stage] cleaning up (removing temporary inspection clip)…", "info");
+        return safeAsync(() => removeTrackItem(project, sequence, trackItem));
+      },
+      log
     );
-    log("════ Diagnostic Inspector aborted ════", "error");
-    return { ok: false, step: "track" };
-  }
-  const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
+    const report = scanReport ?? { trackItem: null, components: [], scanStoppedEarly: true, rawProbe: null, partial: true };
 
-  const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-  const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+    if (cleanupResult.ok && cleanupResult.value) {
+      log("Removed temporary inspection clip.", "info");
+    } else {
+      log(
+        `Couldn't remove the temporary inspection clip (${
+          cleanupResult.ok ? "transaction reported failure" : cleanupResult.error.message || cleanupResult.error
+        }) — you may need to delete it from the timeline by hand.`,
+        "warn"
+      );
+    }
 
-  log(`Inserting temporary inspection clip from: ${mogrtPath}`, "info");
-  const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex));
-  if (!insertResult.ok) {
-    log(`✗ Couldn't insert this .mogrt: ${insertResult.error.message || insertResult.error}`, "error");
-    log("════ Diagnostic Inspector aborted — nothing to inspect ════", "error");
-    return { ok: false, step: "insert" };
-  }
-  const trackItem = insertResult.value;
-  log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
+    const cleanupOk = cleanupResult.ok && cleanupResult.value === true;
 
-  // Cleanup is guaranteed even if either scan throws unexpectedly — see
-  // runScanWithGuaranteedCleanup()'s doc comment for the failure mode this
-  // fixes. Both the classification scan and the deeper raw probe run
-  // against the same single inserted clip, so there's only one insert/
-  // cleanup cycle regardless of how much probing happens.
-  const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
-    async () => {
-      const componentReport = await deepDumpComponentChain(trackItem, log);
-      const rawProbe = await deepProbeMogrt(trackItem, log);
-      return { ...componentReport, rawProbe };
-    },
-    () => safeAsync(() => removeTrackItem(project, sequence, trackItem)),
-    log
-  );
-  const report = scanReport ?? { trackItem: null, components: [], scanStoppedEarly: true, rawProbe: null };
+    if (scanError) {
+      log("════ Diagnostic Inspector — finished with errors (cleanup still ran) ════", "error");
+      return {
+        ok: false,
+        step: "scan",
+        mogrtPath,
+        error: String(scanError.message || scanError),
+        generatedAt: new Date().toISOString(),
+        ...report,
+        cleanupOk,
+      };
+    }
 
-  if (cleanupResult.ok && cleanupResult.value) {
-    log("Removed temporary inspection clip.", "info");
-  } else {
-    log(
-      `Couldn't remove the temporary inspection clip (${
-        cleanupResult.ok ? "transaction reported failure" : cleanupResult.error.message || cleanupResult.error
-      }) — you may need to delete it from the timeline by hand.`,
-      "warn"
-    );
-  }
+    if (report.partial) {
+      log(
+        `════ Diagnostic Inspector — finished with PARTIAL results (${cancelToken.cancelled ? "cancelled" : "time budget exceeded"} — cleanup still ran) ════`,
+        "warn"
+      );
+    } else {
+      log("════ Diagnostic Inspector — finished ════", "info");
+    }
 
-  const cleanupOk = cleanupResult.ok && cleanupResult.value === true;
-
-  if (scanError) {
-    log("════ Diagnostic Inspector — finished with errors (cleanup still ran) ════", "error");
     return {
-      ok: false,
-      step: "scan",
+      ok: true,
       mogrtPath,
-      error: String(scanError.message || scanError),
       generatedAt: new Date().toISOString(),
       ...report,
       cleanupOk,
     };
+  } finally {
+    if (activeCancelToken === cancelToken) activeCancelToken = null;
   }
-
-  log("════ Diagnostic Inspector — finished ════", "info");
-
-  return {
-    ok: true,
-    mogrtPath,
-    generatedAt: new Date().toISOString(),
-    ...report,
-    cleanupOk,
-  };
 }

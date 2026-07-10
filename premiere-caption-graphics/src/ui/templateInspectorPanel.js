@@ -3,7 +3,7 @@ import { store } from "../state/store.js";
 import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { inspectMogrt } from "../ppro/templateInspector.js";
-import { diagnoseMogrt } from "../ppro/diagnostics.js";
+import { diagnoseMogrt, cancelActiveDiagnostic } from "../ppro/diagnostics.js";
 import { saveActiveTemplate } from "../state/settings.js";
 import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
 import { describeCompatibilityLabel } from "../presets/contractValidation.js";
@@ -110,6 +110,16 @@ async function runDiagnostic() {
   }
 }
 
+function cancelDiagnostic() {
+  const cancelled = cancelActiveDiagnostic();
+  log(
+    cancelled
+      ? "Cancel requested — the scan will stop at its next checkpoint (may take up to a second) and still clean up the temporary clip."
+      : "Nothing to cancel — no diagnostic scan is currently running.",
+    cancelled ? "warn" : "info"
+  );
+}
+
 async function saveDiagnosticJson() {
   const { lastDiagnostic } = store.getState().templateInspector;
   if (!lastDiagnostic || !lastDiagnostic.ok) {
@@ -153,7 +163,11 @@ async function saveRawProbeJson() {
 function diagnosticSummaryBlock(result, diagnosing) {
   if (diagnosing) {
     return el("div", { class: "inspector-results" }, [
-      el("div", { class: "status-line log-info", text: "⏳ Running diagnostic scan — inserting a temporary clip, reading its component chain, and running the deeper raw probe… see Log below for progress." }),
+      el("div", {
+        class: "status-line log-info",
+        text: "⏳ Running diagnostic scan — inserting a temporary clip, reading its component chain, and running the deeper raw probe… " +
+          "bounded to finish within ~12s even if something hangs; see Log below for live per-component/per-param progress, or click Cancel to stop early.",
+      }),
     ]);
   }
   if (!result) return null;
@@ -186,6 +200,13 @@ function diagnosticSummaryBlock(result, diagnosing) {
       "See the raw probe (below) for what's actually inside each one.";
 
   return el("div", { class: "inspector-results" }, [
+    result.partial
+      ? el("div", {
+          class: "status-line log-warn",
+          text: "⚠ PARTIAL RESULTS — the scan stopped early (time budget exceeded or cancelled) before finishing every component/param. " +
+            "What's below/in the saved JSON is everything collected up to that point, not the whole picture. Re-run with a longer budget if you need more.",
+        })
+      : null,
     el("div", {
       class: `status-line ${foundCustomControls ? "log-success" : "log-warn"}`,
       text: headline,
@@ -245,6 +266,12 @@ export function renderTemplateInspectorPanel(onChange) {
       onChange();
     },
   });
+  const cancelDiagnosticBtn = el("button", {
+    class: "btn",
+    text: "Cancel",
+    disabled: !ti.diagnosing || undefined,
+    onClick: () => cancelDiagnostic(),
+  });
   const saveDiagnosticBtn = el("button", {
     class: "btn",
     text: "Save diagnostic JSON…",
@@ -292,10 +319,13 @@ export function renderTemplateInspectorPanel(onChange) {
           "effect-or-unknown. Also runs a deeper raw probe — the real shape (Object.keys, prototype methods, " +
           "constructor, safely-called zero-arg getters) of the track item, its project item, and every " +
           "component/param/resolved value — saved as its own JSON, for when nothing classifies as a custom " +
-          "control but the real editable controls must be reachable some other way. See docs/MOGRT_DIAGNOSTIC.md.",
+          "control but the real editable controls must be reachable some other way. Every host value read is " +
+          "timeout-guarded and the whole scan has a shared time budget (~12s), so it always finishes — with " +
+          "partial results, clearly marked, if it ran out of time — instead of hanging. See " +
+          "docs/MOGRT_DIAGNOSTIC.md.",
       ]
     ),
-    el("div", { class: "row" }, [diagnosticBtn, saveDiagnosticBtn, saveRawProbeBtn]),
+    el("div", { class: "row" }, [diagnosticBtn, cancelDiagnosticBtn, saveDiagnosticBtn, saveRawProbeBtn]),
     diagnosticSummaryBlock(ti.lastDiagnostic, ti.diagnosing),
   ]);
 }

@@ -231,3 +231,52 @@ human-reviewed mapping for anything else) will be built against next. The
 milestone before that design work resumes is still open: proving at least
 one genuinely custom MOGRT control (ideally the caption text) can be found
 and read.
+
+## Second real host run: the deep probe hung indefinitely
+
+[CONFIRMED — real Premiere Pro 26.3 host] Running the Diagnostic Inspector
+again (after the classification fix and value-serialization fix above) hung
+on "Running diagnostic scan" and never completed — no JSON could be saved.
+Root cause: the deep probe (added in commit 3371e29) awaited every
+Promise-like host value it found with no timeout at all. Something in the
+probed object graph — the track item, its project item, one of the three
+components, or one of their 20 params — is Promise-like (has a `.then`) but
+never calls either callback, so a bare `await` on it blocked forever, and
+because everything in the probe runs sequentially, that one stuck `await`
+stalled the entire scan.
+
+Fixed with three independent, stacked bounds (see `src/ppro/deepProbe.js`'s
+module doc-comment for the full rationale):
+
+1. **Per-call timeout** (`src/ppro/introspect.js`'s `withTimeout()` /
+   `resolveHostValueDetailed()` / `safeResolve()`, default 400ms) — no
+   single host value is ever awaited past this, timeout or not; a timed-out
+   field/method is recorded as `{ timedOut: true, method, stage }` and the
+   scan moves on.
+2. **A shared scan budget** (`createScanBudget()`, default ~12s total,
+   plus a cooperative cancel token) — checked before every single field
+   read, method call, param, and component, so total scan time is bounded
+   regardless of how much there is to probe (a per-call timeout alone
+   doesn't bound *breadth* — e.g. 20 params × up to 300 fields each could
+   still add up to minutes even at 400ms/call). The moment it expires,
+   remaining work is recorded as skipped/truncated rather than attempted,
+   and the run finishes with `partial: true` instead of hanging.
+3. **Structural caps** (max prototype depth, max own-property count, max
+   method calls, max array sample size) plus WeakSet-based cycle detection
+   (a self-referential array or object no longer causes infinite
+   recursion in `summarizeHostValue()`) — bounds the sheer *amount* of work
+   even if the first two bounds were somehow bypassed.
+
+Also added: a **Cancel** button (cooperative — stops at the next budget
+checkpoint, up to ~1 timeout-worth of delay, not instant) and explicit
+`[stage] …` progress log lines (inserting clip → reading track item →
+probing project item → probing component *i*/*N* → probing parameter
+*j*/*M* → serializing results → cleaning up) so a long-running scan is
+never silent while it works.
+
+**Net effect: the Diagnostic Inspector is now guaranteed to finish within
+its scan budget (~12s) and always produce a result — full or partial — and
+always clean up the temporary clip, no matter what the probed object graph
+does.** Run it again and share the (possibly partial) JSON; a `partial:
+true` result still tells us a lot about what was found before time ran
+out.

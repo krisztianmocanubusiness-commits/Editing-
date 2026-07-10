@@ -7,7 +7,12 @@ import {
   probeObjectShape,
   probeSafeMethods,
   probeHostObject,
+  createScanBudget,
 } from "../src/ppro/deepProbe.js";
+
+function neverResolves() {
+  return new Promise(() => {});
+}
 
 test("summarizeHostValue handles null/undefined/primitives", () => {
   assert.deepEqual(summarizeHostValue(null), { kind: "null" });
@@ -192,4 +197,150 @@ test("probeHostObject combines shape and method probing into one result", async 
   assert.equal(result.shape.exists, true);
   assert.equal(result.methods.exists, true);
   assert.ok(result.methods.methods.some((m) => m.name === "getFoo" && m.called === true));
+});
+
+// --- Regression tests: hang-proofing (a Promise that never resolves, a
+// cyclic host object, an extremely deep prototype chain, a collection with
+// a huge reported length) and budget/cancellation-driven early stopping. ---
+
+test("probeObjectShape reports timedOut:true for a field whose value is a Promise that never resolves, instead of hanging", async () => {
+  const start = Date.now();
+  const obj = { pending: neverResolves() };
+  const result = await probeObjectShape(obj, "thing");
+  const elapsed = Date.now() - start;
+  assert.deepEqual(result.fields.pending, { wasPromiseLike: true, timedOut: true, method: "thing.pending", stage: "field-read" });
+  assert.ok(elapsed < 2000, `expected probeObjectShape to bail out well under the default per-call timeout budget, took ${elapsed}ms`);
+});
+
+test("probeSafeMethods reports timedOut:true for a method that returns a Promise that never resolves, instead of hanging", async () => {
+  const start = Date.now();
+  const obj = { getStuck: () => neverResolves() };
+  const result = await probeSafeMethods(obj, "thing");
+  const elapsed = Date.now() - start;
+  const entry = result.methods.find((m) => m.name === "getStuck");
+  assert.deepEqual(entry, { name: "getStuck", argCount: 0, called: true, timedOut: true, method: "thing.getStuck()", stage: "method-call" });
+  assert.ok(elapsed < 2000, `expected probeSafeMethods to bail out well under the default per-call timeout budget, took ${elapsed}ms`);
+});
+
+test("summarizeHostValue detects a cyclic array (an array containing itself) instead of recursing forever", () => {
+  const arr = [1, 2];
+  arr.push(arr);
+  const start = Date.now();
+  const summary = summarizeHostValue(arr);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 500, `expected summarizeHostValue to return promptly for a cyclic array, took ${elapsed}ms`);
+  assert.equal(summary.kind, "array");
+  assert.equal(summary.sample[2].kind, "cyclic-reference");
+});
+
+test("summarizeHostValue detects a self-referential object without recursing into it more than once", () => {
+  const obj = {};
+  obj.self = obj;
+  assert.doesNotThrow(() => summarizeHostValue(obj));
+});
+
+test("summarizeHostValue never attempts to iterate a non-array object by a huge reported .length — classification only reads the field's value", () => {
+  const start = Date.now();
+  const summary = summarizeHostValue({ length: 999999999 });
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 500, `expected this to return promptly regardless of the reported length, took ${elapsed}ms`);
+  assert.equal(summary.kind, "collection-like");
+  assert.equal(summary.shallowPrimitiveFields.length, 999999999);
+});
+
+test("probeObjectShape/probeSafeMethods bound an extremely deep prototype chain to MAX_PROTO_DEPTH instead of walking all of it", async () => {
+  // Build a chain of 50 nested prototypes, each contributing one uniquely-
+  // named method — real prototype chains are never this deep, but nothing
+  // should hang or crash if one somehow were.
+  let proto = Object.prototype;
+  for (let i = 0; i < 50; i++) {
+    const level = Object.create(proto);
+    level[`getLevel${i}`] = () => i;
+    proto = level;
+  }
+  const obj = Object.create(proto);
+
+  const shape = await probeObjectShape(obj, "thing");
+  const methods = await probeSafeMethods(obj, "thing");
+
+  // Only names from the first few prototype levels should have been
+  // collected — not all 50 — proving the depth cap is actually enforced.
+  assert.ok(shape.prototypeMethodNames.length < 50, `expected far fewer than 50 method names, got ${shape.prototypeMethodNames.length}`);
+  assert.ok(methods.allMethodNames.length < 50, `expected far fewer than 50 method names, got ${methods.allMethodNames.length}`);
+});
+
+test("createScanBudget reports expired once totalMs has elapsed", async () => {
+  const budget = createScanBudget({ totalMs: 10 });
+  assert.equal(budget.isExpired(), false);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(budget.isExpired(), true);
+  assert.equal(budget.reason(), "time-budget-exceeded");
+});
+
+test("createScanBudget reports expired immediately once its cancelToken is marked cancelled, regardless of totalMs", () => {
+  const cancelToken = { cancelled: false };
+  const budget = createScanBudget({ totalMs: 60000, cancelToken });
+  assert.equal(budget.isExpired(), false);
+  cancelToken.cancelled = true;
+  assert.equal(budget.isExpired(), true);
+  assert.equal(budget.reason(), "cancelled");
+});
+
+test("probeObjectShape stops reading further fields once the budget expires, marking the result truncated", async () => {
+  const cancelToken = { cancelled: true }; // already expired
+  const budget = createScanBudget({ totalMs: 60000, cancelToken });
+  const obj = { a: 1, b: 2, c: 3 };
+  const result = await probeObjectShape(obj, "thing", undefined, budget);
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, "cancelled");
+});
+
+test("probeObjectShape truncates mid-loop when the budget expires partway through, instead of processing every remaining field", async () => {
+  let reads = 0;
+  const cancelToken = { cancelled: false };
+  const budget = createScanBudget({ totalMs: 60000, cancelToken });
+  const obj = {};
+  Object.defineProperty(obj, "a", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      cancelToken.cancelled = true; // expire the budget partway through the loop
+      return 1;
+    },
+  });
+  obj.b = 2;
+  obj.c = 3;
+  const result = await probeObjectShape(obj, "thing", undefined, budget);
+  assert.equal(reads, 1, "only the first field should have been read before the budget expired");
+  assert.equal(result.truncated, true);
+});
+
+test("probeSafeMethods stops calling further methods once the budget expires, listing the rest as skipped rather than calling them", async () => {
+  const cancelToken = { cancelled: false };
+  const budget = createScanBudget({ totalMs: 60000, cancelToken });
+  let calls = 0;
+  const obj = {
+    getFirst: () => {
+      calls += 1;
+      cancelToken.cancelled = true;
+      return "first";
+    },
+    getSecond: () => {
+      calls += 1;
+      return "second";
+    },
+  };
+  const result = await probeSafeMethods(obj, "thing", undefined, budget);
+  assert.equal(calls, 1, "the second method must never be called once the budget expired");
+  const second = result.methods.find((m) => m.name === "getSecond");
+  assert.equal(second.called, false);
+  assert.equal(second.reason, "cancelled");
+});
+
+test("probeHostObject skips both shape and method probing entirely when the budget is already expired", async () => {
+  const budget = createScanBudget({ totalMs: 60000, cancelToken: { cancelled: true } });
+  const obj = { a: 1, getFoo: () => "bar" };
+  const result = await probeHostObject(obj, "thing", undefined, budget);
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, "cancelled");
 });

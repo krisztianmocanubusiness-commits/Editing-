@@ -36,16 +36,26 @@ and irrelevant to whether the Premiere-facing calls work.
     params above that layer owns — un-exposed properties are invisible to
     scripting.
 
-## 2. Load the plugin
+## 2. Build, then load the plugin
 
-1. Open UDT → **Add Plugin** → select
+1. From `premiere-caption-graphics/`, run `npm install` then `npm run build`
+   — this produces `dist/main.js`, the actual file the panel loads (see the
+   top-level README's "How it works" section for why a build step exists).
+   Re-run `npm run build` any time you change source and want to test
+   again, or run `npm run build:watch` in a separate terminal to rebuild
+   automatically.
+2. Open UDT → **Add Plugin** → select
    `premiere-caption-graphics/manifest.json` from this repo.
-2. Click **Load** next to the plugin entry (Premiere Pro must already be
+3. Click **Load** next to the plugin entry (Premiere Pro must already be
    running with a project open).
-3. Click **Watch** (optional, for live-reload on file changes) and **Debug**
+4. Click **Watch** (optional, for live-reload on file changes) and **Debug**
    — Debug opens the DevTools console this test's log lines are mirrored
    to (`src/util/log.js` writes every line to both the panel and this
-   console).
+   console). You should immediately see `[Caption Graphics Studio] entry
+   script started` followed by UXP/host version lines and a "section
+   mounted" line for each of the 7 panel sections — if you don't, the
+   panel isn't executing at all; see the top-level README's "How it works"
+   section.
 4. In Premiere: **Window → Extensions → Caption Graphics Studio** to open
    the panel if it isn't already docked/floating.
 

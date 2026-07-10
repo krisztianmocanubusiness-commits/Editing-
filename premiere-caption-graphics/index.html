@@ -18,6 +18,15 @@
       <div id="log-body" class="log-body"></div>
     </section>
 
-    <script type="module" src="src/main.js"></script>
+    <!--
+      Plain classic script — do NOT change this to type="module". UXP's
+      panel webview does not reliably execute a multi-file
+      <script type="module"> import/export graph (confirmed on Premiere
+      Pro 26.3: blank panel, zero console output). dist/main.js is a
+      single-file bundle produced by `npm run build` (esbuild) from
+      src/main.js and everything it imports; see src/main.js's header
+      comment and test/entrypoint.test.js.
+    -->
+    <script src="dist/main.js"></script>
   </body>
 </html>

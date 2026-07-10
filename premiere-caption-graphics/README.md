@@ -7,9 +7,20 @@ style preset (font, gradient, background box, position, tracking, shadow,
 blur, entrance/exit animation, emphasis rules), preview it, and apply it as
 real, editable Premiere text layers.
 
-No build step required — it's plain ES modules loaded straight by UXP's
-JavaScript engine, the same pattern Adobe uses for its own hand-written
-`metadata-handler` sample panel.
+Source is written as plain ES modules (readable, no framework), but Premiere
+Pro's UXP panel webview does not reliably execute a multi-file
+`<script type="module">` graph — confirmed on Premiere Pro 26.3: it produced
+a blank panel with zero console output, because `src/main.js` never ran (see
+its header comment for the full story). So there **is** a build step: `npm
+run build` (esbuild) bundles `src/main.js` and everything it imports into
+one plain script, `dist/main.js`, which `index.html` loads via a normal
+`<script src="dist/main.js"></script>` — no `import`/`export`, no
+`type="module"`, anywhere in what actually ships to the panel. The two real
+UXP host modules (`premierepro`, `uxp`) are accessed via literal `require()`
+calls that pass straight through the bundle untouched (see
+`src/ppro/client.js`), which is UXP's actual, documented module mechanism —
+matching Adobe's own `uxp-premiere-pro-samples` reference panel, which is
+also TypeScript/ESM source bundled (via Vite) into a single shipped file.
 
 ## How it works, end to end
 
@@ -35,11 +46,24 @@ transcript file / clip transcript
 
 ## Setup
 
-1. Install the [UXP Developer Tool](https://developer.adobe.com/uxp/) and Premiere Pro 25.1+.
-2. In UDT, "Add Plugin" → point it at this folder's `manifest.json`.
-3. Load the plugin into a running Premiere Pro project. The panel appears
-   under Window → Extensions → **Caption Graphics Studio**.
-4. Author (or license) at least one `.mogrt` matching
+1. From this folder (`premiere-caption-graphics/`), run:
+   ```
+   npm install
+   npm run build
+   ```
+   `npm install` fetches the one build-time dependency (`esbuild`) — nothing
+   is required at runtime. `npm run build` produces `dist/main.js`. Re-run
+   `npm run build` after every source change (or use `npm run build:watch`
+   to rebuild automatically while you edit — leave it running in a separate
+   terminal).
+2. Install the [UXP Developer Tool](https://developer.adobe.com/uxp/) and Premiere Pro 25.1+.
+3. In UDT, **"Add Plugin"** → select **this folder's `manifest.json`**
+   (`premiere-caption-graphics/manifest.json`) — not the `dist/` folder,
+   not the repo root.
+4. Click **Load** (and **Debug**, to see the console) next to the plugin
+   entry, with Premiere Pro already running and a project open. The panel
+   appears under Window → Extensions → **Caption Graphics Studio**.
+5. Author (or license) at least one `.mogrt` matching
    **[`mogrt-contracts/KERIS_CAPTION_V1.md`](mogrt-contracts/KERIS_CAPTION_V1.md)**
    — the first real, buildable contract this extension ships against (10
    required exposed params). Use the panel's **"1. Template Inspector"**
@@ -47,6 +71,12 @@ transcript file / clip transcript
    `docs/TEMPLATE_INSPECTOR.md`), or import one of the four ready-made
    presets in `mogrt-contracts/presets/` and fill in its `mogrt.path`
    directly.
+
+If the panel loads but shows only the static header and an empty Log box —
+no sections, silence in the console — that's exactly the symptom this build
+step fixes; make sure step 1 actually ran and produced `dist/main.js`
+(`ls dist/main.js` from this folder should show the file) before reloading
+the plugin in UDT.
 
 ## Validate the host connection first
 
@@ -127,6 +157,11 @@ read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
   persists the "active template" (path + contract id) across panel
   restarts via `localStorage`, with an in-memory fallback if that's not
   available in a given UXP host version.
+- `src/main.js` — the panel entrypoint. Authored as an ES module like
+  everything else in `src/`, but never loaded directly — see "How it
+  works" above and this file's own header comment.
+- `dist/main.js` — **build output, not committed** (gitignored). Produced
+  by `npm run build`; this is the actual file `index.html` loads.
 - `mogrt-authoring/` — the spec for building templates this extension can
   drive, and everything unconfirmed about the live scripting API.
 - `docs/PREMIERE_HOST_TEST.md` — manual, in-Premiere validation steps for
@@ -139,16 +174,23 @@ read the output: **[`docs/PREMIERE_HOST_TEST.md`](docs/PREMIERE_HOST_TEST.md)**.
   keyword scoring, all transcript parsers, preset flattening, the
   `KERIS_CAPTION_V1` contract (including that its markdown spec and JS
   definition haven't drifted apart, and that all four example presets
-  resolve correctly against it), settings persistence, and the active-
-  template fallback. These run without Premiere; the `src/ppro/*`
-  scripting layer cannot be unit-tested outside a live host — that's what
-  the smoke test panel, Template Inspector, and their docs are for.
+  resolve correctly against it), settings persistence, the active-
+  template fallback, and `entrypoint.test.js` (a static regression guard
+  making sure `index.html` never goes back to `<script type="module">`
+  and always loads `dist/main.js`). These run without Premiere; the
+  `src/ppro/*` scripting layer cannot be unit-tested outside a live host —
+  that's what the smoke test panel, Template Inspector, and their docs
+  are for.
 
 ## Running the tests
 
 ```
+npm install
 npm test
 ```
+
+`npm test` (`node --test`) only exercises the pure-logic modules — it does
+not require `npm run build` to have run first.
 
 ## Known limitations — please read before relying on this in production
 

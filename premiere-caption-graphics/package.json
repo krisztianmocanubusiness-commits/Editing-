@@ -5,7 +5,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "esbuild src/main.js --bundle --outfile=dist/main.js --format=iife --external:premierepro --external:uxp --log-level=info",
+    "build:watch": "esbuild src/main.js --bundle --outfile=dist/main.js --format=iife --external:premierepro --external:uxp --watch",
     "test": "node --test"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
 }

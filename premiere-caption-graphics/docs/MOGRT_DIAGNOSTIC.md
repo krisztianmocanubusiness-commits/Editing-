@@ -280,3 +280,102 @@ always clean up the temporary clip, no matter what the probed object graph
 does.** Run it again and share the (possibly partial) JSON; a `partial:
 true` result still tells us a lot about what was found before time ran
 out.
+
+## Third real host run: the breakthrough — AE.ADBE Text exists, and now we know why the probe hung
+
+[CONFIRMED — real Premiere Pro 26.3 host, "Keris Master Caption.mogrt"] The
+raw probe (before the fix below) reached a **4th component that the
+classification scan never got to**: `componentIndex: 3`, `matchName:
+"AE.ADBE Text"`, `getParamCount(): 22`. This is the genuine, editable MOGRT
+text component — the thing this whole diagnostic effort has been trying to
+find since the first real host run. The raw probe only got through 12 of
+its 22 params before the scan budget ran out.
+
+**Root cause, confirmed by inspecting the raw probe's own method list**:
+every `ComponentParam` exposes a method called `getValueAtTime`, and
+`probeSafeMethods()`'s only "does this need arguments?" signal —
+`function.length` (`argCount`) — reported **0** for it, same as any real
+zero-arg getter. But `getValueAtTime` genuinely requires a `TickTime`
+argument; called with none, it doesn't return quickly, it hangs until the
+per-call timeout fires. With `getValueAtTime` auto-called once per param
+via the generic method-probing pass, that's dozens of guaranteed 400ms
+timeouts before the scan could even reach component index 3 — almost the
+entire scan budget, gone on a method that should never have been called at
+all. `getParam()` has the same reported-argCount-of-0 problem (calling it
+with no index returns `"Invalid parameter"` rather than hanging, but it's
+the same underlying host-proxy quirk: **Premiere's host-proxy functions
+cannot be trusted to report their own real argument count.**
+
+### The fix
+
+1. **`function.length`/`argCount` is no longer treated as sufficient
+   evidence a method is safe to auto-call.** `src/ppro/deepProbe.js` now
+   has an explicit denylist (`NEVER_AUTO_CALL_EXACT_NAMES`:
+   `getParam`, `getValueAtTime`, `findNearestKeyframe`,
+   `findNextKeyframe`, `findPreviousKeyframe`, `createSetValueAction`) plus
+   broader name-pattern exclusions (anything ending in `AtTime`, containing
+   `Keyframe`, or starting with `create`) checked **before** argCount is
+   even consulted. `getValueAtTime` is now never called anywhere in this
+   codebase unless a real `TickTime` is deliberately supplied (which
+   nothing here does yet).
+2. **A lightweight discovery-first pass.** `discoverComponents()` walks
+   the component chain reading ONLY `matchName`, `displayName`, and
+   `getParamCount()` per component — no method-probing, no per-param work.
+   Every other phase (the classification report, the deep raw probe, and a
+   new dedicated Text extraction pass) now shares this ONE discovery
+   result instead of each independently re-walking the chain, which is
+   also what fixes the classification report and raw probe disagreeing on
+   how many components exist — they literally could not agree before,
+   since each ran its own separate scan.
+3. **`AE.ADBE Text` is now its own classification tier**, `"text-editing"`
+   — an exact matchName check, confirmed real, not a heuristic guess —
+   distinct from both `intrinsic` and the generic `graphic-or-mogrt`
+   signal-based bucket. `prioritizeTextFirst()` reorders the discovered
+   component list so it's probed **before** Motion/Opacity/Crop/Graphic
+   Group in both the raw probe and the dedicated pass below, so it gets
+   first claim on the scan budget.
+4. **A dedicated `probeTextComponentDeep()` pass**, run first (before the
+   generic deep probe), that enumerates every param of the Text component
+   via `component.getParam(index)` (bounded by the real `getParamCount()`,
+   not a blind scan) and reads: `displayName`, the `getStartValue()`
+   result's constructor name, `isTimeVarying()`/`areKeyframesSupported()`
+   (best-effort, feature-detected, never fatal), and — the key fix —
+   that `getStartValue()` result's **inherited** `.value`/`.position`
+   accessor properties. Confirmed real-host shape: `getStartValue()`
+   returns `Keyframe`/`PointKeyframe` objects whose `.value`/`.position`
+   are defined on the **constructor's prototype**, not as own-enumerable
+   properties on the instance — which is exactly why the generic probe
+   reported `value: {}` for these: `Object.keys()`-only enumeration never
+   sees an inherited accessor at all. A plain property read
+   (`startValue.value`) still correctly walks the prototype chain and
+   invokes the inherited getter — no special access pattern needed, just
+   the same timeout-guarded read as anything else (see
+   `probeObjectShape()`'s new `inheritedFields`, which fixes this same gap
+   generically, not just for the dedicated Text pass).
+5. **Consistency.** `diagnoseMogrt()` now does exactly one chain-fetch and
+   one `discoverComponents()` call, sharing the result across the
+   classification report, `rawProbe`, and the new `textComponentProbe`
+   section — so `components.length` in the classification report and in
+   `rawProbe` can no longer disagree, and the top-level `partial` flag is
+   the OR of all three phases' own partial flags.
+6. **A focused `textComponentProbe` section**, saved into the raw probe
+   JSON (and also present in the main diagnostic JSON, since it's the
+   actual payload this whole effort has been after):
+   ```json
+   {
+     "componentIndex": 3,
+     "matchName": "AE.ADBE Text",
+     "displayName": "...",
+     "paramCount": 22,
+     "params": [
+       { "paramIndex": 0, "displayName": "...", "startValueConstructor": "Keyframe",
+         "value": { "kind": "string", "...": "..." }, "position": null, "errors": [], "timedOut": false }
+     ]
+   }
+   ```
+
+With `getValueAtTime` no longer wasting the budget, a targeted Text-first
+pass over 22 params should comfortably finish. Run the Diagnostic Inspector
+again — the next milestone is a JSON result listing all 22 `AE.ADBE Text`
+parameter display names and their resolved `getStartValue().value`/
+`.position`.

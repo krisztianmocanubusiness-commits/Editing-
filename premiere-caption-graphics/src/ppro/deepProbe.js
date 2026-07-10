@@ -131,7 +131,30 @@ const DANGEROUS_NAME_FRAGMENTS = [
 const CALLABLE_NAME_PATTERN = /^(get|is|has)[A-Z0-9]/;
 const CALLABLE_EXACT_NAMES = new Set(["toString", "valueOf"]);
 
+// CONFIRMED real-host bug (see docs/MOGRT_DIAGNOSTIC.md): Premiere's
+// host-proxy functions report `function.length` (this prober's only
+// "needs arguments?" signal) as 0 even when a real argument IS required —
+// `getValueAtTime()` and `getParam()` both do this. That made the probe
+// auto-call `getValueAtTime()` on every param with no time argument,
+// which reliably timed out (400ms x dozens of calls), burning almost the
+// entire scan budget before a single AE.ADBE Text param could be reached.
+// `argCount === 0` can therefore no longer be trusted as sufficient
+// evidence of safety — these exact names (and name patterns strongly
+// suggesting a required time/keyframe argument) are excluded from
+// auto-invocation UNCONDITIONALLY, regardless of what argCount claims.
+const NEVER_AUTO_CALL_EXACT_NAMES = new Set([
+  "getParam",
+  "getValueAtTime",
+  "findNearestKeyframe",
+  "findNextKeyframe",
+  "findPreviousKeyframe",
+  "createSetValueAction",
+]);
+const NEVER_AUTO_CALL_NAME_PATTERNS = [/AtTime$/i, /Keyframe/i, /^create/i];
+
 function isSafeToCallByName(name) {
+  if (NEVER_AUTO_CALL_EXACT_NAMES.has(name)) return false;
+  if (NEVER_AUTO_CALL_NAME_PATTERNS.some((re) => re.test(name))) return false;
   if (!CALLABLE_NAME_PATTERN.test(name) && !CALLABLE_EXACT_NAMES.has(name)) return false;
   const lower = name.toLowerCase();
   return !DANGEROUS_NAME_FRAGMENTS.some((frag) => lower.includes(frag));
@@ -269,12 +292,43 @@ export function formatSummaryForLog(summary) {
 }
 
 /**
+ * Reads a single field (own or inherited) via a plain property access —
+ * `obj[name]` naturally walks the prototype chain and invokes an inherited
+ * accessor's getter, so no special access pattern is needed for a
+ * prototype-defined property, just the same timeout-guarded read as any
+ * own one. Never throws.
+ */
+async function readField(obj, name, label, log) {
+  const raw = safe(() => obj[name]);
+  if (!raw.ok) {
+    return { readError: String(raw.error.message || raw.error) };
+  }
+  const wasPromiseLike = isPromiseLike(raw.value);
+  const resolved = await resolveHostValueDetailed(raw.value, { log, label: `${label}.${name}`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
+  if (!resolved.ok && resolved.timedOut) {
+    return { wasPromiseLike, timedOut: true, method: `${label}.${name}`, stage: "field-read" };
+  }
+  if (!resolved.ok) {
+    return { wasPromiseLike, readError: String(resolved.error.message || resolved.error) };
+  }
+  return { wasPromiseLike, summary: summarizeHostValue(resolved.value) };
+}
+
+/**
  * Inspect an object's real shape: own property names, own enumerable keys,
  * prototype-chain property/method names (bounded depth), constructor name,
- * and — for every OWN enumerable key — its resolved value's summary and
- * whether it was Promise-like before resolution. Never throws, never waits
- * on a single field past PROBE_CALL_TIMEOUT_MS, and stops early (marking
- * `truncated: true`) the moment `budget` (if given) expires.
+ * and every field's resolved value/Promise-like flag — for BOTH own
+ * enumerable keys (`fields`) AND non-method properties found only on the
+ * prototype chain (`inheritedFields`). The latter matters because several
+ * confirmed real-host result types (`Keyframe`/`PointKeyframe`, returned by
+ * `ComponentParam.getStartValue()`) expose their actual data — `.value`,
+ * `.position` — as accessor properties defined on the constructor's
+ * prototype, not as own-enumerable properties on the instance, so
+ * `Object.keys()`-only enumeration never sees them at all (this is why the
+ * probe used to report `value: {}` for these — see
+ * docs/MOGRT_DIAGNOSTIC.md). Never throws, never waits on a single field
+ * past PROBE_CALL_TIMEOUT_MS, and stops early (marking `truncated: true`)
+ * the moment `budget` (if given) expires.
  *
  * @param {*} obj
  * @param {string} label
@@ -309,22 +363,21 @@ export async function probeObjectShape(obj, label, log, budget) {
       truncated = true;
       break;
     }
-    const raw = safe(() => obj[name]);
-    if (!raw.ok) {
-      fields[name] = { readError: String(raw.error.message || raw.error) };
-      continue;
+    fields[name] = await readField(obj, name, label, log);
+  }
+
+  // Inherited (prototype-only) non-method properties not already covered
+  // above as an own key — e.g. Keyframe.prototype.value.
+  const inheritedFields = {};
+  if (!truncated) {
+    for (const name of prototypeNonMethodNames) {
+      if (ownKeys.includes(name)) continue;
+      if (budget && budget.isExpired()) {
+        truncated = true;
+        break;
+      }
+      inheritedFields[name] = await readField(obj, name, label, log);
     }
-    const wasPromiseLike = isPromiseLike(raw.value);
-    const resolved = await resolveHostValueDetailed(raw.value, { log, label: `${label}.${name}`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
-    if (!resolved.ok && resolved.timedOut) {
-      fields[name] = { wasPromiseLike, timedOut: true, method: `${label}.${name}`, stage: "field-read" };
-      continue;
-    }
-    if (!resolved.ok) {
-      fields[name] = { wasPromiseLike, readError: String(resolved.error.message || resolved.error) };
-      continue;
-    }
-    fields[name] = { wasPromiseLike, summary: summarizeHostValue(resolved.value) };
   }
 
   return {
@@ -336,6 +389,7 @@ export async function probeObjectShape(obj, label, log, budget) {
     prototypeMethodNames,
     prototypeNonMethodNames,
     fields,
+    inheritedFields,
     ...(truncated ? { truncated: true, truncatedReason: budget?.reason() ?? null } : {}),
   };
 }

@@ -7,8 +7,12 @@ import {
   readDisplayName,
   textLikeSignal,
   runScanWithGuaranteedCleanup,
+  discoverComponents,
+  prioritizeTextFirst,
+  probeTextComponentDeep,
 } from "../src/ppro/diagnostics.js";
 import { resolveHostValue, safeResolve, toSafeString, isPromiseLike } from "../src/ppro/introspect.js";
+import { createScanBudget } from "../src/ppro/deepProbe.js";
 
 test("classifyComponent recognizes the known intrinsic component names, case-insensitively", () => {
   for (const name of ["Motion", "opacity", "Time Remapping", "CROP", "Channel Volume", "Volume"]) {
@@ -20,8 +24,21 @@ test("classifyComponent recognizes the known intrinsic component names, case-ins
 test("classifyComponent flags graphic/MOGRT signals in displayName or matchName", () => {
   assert.equal(classifyComponent({ displayName: "Graphic", matchName: null }).classification, "graphic-or-mogrt");
   assert.equal(classifyComponent({ displayName: "Essential Graphics", matchName: null }).classification, "graphic-or-mogrt");
-  assert.equal(classifyComponent({ displayName: "Text", matchName: "AE.ADBE Text" }).classification, "graphic-or-mogrt");
+  // "AE.ADBE Text Document" contains "text" but is NOT an exact match for
+  // the confirmed AE.ADBE Text component matchName, so it falls to the
+  // weaker graphic-or-mogrt signal rather than the "text-editing" tier.
+  assert.equal(classifyComponent({ displayName: "Text", matchName: "AE.ADBE Text Document" }).classification, "graphic-or-mogrt");
   assert.equal(classifyComponent({ displayName: "Some MOGRT Layer", matchName: null }).classification, "graphic-or-mogrt");
+});
+
+test("classifyComponent classifies an exact AE.ADBE Text matchName as text-editing — the confirmed real MOGRT text control, distinct from both intrinsic and the generic graphic-or-mogrt signal tier", () => {
+  const byMatchName = classifyComponent({ displayName: "Text", matchName: "AE.ADBE Text" });
+  assert.equal(byMatchName.classification, "text-editing");
+  assert.match(byMatchName.reason, /confirmed via a real host run/);
+
+  // Also matches on displayName alone if that's the only field carrying it.
+  const byDisplayName = classifyComponent({ displayName: "AE.ADBE Text", matchName: null });
+  assert.equal(byDisplayName.classification, "text-editing");
 });
 
 test("classifyComponent falls back to effect-or-unknown for anything unrecognized", () => {
@@ -57,13 +74,12 @@ test("classifyComponent treats AE.ADBE Opacity/Motion/Graphic Group as intrinsic
   }
 });
 
-test("classifyComponent still flags a genuinely AE.ADBE-prefixed but otherwise-unrecognized name via a specific signal (text), not the removed blanket ae.adbe signal", () => {
-  // "ae.adbe" alone is no longer a graphic-or-mogrt signal (see the
-  // regression test above for why) — only specific signals like "text"
-  // still flag a component as a possible custom control.
-  assert.equal(classifyComponent({ displayName: null, matchName: "AE.ADBE Text" }).classification, "graphic-or-mogrt");
-  // An AE.ADBE-prefixed name with no specific signal and not in the known
-  // intrinsic list falls through to effect-or-unknown, not graphic-or-mogrt.
+test("classifyComponent no longer treats a bare ae.adbe prefix as a graphic-or-mogrt signal", () => {
+  // "ae.adbe" alone is no longer a graphic-or-mogrt signal (removed after
+  // it misclassified the three confirmed intrinsic components — see the
+  // regression test above). An AE.ADBE-prefixed name with no specific
+  // signal and not in the known intrinsic/text-editing lists falls through
+  // to effect-or-unknown, not graphic-or-mogrt.
   assert.equal(classifyComponent({ displayName: null, matchName: "AE.ADBE SomeUnknownThing" }).classification, "effect-or-unknown");
 });
 
@@ -278,4 +294,143 @@ test("runScanWithGuaranteedCleanup logs the scan crash when a log callback is gi
     runScanWithGuaranteedCleanup(scanFn, cleanupFn, (msg, level) => loggedLines.push({ msg, level }))
   );
   assert.ok(loggedLines.some((l) => /scan crashed/.test(l.msg) && l.level === "error"));
+});
+
+// --- Regression tests: discovery-first architecture (component-discovery
+// pass, AE.ADBE Text prioritization, dedicated Text extraction pass). ---
+
+function noopLog() {}
+
+function fakeParam({ displayName, value, position, isTimeVarying, areKeyframesSupported, startValueConstructorName = "Keyframe" } = {}) {
+  // `constructor` as an own data property on the prototype shadows the
+  // inherited Object.prototype.constructor, so `startValue.constructor.name`
+  // reads back `startValueConstructorName` — without ever touching the
+  // real, global `Object` constructor (which `Object.defineProperty(
+  // startValueProto.constructor, "name", ...)` would have done, since a
+  // plain object's inherited `.constructor` IS the global `Object`
+  // function).
+  const startValueProto = { constructor: { name: startValueConstructorName } };
+  if (value !== undefined) Object.defineProperty(startValueProto, "value", { enumerable: false, get: () => value });
+  if (position !== undefined) Object.defineProperty(startValueProto, "position", { enumerable: false, get: () => position });
+  const startValue = Object.create(startValueProto);
+
+  return {
+    displayName,
+    getStartValue: () => startValue,
+    ...(isTimeVarying !== undefined ? { isTimeVarying: () => isTimeVarying } : {}),
+    ...(areKeyframesSupported !== undefined ? { areKeyframesSupported: () => areKeyframesSupported } : {}),
+  };
+}
+
+function fakeComponent({ matchName, displayName, params }) {
+  return {
+    getMatchName: () => matchName,
+    getDisplayName: () => displayName,
+    getParamCount: () => params.length,
+    getParam: (i) => params[i] ?? null,
+  };
+}
+
+test("prioritizeTextFirst moves a text-editing component before intrinsic ones, preserving relative order otherwise", () => {
+  const components = [
+    { componentIndex: 0, classification: "intrinsic" },
+    { componentIndex: 1, classification: "intrinsic" },
+    { componentIndex: 2, classification: "intrinsic" },
+    { componentIndex: 3, classification: "text-editing" },
+  ];
+  const ordered = prioritizeTextFirst(components);
+  assert.deepEqual(ordered.map((c) => c.componentIndex), [3, 0, 1, 2]);
+});
+
+test("prioritizeTextFirst is a no-op (preserves order) when there is no text-editing component", () => {
+  const components = [
+    { componentIndex: 0, classification: "intrinsic" },
+    { componentIndex: 1, classification: "effect-or-unknown" },
+  ];
+  assert.deepEqual(prioritizeTextFirst(components).map((c) => c.componentIndex), [0, 1]);
+});
+
+test("discoverComponents finds AE.ADBE Text among intrinsic components using only matchName/displayName/paramCount reads (no per-param work)", async () => {
+  const chain = {
+    getComponentAtIndex: (i) => {
+      const components = [
+        fakeComponent({ matchName: "AE.ADBE Opacity", displayName: "Opacity", params: [] }),
+        fakeComponent({ matchName: "AE.ADBE Motion", displayName: "Motion", params: [] }),
+        fakeComponent({ matchName: "AE.ADBE Graphic Group", displayName: "Graphic", params: [] }),
+        fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: Array.from({ length: 22 }, (_, i) => fakeParam({ displayName: `Param ${i}` })) }),
+      ];
+      return components[i] ?? null;
+    },
+  };
+
+  const { components, partial } = await discoverComponents(chain, noopLog, undefined);
+  assert.equal(partial, false);
+  assert.equal(components.length, 4);
+  const text = components.find((c) => c.classification === "text-editing");
+  assert.ok(text, "expected a text-editing component to be discovered");
+  assert.equal(text.componentIndex, 3);
+  assert.equal(text.matchName, "AE.ADBE Text");
+  assert.equal(text.paramCount, 22);
+});
+
+test("probeTextComponentDeep probes all 22 params of a Text component and resolves each one's displayName and getStartValue().value, completing quickly (no unrelated timeout calls)", async () => {
+  const params = Array.from({ length: 22 }, (_, i) =>
+    fakeParam({ displayName: `Text Param ${i}`, value: i % 2 === 0 ? `value-${i}` : { x: i, y: i * 2 }, isTimeVarying: false, areKeyframesSupported: true })
+  );
+  const componentInfo = {
+    componentIndex: 3,
+    component: { getParam: (i) => params[i] ?? null },
+    matchName: "AE.ADBE Text",
+    displayName: "Text",
+    paramCount: 22,
+  };
+
+  const start = Date.now();
+  const result = await probeTextComponentDeep(componentInfo, noopLog, undefined);
+  const elapsed = Date.now() - start;
+
+  assert.equal(result.partial, false);
+  assert.equal(result.params.length, 22);
+  assert.ok(elapsed < 2000, `expected the 22-param Text probe to complete quickly with no timeouts involved, took ${elapsed}ms`);
+
+  for (let i = 0; i < 22; i++) {
+    const entry = result.params[i];
+    assert.equal(entry.paramIndex, i);
+    assert.equal(entry.displayName, `Text Param ${i}`);
+    assert.equal(entry.startValueConstructor, "Keyframe");
+    assert.equal(entry.timedOut, false);
+    assert.deepEqual(entry.errors, []);
+    if (i % 2 === 0) {
+      assert.equal(entry.value.kind, "string");
+    } else {
+      assert.equal(entry.value.kind, "point-like");
+    }
+  }
+});
+
+test("probeTextComponentDeep stops early and marks partial when the budget expires mid-scan, instead of finishing all 22 params", async () => {
+  const cancelToken = { cancelled: false };
+  const budget = createScanBudget({ totalMs: 60000, cancelToken });
+  let paramsRead = 0;
+  const params = Array.from({ length: 22 }, (_, i) => {
+    const p = fakeParam({ displayName: `Text Param ${i}`, value: i });
+    const originalGetStartValue = p.getStartValue;
+    p.getStartValue = () => {
+      paramsRead += 1;
+      if (paramsRead === 5) cancelToken.cancelled = true; // expire the budget partway through
+      return originalGetStartValue();
+    };
+    return p;
+  });
+  const componentInfo = {
+    componentIndex: 3,
+    component: { getParam: (i) => params[i] ?? null },
+    matchName: "AE.ADBE Text",
+    displayName: "Text",
+    paramCount: 22,
+  };
+
+  const result = await probeTextComponentDeep(componentInfo, noopLog, budget);
+  assert.equal(result.partial, true);
+  assert.ok(result.params.length < 22, `expected fewer than 22 params to have been probed, got ${result.params.length}`);
 });

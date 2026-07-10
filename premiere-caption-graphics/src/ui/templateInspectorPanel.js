@@ -153,7 +153,9 @@ async function saveRawProbeJson() {
     // @ts-ignore
     const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-raw-probe.json", { types: ["json"] });
     if (!file) return;
-    await file.write(JSON.stringify(lastDiagnostic.rawProbe, null, 2));
+    // Includes textComponentProbe (the dedicated AE.ADBE Text extraction
+    // pass) alongside the generic rawProbe, so both live in one file.
+    await file.write(JSON.stringify({ ...lastDiagnostic.rawProbe, textComponentProbe: lastDiagnostic.textComponentProbe }, null, 2));
     log(`Raw probe saved to ${file.nativePath}.`, "success");
   } catch (err) {
     log(`Saving raw probe JSON failed: ${err.message || err}`, "error");
@@ -184,20 +186,33 @@ function diagnosticSummaryBlock(result, diagnosing) {
     acc[c.classification] = (acc[c.classification] || 0) + 1;
     return acc;
   }, {});
-  const foundCustomControls = (byClass["graphic-or-mogrt"] ?? 0) > 0;
+  const textEditingCount = byClass["text-editing"] ?? 0;
+  const graphicCount = byClass["graphic-or-mogrt"] ?? 0;
+  const foundCustomControls = textEditingCount + graphicCount > 0;
 
   // Every component so far classifying as "intrinsic" (or unrecognized)
   // means nothing that looks like a genuine custom MOGRT control was
   // found — say so plainly instead of "N graphic-or-mogrt components
-  // found", which read as a success even when it wasn't one. See
-  // docs/MOGRT_DIAGNOSTIC.md.
+  // found", which read as a success even when it wasn't one. A
+  // "text-editing" component (AE.ADBE Text, confirmed via a real host run)
+  // always counts as found. See docs/MOGRT_DIAGNOSTIC.md.
   const headline = foundCustomControls
-    ? `${result.components.length} component(s) found: ${byClass.intrinsic ?? 0} intrinsic, ` +
-      `${byClass["graphic-or-mogrt"]} graphic-or-mogrt (possible custom control${byClass["graphic-or-mogrt"] === 1 ? "" : "s"}), ` +
+    ? `${result.components.length} component(s) found: ${byClass.intrinsic ?? 0} intrinsic, ${textEditingCount} text-editing, ` +
+      `${graphicCount} graphic-or-mogrt (possible custom control${graphicCount === 1 ? "" : "s"}), ` +
       `${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.`
     : `MOGRT inserted, but no custom editable controls were discovered — ${result.components.length} component(s) found, ` +
       `all intrinsic/standard (${byClass.intrinsic ?? 0} intrinsic, ${byClass["effect-or-unknown"] ?? 0} unrecognized). ` +
       "See the raw probe (below) for what's actually inside each one.";
+
+  const textProbe = result.textComponentProbe;
+  const textProbeLine = textProbe
+    ? el("div", {
+        class: `status-line ${textProbe.partial ? "log-warn" : "log-success"}`,
+        text: `${textProbe.partial ? "⚠" : "✓"} AE.ADBE Text component found at index ${textProbe.componentIndex} — ` +
+          `${textProbe.params.length}${textProbe.paramCount ? `/${textProbe.paramCount}` : ""} parameter(s) probed in depth` +
+          `${textProbe.partial ? " — STOPPED EARLY, only partially inspected (see raw probe JSON for what was captured, re-run to continue)" : ""}.`,
+      })
+    : el("div", { class: "status-line log-warn", text: "No AE.ADBE Text component was found during discovery — see the Log for the full component list found." });
 
   return el("div", { class: "inspector-results" }, [
     result.partial
@@ -207,6 +222,7 @@ function diagnosticSummaryBlock(result, diagnosing) {
             "What's below/in the saved JSON is everything collected up to that point, not the whole picture. Re-run with a longer budget if you need more.",
         })
       : null,
+    textProbeLine,
     el("div", {
       class: `status-line ${foundCustomControls ? "log-success" : "log-warn"}`,
       text: headline,
@@ -217,7 +233,7 @@ function diagnosticSummaryBlock(result, diagnosing) {
         text: `  [${c.classification}] "${c.displayName ?? "n/a"}" — ${c.paramCount} param(s)`,
       })
     ),
-    el("div", { class: "status-line", text: "Component/param detail is in the Log below and the saved diagnostic JSON. For the deeper raw host-object probe (shape/methods of every component, param, and resolved value — use this to find controls the classifier missed), see the saved raw probe JSON." }),
+    el("div", { class: "status-line", text: "Component/param detail is in the Log below and the saved diagnostic JSON. For the deeper raw host-object probe (shape/methods of every component, param, and resolved value) plus the dedicated AE.ADBE Text extraction pass (display names, resolved value/position for every param), see the saved raw probe JSON." }),
   ]);
 }
 
@@ -314,15 +330,17 @@ export function renderTemplateInspectorPanel(onChange) {
         "Dumps the full component/param graph found on this .mogrt with no assumptions about which " +
           "params are meaningful — every component's display name and best-effort match name, classified " +
           "as intrinsic (Motion/Opacity/Crop/Time Remapping, including their AE.ADBE-prefixed forms and the " +
-          "Graphic Group wrapper — all present on every graphic clip, custom or not), graphic-or-mogrt " +
-          "(a specific signal like a text-related name suggests it's the template's own content), or " +
-          "effect-or-unknown. Also runs a deeper raw probe — the real shape (Object.keys, prototype methods, " +
-          "constructor, safely-called zero-arg getters) of the track item, its project item, and every " +
-          "component/param/resolved value — saved as its own JSON, for when nothing classifies as a custom " +
-          "control but the real editable controls must be reachable some other way. Every host value read is " +
-          "timeout-guarded and the whole scan has a shared time budget (~12s), so it always finishes — with " +
-          "partial results, clearly marked, if it ran out of time — instead of hanging. See " +
-          "docs/MOGRT_DIAGNOSTIC.md.",
+          "Graphic Group wrapper — all present on every graphic clip, custom or not), text-editing (an exact " +
+          "AE.ADBE Text match — confirmed via a real host run to be the genuine editable text component, and " +
+          "probed with priority, before the intrinsic ones), graphic-or-mogrt (a weaker signal like a " +
+          "text-related name), or effect-or-unknown. Also runs a deeper raw probe — the real shape " +
+          "(Object.keys, prototype methods, constructor, safely-called zero-arg getters — never a method that " +
+          "needs an argument, like getValueAtTime or getParam, even if the host misreports it as zero-arg) of " +
+          "the track item, its project item, and every component/param/resolved value, plus a dedicated " +
+          "AE.ADBE Text extraction pass (every param's display name and resolved getStartValue().value/" +
+          "position) — saved as its own JSON. Every host value read is timeout-guarded and the whole scan has " +
+          "a shared time budget (~12s), so it always finishes — with partial results, clearly marked, if it " +
+          "ran out of time — instead of hanging. See docs/MOGRT_DIAGNOSTIC.md.",
       ]
     ),
     el("div", { class: "row" }, [diagnosticBtn, cancelDiagnosticBtn, saveDiagnosticBtn, saveRawProbeBtn]),

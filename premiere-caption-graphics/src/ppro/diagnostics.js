@@ -8,17 +8,28 @@
  * graphic/text controls at all, or only the intrinsic Motion/Opacity/Crop/
  * Time Remapping components every track item has regardless of its content?
  *
- * Unlike templateInspector.js (which asks "does this satisfy contract X?"),
- * this module makes NO assumption about which discovered params are
- * meaningful. It classifies each component by a conservative, clearly-a-
- * heuristic name match and reports every param's display name, best-effort
- * match name, value type, and current value, so a human can read the real
- * host output and decide — see docs/MOGRT_DIAGNOSTIC.md for how to read it.
+ * CONFIRMED (see docs/MOGRT_DIAGNOSTIC.md): yes — a real host run found a
+ * 4th component, `AE.ADBE Text`, with 22 params, sitting right after the
+ * three intrinsic ones. `discoverComponents()` below is a deliberately
+ * lightweight FIRST pass (index/matchName/displayName/paramCount only, no
+ * method-probing, no per-field deep dive) so every phase downstream — the
+ * classification report, the deep raw probe, AND the dedicated
+ * `probeTextComponentDeep()` extraction pass — works from the exact same
+ * discovered component list, in the exact same priority order (any
+ * AE.ADBE Text component first), instead of each independently re-walking
+ * the chain and risking disagreeing about what's even there.
  */
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
-import { safe, safeAsync, safeResolve, resolveHostValue, toSafeString } from "./introspect.js";
-import { summarizeHostValue, formatSummaryForLog, probeHostObject, createScanBudget, DEFAULT_SCAN_BUDGET_MS } from "./deepProbe.js";
+import { safe, safeAsync, safeResolve, resolveHostValue, resolveHostValueDetailed, toSafeString } from "./introspect.js";
+import {
+  summarizeHostValue,
+  formatSummaryForLog,
+  probeHostObject,
+  createScanBudget,
+  DEFAULT_SCAN_BUDGET_MS,
+  PROBE_CALL_TIMEOUT_MS,
+} from "./deepProbe.js";
 
 const MAX_COMPONENT_SCAN = 64;
 const MAX_PARAM_SCAN = 64;
@@ -49,7 +60,7 @@ const INTRINSIC_COMPONENT_NAMES = new Set([
 // below) for the SAME standard/intrinsic components as
 // INTRINSIC_COMPONENT_NAMES above. Confirmed by a real Diagnostic Inspector
 // run against a Premiere-native (no After Effects) MOGRT on Premiere Pro
-// 26.3, which reported exactly these three components:
+// 26.3, which reported exactly these three intrinsic components:
 // "AE.ADBE Opacity", "AE.ADBE Motion", "AE.ADBE Graphic Group". Premiere
 // Graphics clips are apparently represented internally via AE-style
 // matchNames even when authored without After Effects — so a bare
@@ -60,9 +71,7 @@ const INTRINSIC_COMPONENT_NAMES = new Set([
 // "AE.ADBE Graphic Group" specifically is the wrapper/container for
 // whatever custom content the graphic has — intrinsic to every graphic
 // clip the same way Motion/Opacity are intrinsic to every clip, not itself
-// a discovered custom control. If the graphic exposes real editable
-// controls, they must be reachable *inside* this group or via a different
-// route entirely — see the raw probe in diagnoseMogrt()/docs/MOGRT_DIAGNOSTIC.md.
+// a discovered custom control.
 const INTRINSIC_MATCH_NAMES = new Set([
   "ae.adbe opacity",
   "ae.adbe motion",
@@ -73,15 +82,19 @@ const INTRINSIC_MATCH_NAMES = new Set([
   "ae.adbe graphic group",
 ]);
 
+// CONFIRMED (see docs/MOGRT_DIAGNOSTIC.md): the real, genuine MOGRT text
+// editing component's matchName, found via a real host run. Checked as an
+// EXACT match (not a substring signal) and given its own classification
+// tier — "text-editing" — distinct from both "intrinsic" and the generic
+// "graphic-or-mogrt" bucket, so this specific, confirmed control is never
+// lumped in with an unconfirmed heuristic guess.
+const TEXT_COMPONENT_MATCH_NAMES = new Set(["ae.adbe text"]);
+
 // Narrow, specific signals that a component is genuinely the MOGRT's own
 // editable content — deliberately NOT including a bare "ae.adbe" (see
 // INTRINSIC_MATCH_NAMES comment above for why that was wrong). "text" is
-// kept because Adobe forum threads specifically describe locating an
-// After-Effects-authored MOGRT's Source Text control via a matchName
-// containing "AE.ADBE Text" (see docs/MOGRT_DIAGNOSTIC.md's research
-// notes) — not confirmed against this project's own host output yet, since
-// no such component has been observed so far, but specific enough to be
-// worth flagging rather than silently grouping with "effect-or-unknown".
+// kept as a fallback signal for any OTHER text-ish component that isn't an
+// exact "AE.ADBE Text" match (e.g. a differently-matchNamed text layer).
 const GRAPHIC_NAME_SIGNALS = ["mogrt", "essential graphics", "video/graphic", "text", "graphic"];
 
 // Safe string-or-empty lowercasing: NEVER calls a string method on
@@ -99,11 +112,18 @@ function safeLower(value) {
 
 /**
  * @param {{ displayName?: string|null, matchName?: string|null }} info
- * @returns {{ classification: "intrinsic"|"graphic-or-mogrt"|"effect-or-unknown", reason: string }}
+ * @returns {{ classification: "text-editing"|"intrinsic"|"graphic-or-mogrt"|"effect-or-unknown", reason: string }}
  */
 export function classifyComponent({ displayName, matchName }) {
   const name = safeLower(displayName);
   const match = safeLower(matchName);
+
+  if (TEXT_COMPONENT_MATCH_NAMES.has(match) || TEXT_COMPONENT_MATCH_NAMES.has(name)) {
+    return {
+      classification: "text-editing",
+      reason: `matchName "${matchName ?? displayName}" is AE.ADBE Text — confirmed via a real host run to be the MOGRT's genuine text/graphic editing component, not an intrinsic one (see docs/MOGRT_DIAGNOSTIC.md)`,
+    };
+  }
 
   if (INTRINSIC_COMPONENT_NAMES.has(name) || INTRINSIC_COMPONENT_NAMES.has(match)) {
     return { classification: "intrinsic", reason: `display name/matchName exactly matches a known intrinsic component name` };
@@ -154,16 +174,26 @@ export async function readMatchName(obj, log) {
  * Best-effort displayName reader, same async-safe treatment as
  * readMatchName() above — `displayName` is host-returned metadata too, so
  * it gets the same "might be a Promise" treatment rather than being
- * special-cased as always-synchronous.
+ * special-cased as always-synchronous. Tries a `getDisplayName()` method
+ * too (not just the `.displayName` property), same two-attempt pattern as
+ * readMatchName().
  *
  * @param {*} obj
  * @param {(message: string, level?: string) => void} [log]
  */
 export async function readDisplayName(obj, log) {
-  const raw = safe(() => obj.displayName);
-  if (!raw.ok || raw.value === undefined || raw.value === null) return null;
-  const resolved = await resolveHostValue(raw.value, null, { log, label: "displayName" });
-  return toSafeString(resolved);
+  const attempts = [
+    { source: "displayName (property)", fn: () => obj.displayName },
+    { source: "getDisplayName() (method)", fn: () => (typeof obj.getDisplayName === "function" ? obj.getDisplayName() : undefined) },
+  ];
+  for (const attempt of attempts) {
+    const raw = safe(attempt.fn);
+    if (!raw.ok || raw.value === undefined || raw.value === null) continue;
+    const resolved = await resolveHostValue(raw.value, null, { log, label: `displayName via ${attempt.source}` });
+    const asString = toSafeString(resolved);
+    if (asString !== null) return asString;
+  }
+  return null;
 }
 
 export function textLikeSignal(displayName, matchName) {
@@ -185,19 +215,112 @@ async function readParamType(param, ci, pi, log) {
 }
 
 /**
- * Walk every component/param on a track item with full detail, logging
- * progressively and returning a JSON-serializable report. See module
- * doc-comment for what this is trying to settle. Stops early (marking
- * `partial: true`) the moment `budget` (if given) expires — see
- * src/ppro/deepProbe.js's createScanBudget().
+ * Best-effort param count reader: `component.getParamCount()` — CONFIRMED
+ * to exist and work on a real host (returned 22 for the AE.ADBE Text
+ * component). Used to bound per-component param loops precisely instead of
+ * scanning blindly up to MAX_PARAM_SCAN; falls back to `null` (caller then
+ * uses the blind bound) if unavailable or it fails.
  *
- * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * IMPORTANT: this is a read (a getter reporting a count), never confused
+ * with actually calling `getParam()` itself without an index — see
+ * NEVER_AUTO_CALL_EXACT_NAMES in src/ppro/deepProbe.js for why the latter
+ * must never be auto-invoked.
+ */
+async function readParamCount(component, ci, log) {
+  if (typeof component.getParamCount !== "function") return null;
+  const result = await safeResolve(() => component.getParamCount(), { log, label: `component[${ci}].getParamCount()` });
+  return result.ok && typeof result.value === "number" ? result.value : null;
+}
+
+/**
+ * Lightweight, first-pass component discovery: for every component index,
+ * reads ONLY its matchName, displayName, and paramCount (via
+ * getParamCount()) — no method-probing, no per-param work. Deliberately
+ * cheap so every later phase (classification detail, deep raw probe,
+ * dedicated text extraction) can share this single result instead of each
+ * re-walking the chain and risking a different, inconsistent view of what
+ * components exist (confirmed real-host bug this fixes — see
+ * docs/MOGRT_DIAGNOSTIC.md: the classification report and the raw probe
+ * used to disagree on the component count).
+ *
+ * @param {*} chain
  * @param {(message: string, level?: string) => void} log
  * @param {ReturnType<typeof createScanBudget>} [budget]
  */
-export async function deepDumpComponentChain(trackItem, log, budget) {
-  log("[stage] reading track item — component chain (no name assumptions)…", "info");
+export async function discoverComponents(chain, log, budget) {
+  const components = [];
+  let consecutiveMisses = 0;
+  let partial = false;
 
+  for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
+    if (budget && budget.isExpired()) {
+      log(`Component discovery stopped early at index ${ci}: ${budget.reason()}.`, "warn");
+      partial = true;
+      break;
+    }
+    const componentResult = await safeResolve(() => chain.getComponentAtIndex(ci), { log, label: `component[${ci}] (discovery)` });
+    if (!componentResult.ok || !componentResult.value) {
+      consecutiveMisses += 1;
+      if (consecutiveMisses >= CONSECUTIVE_MISS_TOLERANCE) break;
+      continue;
+    }
+    consecutiveMisses = 0;
+    const component = componentResult.value;
+
+    const matchNameResult = await readMatchName(component, log);
+    const displayName = await readDisplayName(component, log);
+    const paramCount = await readParamCount(component, ci, log);
+    const { classification, reason } = classifyComponent({ displayName, matchName: matchNameResult.value });
+
+    log(
+      `Discovered component ${ci}: matchName=${matchNameResult.value ?? "n/a"}, displayName=${displayName ?? "n/a"}, ` +
+        `paramCount=${paramCount ?? "unknown"} → ${classification.toUpperCase()}`,
+      classification === "text-editing" ? "success" : "info"
+    );
+
+    components.push({
+      componentIndex: ci,
+      component,
+      matchName: matchNameResult.value,
+      matchNameSource: matchNameResult.source,
+      displayName,
+      paramCount,
+      classification,
+      classificationReason: reason,
+    });
+  }
+
+  return { components, partial };
+}
+
+/**
+ * Reorders a discovered-component list so any `text-editing`-classified
+ * component (i.e. AE.ADBE Text) comes first — per the task requirement to
+ * probe it before Motion/Opacity/Crop/Graphic Group, so it gets first
+ * claim on whatever scan budget is available. Stable otherwise (preserves
+ * original relative order within each group).
+ */
+export function prioritizeTextFirst(components) {
+  const text = components.filter((c) => c.classification === "text-editing");
+  const rest = components.filter((c) => c.classification !== "text-editing");
+  return [...text, ...rest];
+}
+
+/**
+ * Builds the classification/detail report (per-component displayName/
+ * matchName/classification, per-param displayName/matchName/type/value)
+ * from an already-discovered, priority-ordered component list — see
+ * discoverComponents(). Reported components are re-sorted back to original
+ * index order for readability before returning, even though they were
+ * probed in priority order internally.
+ *
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {Array} orderedComponents From discoverComponents() + prioritizeTextFirst().
+ * @param {boolean} discoveryPartial Whether the discovery pass itself stopped early.
+ * @param {(message: string, level?: string) => void} log
+ * @param {ReturnType<typeof createScanBudget>} [budget]
+ */
+export async function buildComponentDetailReport(trackItem, orderedComponents, discoveryPartial, log, budget) {
   const typeNameResult = await safeResolve(() => trackItem.constructor?.name, { log, label: "trackItem type" });
   const trackItemMatchName = await readMatchName(trackItem, log);
   const trackItemInfo = {
@@ -206,54 +329,26 @@ export async function deepDumpComponentChain(trackItem, log, budget) {
   };
   log(`TrackItem: type=${trackItemInfo.typeName}, matchName=${trackItemInfo.matchName ?? "n/a"}`, "info");
 
-  const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain()" });
-  if (!chainResult.ok) {
-    log(`✗ getComponentChain() failed: ${chainResult.error.message || chainResult.error}`, "error");
-    return { trackItem: trackItemInfo, components: [], scanStoppedEarly: true };
-  }
-  const chain = chainResult.value;
-  if (!chain) {
-    log("✗ getComponentChain() returned nothing.", "error");
-    return { trackItem: trackItemInfo, components: [], scanStoppedEarly: true };
-  }
-
   const components = [];
-  let consecutiveMisses = 0;
-  let partial = false;
+  let partial = discoveryPartial;
 
-  for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
+  for (const info of orderedComponents) {
     if (budget && budget.isExpired()) {
-      log(`Component scan stopped early at index ${ci}: ${budget.reason()}.`, "warn");
+      log(`Component detail scan stopped early before component ${info.componentIndex}: ${budget.reason()}.`, "warn");
       partial = true;
       break;
     }
-    const componentResult = await safeResolve(() => chain.getComponentAtIndex(ci), { log, label: `component[${ci}]` });
-    if (!componentResult.ok || !componentResult.value) {
-      consecutiveMisses += 1;
-      log(
-        `Component index ${ci}: ${componentResult.ok ? "no component returned" : `failed (${componentResult.error.message || componentResult.error})`} ` +
-          `(${consecutiveMisses}/${CONSECUTIVE_MISS_TOLERANCE} consecutive misses before stopping)`,
-        "info"
-      );
-      if (consecutiveMisses >= CONSECUTIVE_MISS_TOLERANCE) break;
-      continue;
-    }
-    consecutiveMisses = 0;
-    const component = componentResult.value;
-
-    const displayName = await readDisplayName(component, log);
-    const matchNameResult = await readMatchName(component, log);
-    const { classification, reason } = classifyComponent({ displayName, matchName: matchNameResult.value });
+    const { componentIndex: ci, component, matchName, matchNameSource, displayName, classification, classificationReason, paramCount } = info;
 
     log(
-      `Component ${ci}: displayName="${displayName ?? "n/a"}", matchName=${matchNameResult.value ?? "n/a"}` +
-        `${matchNameResult.source ? ` (via ${matchNameResult.source})` : ""} → classified as ${classification.toUpperCase()} (${reason})`,
-      classification === "graphic-or-mogrt" ? "success" : "info"
+      `Component ${ci}: displayName="${displayName ?? "n/a"}", matchName=${matchName ?? "n/a"} → classified as ${classification.toUpperCase()} (${classificationReason})`,
+      classification === "text-editing" || classification === "graphic-or-mogrt" ? "success" : "info"
     );
 
     const params = [];
     let paramMisses = 0;
-    for (let pi = 0; pi < MAX_PARAM_SCAN; pi++) {
+    const upperBound = typeof paramCount === "number" ? paramCount : MAX_PARAM_SCAN;
+    for (let pi = 0; pi < upperBound; pi++) {
       if (budget && budget.isExpired()) {
         log(`Param scan on component ${ci} stopped early at index ${pi}: ${budget.reason()}.`, "warn");
         partial = true;
@@ -270,15 +365,16 @@ export async function deepDumpComponentChain(trackItem, log, budget) {
       const paramDisplayName = await readDisplayName(param, log);
       const paramMatchNameResult = await readMatchName(param, log);
       const paramType = await readParamType(param, ci, pi, log);
-      const startValue = await safeAsync(() => param.getStartValue());
-      const resolvedValue = startValue.ok
-        ? await resolveHostValue(startValue.value, undefined, { log, label: `component[${ci}].param[${pi}].value` })
-        : undefined;
-      // summarizeHostValue() (not JSON.stringify) is what fixes "value: {}":
-      // UXP native-bridge objects apparently expose their real data through
-      // non-enumerable getters, which JSON.stringify silently sees nothing
-      // in — see docs/MOGRT_DIAGNOSTIC.md and src/ppro/deepProbe.js.
-      const valueSummary = startValue.ok ? summarizeHostValue(resolvedValue) : { kind: "unreadable", error: String(startValue.error.message || startValue.error) };
+      const startValue = await safeResolve(() => param.getStartValue(), { log, label: `component[${ci}].param[${pi}].getStartValue()` });
+      let valueSummary;
+      if (!startValue.ok) {
+        valueSummary = { kind: "unreadable", error: startValue.timedOut ? "getStartValue() timed out" : String(startValue.error?.message || startValue.error) };
+      } else {
+        const resolved = await resolveHostValueDetailed(startValue.value, { log, label: `component[${ci}].param[${pi}].value`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
+        valueSummary = resolved.ok
+          ? summarizeHostValue(resolved.value)
+          : { kind: "unreadable", error: resolved.timedOut ? "value resolution timed out" : String(resolved.error?.message || resolved.error) };
+      }
       const isTextLike = textLikeSignal(paramDisplayName, paramMatchNameResult.value);
 
       log(
@@ -302,14 +398,19 @@ export async function deepDumpComponentChain(trackItem, log, budget) {
     components.push({
       componentIndex: ci,
       displayName,
-      matchName: matchNameResult.value,
-      matchNameSource: matchNameResult.source,
+      matchName,
+      matchNameSource,
       classification,
-      classificationReason: reason,
+      classificationReason,
       paramCount: params.length,
+      declaredParamCount: paramCount ?? null,
       params,
     });
   }
+
+  // Report in original index order for readability, even though probing
+  // happened in priority (text-first) order above.
+  components.sort((a, b) => a.componentIndex - b.componentIndex);
 
   const byClass = components.reduce((acc, c) => {
     acc[c.classification] = (acc[c.classification] || 0) + 1;
@@ -317,12 +418,41 @@ export async function deepDumpComponentChain(trackItem, log, budget) {
   }, {});
   log(
     `Diagnostic scan complete: ${components.length} component(s) — ` +
-      `${byClass.intrinsic ?? 0} intrinsic, ${byClass["graphic-or-mogrt"] ?? 0} graphic-or-mogrt, ${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.` +
+      `${byClass.intrinsic ?? 0} intrinsic, ${byClass["text-editing"] ?? 0} text-editing, ${byClass["graphic-or-mogrt"] ?? 0} graphic-or-mogrt, ${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.` +
       (partial ? " (STOPPED EARLY — time budget or cancellation, see above)" : ""),
     partial ? "warn" : "success"
   );
 
   return { trackItem: trackItemInfo, components, scanStoppedEarly: false, classificationPartial: partial };
+}
+
+/**
+ * Self-contained convenience wrapper: fetches its own component chain,
+ * discovers + prioritizes components, and builds the detail report — for
+ * standalone use. diagnoseMogrt() below does NOT call this; it shares one
+ * chain-fetch and one discoverComponents() pass across the classification
+ * report, the raw probe, and the dedicated text-component pass instead, to
+ * guarantee all three agree on what components exist.
+ *
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {(message: string, level?: string) => void} log
+ * @param {ReturnType<typeof createScanBudget>} [budget]
+ */
+export async function deepDumpComponentChain(trackItem, log, budget) {
+  log("[stage] reading track item — discovering components (lightweight pass)…", "info");
+  const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain()" });
+  const typeNameResult = await safeResolve(() => trackItem.constructor?.name, { log, label: "trackItem type" });
+  const trackItemMatchName = await readMatchName(trackItem, log);
+  const trackItemInfo = { typeName: (typeNameResult.ok && typeNameResult.value) || "unknown", matchName: trackItemMatchName.value };
+
+  if (!chainResult.ok || !chainResult.value) {
+    log(`✗ getComponentChain() failed: ${chainResult.ok ? "returned nothing" : (chainResult.error.message || chainResult.error)}`, "error");
+    return { trackItem: trackItemInfo, components: [], scanStoppedEarly: true, classificationPartial: false };
+  }
+
+  const discovery = await discoverComponents(chainResult.value, log, budget);
+  const ordered = prioritizeTextFirst(discovery.components);
+  return buildComponentDetailReport(trackItem, ordered, discovery.partial, log, budget);
 }
 
 /**
@@ -351,42 +481,26 @@ async function resolveProjectItem(trackItem, log) {
 }
 
 /**
- * The deeper raw probe: inspects the real shape (Object.keys,
- * Object.getOwnPropertyNames, prototype method/property names, constructor,
- * safely-called zero-arg getters) of the track item, its associated project
- * item (if any accessor for one is found), every component, every param,
- * and the resolved objects from both `param.getStartValue()` and
- * `param.getValue()` (feature-detected — `getValue` is not used anywhere
- * else in this codebase and its existence is unconfirmed, per the task that
- * asked for this probe). This is deliberately separate from
- * deepDumpComponentChain()'s classification-focused walk: it re-walks the
- * same chain, but everything it records is unconditional — classification
- * never gates what gets probed, since the whole point is finding controls
- * the classifier doesn't recognize.
+ * The generic deep raw probe body: trackItem, project item, and every
+ * discovered component/param's full shape (Object.keys,
+ * Object.getOwnPropertyNames, prototype method/property names,
+ * constructor, safely-called zero-arg getters — see
+ * src/ppro/deepProbe.js's probeHostObject()). Driven by an already-
+ * discovered, priority-ordered component list (see discoverComponents()/
+ * prioritizeTextFirst()) rather than re-walking the chain, so this always
+ * agrees with the classification report on what components exist.
  *
- * Returns a plain, JSON-safe object (see src/ppro/deepProbe.js — every
- * probe result is a summary, never a raw host reference), meant to be
- * saved to its own file rather than folded into the same JSON as the
- * classification report (which stays comparatively compact for quick
- * reading).
+ * NOTE: `getValueAtTime()` is never auto-called here (or anywhere else) —
+ * see NEVER_AUTO_CALL_EXACT_NAMES in src/ppro/deepProbe.js. This was the
+ * confirmed cause of the scan hanging/burning its whole budget before
+ * reaching AE.ADBE Text (see docs/MOGRT_DIAGNOSTIC.md).
  *
  * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {Array} orderedComponents
  * @param {(message: string, level?: string) => void} log
- * @param {Object} [opts]
- * @param {ReturnType<typeof createScanBudget>} [opts.budget]
- * @param {number} [opts.expectedComponentCount] From the classification scan, for "component i/N" progress logs — purely cosmetic, never gates behavior.
- * @param {number[]} [opts.expectedParamCounts] Same, per component, for "param j/M" progress logs.
+ * @param {ReturnType<typeof createScanBudget>} [budget]
  */
-export async function deepProbeMogrt(trackItem, log, opts = {}) {
-  const { budget, expectedComponentCount, expectedParamCounts } = opts;
-
-  log("[stage] probing deeper (raw host-object probe): trackItem, projectItem, every component/param, resolved values…", "info");
-
-  if (budget && budget.isExpired()) {
-    log(`Raw probe skipped entirely: ${budget.reason()} before it could start.`, "warn");
-    return { trackItemProbe: { label: "trackItem", skipped: true, reason: budget.reason() }, projectItemProbe: { label: "trackItem.projectItem", skipped: true, reason: budget.reason() }, components: [], partial: true };
-  }
-
+export async function probeComponentsDeep(trackItem, orderedComponents, log, budget) {
   const trackItemProbe = await probeHostObject(trackItem, "trackItem", log, budget);
 
   log("[stage] probing project item…", "info");
@@ -401,74 +515,53 @@ export async function deepProbeMogrt(trackItem, log, opts = {}) {
     projectItemResult.value ? "success" : "warn"
   );
 
-  const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain() (raw probe)" });
   const components = [];
   let partial = false;
-  if (chainResult.ok && chainResult.value) {
-    const chain = chainResult.value;
-    let consecutiveMisses = 0;
-    for (let ci = 0; ci < MAX_COMPONENT_SCAN; ci++) {
+  const totalComponents = orderedComponents.length;
+
+  for (let idx = 0; idx < orderedComponents.length; idx++) {
+    if (budget && budget.isExpired()) {
+      log(`Raw probe stopped early before component ${idx + 1}/${totalComponents}: ${budget.reason()}.`, "warn");
+      partial = true;
+      break;
+    }
+    const info = orderedComponents[idx];
+    const { componentIndex: ci, component, paramCount } = info;
+    log(`[stage] probing component ${idx + 1}/${totalComponents} (index ${ci}, ${info.classification})…`, "info");
+    const componentProbe = await probeHostObject(component, `component[${ci}]`, log, budget);
+
+    const params = [];
+    let paramMisses = 0;
+    const upperBound = typeof paramCount === "number" ? paramCount : MAX_PARAM_SCAN;
+    for (let pi = 0; pi < upperBound; pi++) {
       if (budget && budget.isExpired()) {
-        log(`Raw probe stopped early before component ${ci}: ${budget.reason()}.`, "warn");
+        log(`Raw probe stopped early before param ${pi} on component ${ci}: ${budget.reason()}.`, "warn");
         partial = true;
         break;
       }
-      const componentResult = await safeResolve(() => chain.getComponentAtIndex(ci), { log, label: `component[${ci}] (raw probe)` });
-      if (!componentResult.ok || !componentResult.value) {
-        consecutiveMisses += 1;
-        if (consecutiveMisses >= CONSECUTIVE_MISS_TOLERANCE) break;
+      const paramResult = await safeResolve(() => component.getParam(pi), { log, label: `component[${ci}].param[${pi}] (raw probe)` });
+      if (!paramResult.ok || !paramResult.value) {
+        paramMisses += 1;
+        if (paramMisses >= 1) break;
         continue;
       }
-      consecutiveMisses = 0;
-      const component = componentResult.value;
-      log(`[stage] probing component ${ci + 1}${expectedComponentCount ? `/${expectedComponentCount}` : ""}…`, "info");
-      const componentProbe = await probeHostObject(component, `component[${ci}]`, log, budget);
+      const param = paramResult.value;
+      log(`  [stage] probing parameter ${pi + 1}${paramCount ? `/${paramCount}` : ""} on component ${ci}…`, "info");
+      const paramProbe = await probeHostObject(param, `component[${ci}].param[${pi}]`, log, budget);
 
-      const params = [];
-      let paramMisses = 0;
-      const expectedParamCount = expectedParamCounts?.[ci];
-      for (let pi = 0; pi < MAX_PARAM_SCAN; pi++) {
-        if (budget && budget.isExpired()) {
-          log(`Raw probe stopped early before param ${pi} on component ${ci + 1}: ${budget.reason()}.`, "warn");
-          partial = true;
-          break;
-        }
-        const paramResult = await safeResolve(() => component.getParam(pi), { log, label: `component[${ci}].param[${pi}] (raw probe)` });
-        if (!paramResult.ok || !paramResult.value) {
-          paramMisses += 1;
-          if (paramMisses >= 1) break;
-          continue;
-        }
-        const param = paramResult.value;
-        log(
-          `  [stage] probing parameter ${pi + 1}${expectedParamCount ? `/${expectedParamCount}` : ""} on component ${ci + 1}${expectedComponentCount ? `/${expectedComponentCount}` : ""}…`,
-          "info"
-        );
-        const paramProbe = await probeHostObject(param, `component[${ci}].param[${pi}]`, log, budget);
+      const startValueResult = await safeResolve(() => param.getStartValue(), { log, label: `component[${ci}].param[${pi}].getStartValue()` });
+      const startValueProbe = startValueResult.ok
+        ? await probeHostObject(startValueResult.value, `component[${ci}].param[${pi}].getStartValue()`, log, budget)
+        : { label: `component[${ci}].param[${pi}].getStartValue()`, exists: false, error: String(startValueResult.error?.message || startValueResult.error) };
 
-        const startValueResult = await safeResolve(() => param.getStartValue(), { log, label: `component[${ci}].param[${pi}].getStartValue()` });
-        const startValueProbe = startValueResult.ok
-          ? await probeHostObject(startValueResult.value, `component[${ci}].param[${pi}].getStartValue()`, log, budget)
-          : { label: `component[${ci}].param[${pi}].getStartValue()`, exists: false, error: String(startValueResult.error.message || startValueResult.error) };
-
-        // `getValue` is not used anywhere else in this codebase — its
-        // existence on ComponentParam is unconfirmed. Feature-detected,
-        // never assumed.
-        let getValueProbe = { label: `component[${ci}].param[${pi}].getValue()`, exists: false, note: "getValue is not a function on this param" };
-        if (typeof param.getValue === "function" && !(budget && budget.isExpired())) {
-          const getValueResult = await safeResolve(() => param.getValue(), { log, label: `component[${ci}].param[${pi}].getValue()` });
-          getValueProbe = getValueResult.ok
-            ? await probeHostObject(getValueResult.value, `component[${ci}].param[${pi}].getValue()`, log, budget)
-            : { label: `component[${ci}].param[${pi}].getValue()`, exists: false, error: String(getValueResult.error.message || getValueResult.error) };
-        }
-
-        params.push({ paramIndex: pi, probe: paramProbe, startValueProbe, getValueProbe });
-      }
-
-      components.push({ componentIndex: ci, probe: componentProbe, params });
-      if (partial) break;
+      params.push({ paramIndex: pi, probe: paramProbe, startValueProbe });
     }
+
+    components.push({ componentIndex: ci, probe: componentProbe, params });
+    if (partial) break;
   }
+
+  components.sort((a, b) => a.componentIndex - b.componentIndex);
 
   log("[stage] serializing raw probe results…", "info");
   log(
@@ -478,6 +571,195 @@ export async function deepProbeMogrt(trackItem, log, opts = {}) {
   );
 
   return { trackItemProbe, projectItemProbe, components, partial };
+}
+
+/**
+ * Self-contained convenience wrapper around probeComponentsDeep() — fetches
+ * its own chain/discovery, for standalone use. diagnoseMogrt() shares one
+ * discovery pass instead (see deepDumpComponentChain()'s doc-comment).
+ *
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {(message: string, level?: string) => void} log
+ * @param {Object} [opts]
+ * @param {ReturnType<typeof createScanBudget>} [opts.budget]
+ */
+export async function deepProbeMogrt(trackItem, log, opts = {}) {
+  const { budget } = opts;
+  log("[stage] probing deeper (raw host-object probe): trackItem, projectItem, every component/param, resolved values…", "info");
+  if (budget && budget.isExpired()) {
+    log(`Raw probe skipped entirely: ${budget.reason()} before it could start.`, "warn");
+    return { trackItemProbe: { label: "trackItem", skipped: true, reason: budget.reason() }, projectItemProbe: { label: "trackItem.projectItem", skipped: true, reason: budget.reason() }, components: [], partial: true };
+  }
+  const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain() (raw probe)" });
+  if (!chainResult.ok || !chainResult.value) {
+    return { trackItemProbe: await probeHostObject(trackItem, "trackItem", log, budget), projectItemProbe: { label: "trackItem.projectItem", exists: false }, components: [], partial: false };
+  }
+  const discovery = await discoverComponents(chainResult.value, log, budget);
+  const ordered = prioritizeTextFirst(discovery.components);
+  const result = await probeComponentsDeep(trackItem, ordered, log, budget);
+  return { ...result, partial: result.partial || discovery.partial };
+}
+
+/**
+ * Reads a single field (own or inherited) the same way deepProbe.js's
+ * probeObjectShape() does — a plain property access naturally walks the
+ * prototype chain, so this correctly reads an inherited accessor (e.g.
+ * `Keyframe.prototype.value`) without any special handling.
+ */
+async function readTextParamField(obj, name, label, log) {
+  const raw = safe(() => obj[name]);
+  if (!raw.ok || raw.value === undefined) return null;
+  const resolved = await resolveHostValueDetailed(raw.value, { log, label: `${label}.${name}`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
+  if (!resolved.ok) {
+    return { errored: true, timedOut: Boolean(resolved.timedOut), message: resolved.timedOut ? "timed out" : String(resolved.error?.message || resolved.error) };
+  }
+  return { errored: false, summary: summarizeHostValue(resolved.value) };
+}
+
+/**
+ * Dedicated, focused extraction pass for exactly one component — meant for
+ * the AE.ADBE Text component once discovery finds it. Per param, reads:
+ * displayName, the getStartValue() result's constructor name, whether
+ * isTimeVarying()/areKeyframesSupported() are safely callable (best
+ * effort, failures recorded but not fatal), and — critically — that
+ * getStartValue() result's INHERITED `.value`/`.position` accessor
+ * properties (the actual real number/point/colour/text value; see
+ * deepProbe.js's probeObjectShape() doc-comment for why these are
+ * inherited, not own, properties on Keyframe/PointKeyframe).
+ *
+ * Deliberately narrow and un-generic (no method-probing beyond the two
+ * named predicates, no walking the param's whole prototype chain) so a
+ * 22-param text component completes quickly — the whole point of this
+ * pass existing separately from the generic probeComponentsDeep() above.
+ *
+ * @param {{ componentIndex: number, component: *, matchName: string|null, displayName: string|null, paramCount: number|null }} componentInfo
+ * @param {(message: string, level?: string) => void} log
+ * @param {ReturnType<typeof createScanBudget>} [budget]
+ */
+export async function probeTextComponentDeep(componentInfo, log, budget) {
+  const { componentIndex, component, matchName, displayName, paramCount } = componentInfo;
+  const result = { componentIndex, matchName, displayName, paramCount, params: [], partial: false };
+
+  const upperBound = typeof paramCount === "number" ? paramCount : MAX_PARAM_SCAN;
+  let consecutiveMisses = 0;
+
+  for (let pi = 0; pi < upperBound; pi++) {
+    if (budget && budget.isExpired()) {
+      log(`Text component param scan stopped early at param ${pi}${paramCount ? `/${paramCount}` : ""}: ${budget.reason()}.`, "warn");
+      result.partial = true;
+      break;
+    }
+    const paramResult = await safeResolve(() => component.getParam(pi), { log, label: `textComponent.param[${pi}]` });
+    if (!paramResult.ok || !paramResult.value) {
+      consecutiveMisses += 1;
+      if (consecutiveMisses >= CONSECUTIVE_MISS_TOLERANCE) break;
+      continue;
+    }
+    consecutiveMisses = 0;
+    const param = paramResult.value;
+    const entry = await probeTextParam(param, pi, log);
+    result.params.push(entry);
+    log(
+      `  [stage] Text param ${pi + 1}${paramCount ? `/${paramCount}` : ""}: displayName="${entry.displayName ?? "n/a"}", ` +
+        `startValueConstructor=${entry.startValueConstructor ?? "n/a"}` +
+        `${entry.value ? `, value=${formatSummaryForLog(entry.value)}` : ""}` +
+        `${entry.position ? `, position=${formatSummaryForLog(entry.position)}` : ""}`,
+      entry.timedOut ? "warn" : "success"
+    );
+  }
+
+  log(
+    `Text component probe complete: ${result.params.length}${paramCount ? `/${paramCount}` : ""} param(s) probed.` +
+      (result.partial ? " (STOPPED EARLY)" : ""),
+    result.partial ? "warn" : "success"
+  );
+
+  return result;
+}
+
+async function probeTextParam(param, paramIndex, log) {
+  const errors = [];
+  const displayName = await readDisplayName(param, log);
+
+  const constructorResult = await safeResolve(() => param.constructor?.name, { log, label: `textComponent.param[${paramIndex}].constructor` });
+  const paramConstructorName = (constructorResult.ok && constructorResult.value) || null;
+
+  // isTimeVarying()/areKeyframesSupported(): genuine zero-arg predicates by
+  // name and convention, called defensively ("only if safely callable" —
+  // feature-detected, and any failure is recorded rather than aborting the
+  // rest of this param's probe).
+  let isTimeVarying = null;
+  if (typeof param.isTimeVarying === "function") {
+    const r = await safeResolve(() => param.isTimeVarying(), { log, label: `textComponent.param[${paramIndex}].isTimeVarying()` });
+    if (r.ok) isTimeVarying = r.value;
+    else errors.push(`isTimeVarying(): ${r.timedOut ? "timed out" : String(r.error?.message || r.error)}`);
+  }
+
+  let areKeyframesSupported = null;
+  if (typeof param.areKeyframesSupported === "function") {
+    const r = await safeResolve(() => param.areKeyframesSupported(), { log, label: `textComponent.param[${paramIndex}].areKeyframesSupported()` });
+    if (r.ok) areKeyframesSupported = r.value;
+    else errors.push(`areKeyframesSupported(): ${r.timedOut ? "timed out" : String(r.error?.message || r.error)}`);
+  }
+
+  const startValueResult = await safeResolve(() => param.getStartValue(), { log, label: `textComponent.param[${paramIndex}].getStartValue()` });
+  let startValueConstructor = null;
+  let value = null;
+  let position = null;
+  let timedOut = false;
+
+  if (!startValueResult.ok) {
+    if (startValueResult.timedOut) {
+      timedOut = true;
+      errors.push("getStartValue(): timed out");
+    } else {
+      errors.push(`getStartValue(): ${String(startValueResult.error?.message || startValueResult.error)}`);
+    }
+  } else {
+    const startValue = startValueResult.value;
+    const ctorResult = await safeResolve(() => startValue?.constructor?.name, { log, label: `textComponent.param[${paramIndex}].getStartValue().constructor` });
+    startValueConstructor = (ctorResult.ok && ctorResult.value) || null;
+
+    if (startValue !== null && startValue !== undefined && (typeof startValue === "object" || typeof startValue === "function")) {
+      // `.value`/`.position` are INHERITED accessor properties on the
+      // Keyframe/PointKeyframe prototype (confirmed via a real host run —
+      // see docs/MOGRT_DIAGNOSTIC.md), not own-enumerable properties on the
+      // instance. A plain property read still walks the prototype chain
+      // and invokes the getter correctly — see readTextParamField().
+      const valueField = await readTextParamField(startValue, "value", `textComponent.param[${paramIndex}].getStartValue()`, log);
+      if (valueField) {
+        if (valueField.errored) {
+          if (valueField.timedOut) timedOut = true;
+          errors.push(`.value: ${valueField.message}`);
+        } else {
+          value = valueField.summary;
+        }
+      }
+
+      const positionField = await readTextParamField(startValue, "position", `textComponent.param[${paramIndex}].getStartValue()`, log);
+      if (positionField) {
+        if (positionField.errored) {
+          if (positionField.timedOut) timedOut = true;
+          errors.push(`.position: ${positionField.message}`);
+        } else {
+          position = positionField.summary;
+        }
+      }
+    }
+  }
+
+  return {
+    paramIndex,
+    displayName,
+    startValueConstructor,
+    paramConstructorName,
+    isTimeVarying,
+    areKeyframesSupported,
+    value,
+    position,
+    errors,
+    timedOut,
+  };
 }
 
 /**
@@ -540,11 +822,14 @@ export function cancelActiveDiagnostic() {
 }
 
 /**
- * Insert a .mogrt on the active sequence, run the deep component dump on it,
- * clean up the temporary clip, and return the full structured report. Reuses
- * the exact same insert/cleanup plumbing as templateInspector.js (see
- * ./mogrt.js) so this mode's insertion behavior can't drift from the regular
- * inspector's.
+ * Insert a .mogrt on the active sequence, discover its components once,
+ * then run the classification detail report, the deep raw probe, and (if
+ * an AE.ADBE Text component was found) the dedicated text extraction pass
+ * — all from that ONE discovery, in priority order (text first) — clean
+ * up the temporary clip, and return the full structured report. Reuses the
+ * exact same insert/cleanup plumbing as templateInspector.js (see
+ * ./mogrt.js) so this mode's insertion behavior can't drift from the
+ * regular inspector's.
  *
  * Bounded to finish within `opts.scanBudgetMs` (default
  * DEFAULT_SCAN_BUDGET_MS, ~12s) regardless of how much there is to probe or
@@ -612,24 +897,64 @@ export async function diagnoseMogrt(opts) {
     const trackItem = insertResult.value;
     log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
 
-    // Cleanup is guaranteed even if either scan throws OR the scan budget/
+    // Cleanup is guaranteed even if any phase throws OR the scan budget/
     // cancellation cuts it short — see runScanWithGuaranteedCleanup()'s doc
     // comment for the crash failure mode, and deepProbe.js's module
-    // doc-comment for the hang failure mode this budget fixes. Both the
-    // classification scan and the deeper raw probe run against the same
-    // single inserted clip and share the SAME budget, so there's only one
-    // insert/cleanup cycle and one overall time bound regardless of how
-    // much probing happens.
+    // doc-comment for the hang failure mode this budget fixes. Every phase
+    // below shares the SAME single discovery pass and the SAME budget, so
+    // there's only one insert/cleanup cycle, one overall time bound, and no
+    // possibility of the classification report and raw probe disagreeing
+    // on what components exist.
     const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
       async () => {
-        const componentReport = await deepDumpComponentChain(trackItem, log, budget);
-        const rawProbe = await deepProbeMogrt(trackItem, log, {
-          budget,
-          expectedComponentCount: componentReport.components.length,
-          expectedParamCounts: componentReport.components.map((c) => c.paramCount),
-        });
+        const typeNameResult = await safeResolve(() => trackItem.constructor?.name, { log, label: "trackItem type" });
+        const trackItemMatchName = await readMatchName(trackItem, log);
+        const trackItemInfo = { typeName: (typeNameResult.ok && typeNameResult.value) || "unknown", matchName: trackItemMatchName.value };
+        log(`TrackItem: type=${trackItemInfo.typeName}, matchName=${trackItemInfo.matchName ?? "n/a"}`, "info");
+
+        const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain()" });
+        if (!chainResult.ok || !chainResult.value) {
+          log(`✗ getComponentChain() failed: ${chainResult.ok ? "returned nothing" : (chainResult.error.message || chainResult.error)}`, "error");
+          return {
+            trackItem: trackItemInfo,
+            components: [],
+            scanStoppedEarly: true,
+            classificationPartial: false,
+            rawProbe: null,
+            textComponentProbe: null,
+            partial: false,
+          };
+        }
+        const chain = chainResult.value;
+
+        log("[stage] discovering components (lightweight: matchName, displayName, paramCount only)…", "info");
+        const discovery = await discoverComponents(chain, log, budget);
+        const ordered = prioritizeTextFirst(discovery.components);
+
+        const textInfo = discovery.components.find((c) => c.classification === "text-editing") ?? null;
+        let textComponentProbe = null;
+        if (textInfo) {
+          log(
+            `[stage] AE.ADBE Text component found at index ${textInfo.componentIndex} (${textInfo.paramCount ?? "?"} params declared) — probing it first, with priority.`,
+            "success"
+          );
+          textComponentProbe = await probeTextComponentDeep(textInfo, log, budget);
+        } else {
+          log("No AE.ADBE Text component found during discovery.", "warn");
+        }
+
+        const componentReport = await buildComponentDetailReport(trackItem, ordered, discovery.partial, log, budget);
+        const rawProbeInner = await probeComponentsDeep(trackItem, ordered, log, budget);
+        const rawProbe = { ...rawProbeInner, partial: rawProbeInner.partial || discovery.partial };
+
         log("[stage] serializing results…", "info");
-        return { ...componentReport, rawProbe, partial: Boolean(componentReport.classificationPartial || rawProbe.partial) };
+
+        return {
+          ...componentReport,
+          rawProbe,
+          textComponentProbe,
+          partial: Boolean(componentReport.classificationPartial || rawProbe.partial || (textComponentProbe && textComponentProbe.partial)),
+        };
       },
       () => {
         log("[stage] cleaning up (removing temporary inspection clip)…", "info");
@@ -637,7 +962,15 @@ export async function diagnoseMogrt(opts) {
       },
       log
     );
-    const report = scanReport ?? { trackItem: null, components: [], scanStoppedEarly: true, rawProbe: null, partial: true };
+    const report = scanReport ?? {
+      trackItem: null,
+      components: [],
+      scanStoppedEarly: true,
+      classificationPartial: false,
+      rawProbe: null,
+      textComponentProbe: null,
+      partial: true,
+    };
 
     if (cleanupResult.ok && cleanupResult.value) {
       log("Removed temporary inspection clip.", "info");

@@ -344,3 +344,96 @@ test("probeHostObject skips both shape and method probing entirely when the budg
   assert.equal(result.skipped, true);
   assert.equal(result.reason, "cancelled");
 });
+
+// --- Regression tests: the confirmed real-host bug where Premiere's
+// host-proxy functions report function.length (argCount) as 0 even when a
+// real argument IS required — getValueAtTime() and getParam() both do
+// this, which used to make probeSafeMethods auto-call them with no
+// argument on every param, reliably timing out and burning almost the
+// entire scan budget before AE.ADBE Text could be reached. ---
+
+test("probeSafeMethods never calls getValueAtTime even though the host reports its argCount (function.length) as 0", async () => {
+  let called = false;
+  const obj = {
+    // A real host-proxy function's .length really does report 0 here even
+    // though a TickTime argument is required — this fake mirrors that.
+    getValueAtTime: function () {
+      called = true;
+      return "should never run";
+    },
+  };
+  assert.equal(obj.getValueAtTime.length, 0, "sanity check: this fake reports argCount 0, same as the real host bug");
+  const result = await probeSafeMethods(obj, "param");
+  const entry = result.methods.find((m) => m.name === "getValueAtTime");
+  assert.equal(entry.called, false);
+  assert.equal(called, false, "getValueAtTime must never actually be invoked without a deliberately supplied TickTime");
+});
+
+test("probeSafeMethods never calls getParam even though the host reports its argCount as 0 (returns 'Invalid parameter' when auto-called with no index)", async () => {
+  let called = false;
+  const obj = {
+    getParam: function () {
+      called = true;
+      return "Invalid parameter";
+    },
+  };
+  assert.equal(obj.getParam.length, 0);
+  const result = await probeSafeMethods(obj, "component");
+  const entry = result.methods.find((m) => m.name === "getParam");
+  assert.equal(entry.called, false);
+  assert.equal(called, false, "getParam must never be auto-called without an explicit index");
+});
+
+test("probeSafeMethods never calls keyframe-search or createSetValueAction methods regardless of reported argCount", async () => {
+  const calls = [];
+  const obj = {
+    findNearestKeyframe: () => calls.push("findNearestKeyframe"),
+    findNextKeyframe: () => calls.push("findNextKeyframe"),
+    findPreviousKeyframe: () => calls.push("findPreviousKeyframe"),
+    createSetValueAction: () => calls.push("createSetValueAction"),
+  };
+  for (const fn of Object.values(obj)) assert.equal(fn.length, 0);
+  const result = await probeSafeMethods(obj, "param");
+  for (const name of Object.keys(obj)) {
+    const entry = result.methods.find((m) => m.name === name);
+    assert.equal(entry.called, false, `${name} must never be auto-called`);
+  }
+  assert.deepEqual(calls, [], "none of the denylisted methods should have actually run");
+});
+
+// --- Regression tests: inherited (prototype-only) accessor properties —
+// confirmed real-host shape for ComponentParam.getStartValue()'s
+// Keyframe/PointKeyframe results, whose `.value`/`.position` are defined
+// on the constructor's PROTOTYPE, not as own-enumerable properties on the
+// instance. Object.keys()-only enumeration never sees these at all, which
+// is why the probe used to report `value: {}`. ---
+
+function makeInheritedAccessorInstance(props) {
+  const proto = {};
+  for (const [name, value] of Object.entries(props)) {
+    Object.defineProperty(proto, name, { enumerable: false, configurable: true, get: () => value });
+  }
+  return Object.create(proto);
+}
+
+test("probeObjectShape reads inherited (prototype-only) displayName, not just own-enumerable properties", async () => {
+  const instance = makeInheritedAccessorInstance({ displayName: "Fill Color" });
+  assert.deepEqual(Object.keys(instance), [], "sanity check: displayName is NOT an own-enumerable key on this instance");
+  const result = await probeObjectShape(instance, "param");
+  assert.ok(result.prototypeNonMethodNames.includes("displayName"));
+  assert.deepEqual(result.inheritedFields.displayName, { wasPromiseLike: false, summary: { kind: "string", length: 10, preview: "Fill Color" } });
+});
+
+test("probeObjectShape reads an inherited Keyframe.value accessor property", async () => {
+  const keyframe = makeInheritedAccessorInstance({ value: 42 });
+  const result = await probeObjectShape(keyframe, "param.getStartValue()");
+  assert.deepEqual(result.inheritedFields.value, { wasPromiseLike: false, summary: { kind: "number", value: 42 } });
+});
+
+test("probeObjectShape reads an inherited PointKeyframe.position accessor property", async () => {
+  const pointKeyframe = makeInheritedAccessorInstance({ position: { x: 100, y: 200 } });
+  const result = await probeObjectShape(pointKeyframe, "param.getStartValue()");
+  assert.equal(result.inheritedFields.position.wasPromiseLike, false);
+  assert.equal(result.inheritedFields.position.summary.kind, "point-like");
+  assert.deepEqual(result.inheritedFields.position.summary.shallowPrimitiveFields, { x: 100, y: 200 });
+});

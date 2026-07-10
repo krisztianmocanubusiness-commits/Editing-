@@ -58,8 +58,16 @@ const VALID_CANVAS_2D_MEMBERS = new Set([
   "canvas", "getContextAttributes", "drawFocusIfNeeded",
 ]);
 
+// Strip comments before scanning so a doc comment that *mentions* a method
+// name (e.g. explaining why it's deliberately not called) isn't itself
+// treated as a usage. Good enough for this codebase's actual content, not
+// meant to be a full JS parser.
+function stripComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+}
+
 function findCanvasContextCalls(source) {
-  return [...source.matchAll(/\bctx\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]);
+  return [...stripComments(source).matchAll(/\bctx\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]);
 }
 
 function listJsFiles(dir) {
@@ -90,5 +98,62 @@ test("src/ui/previewCanvas.js is the only file that references a canvas context 
   assert.deepEqual(
     filesUsingCtx.map((f) => path.relative(SRC_DIR, f)),
     ["ui/previewCanvas.js"]
+  );
+});
+
+/**
+ * "Is this a real method name" (the test above) isn't the whole story:
+ * `ctx.measureText` is a perfectly real, standard Canvas 2D member, and it
+ * still threw `TypeError: ctx.measureText is not a function` in Premiere
+ * Pro 26.3, because that host's UXP canvas implementation simply doesn't
+ * have it. So this second check goes further: for members known to be
+ * missing or inconsistent across real hosts (confirmed: measureText;
+ * flagged as worth checking: gradients, roundRect, setTransform/
+ * resetTransform, filter), it requires that every file using one of them
+ * also contains a feature-detection guard (`typeof ctx.<member> ===
+ * "function"` or `"<member>" in ctx`) somewhere in that file.
+ *
+ * This is a whole-file check, not a per-call-site one — it can't prove
+ * the *specific* call is inside the guarded branch, only that the file
+ * demonstrates it's aware the member might be missing. That's a
+ * deliberate simplicity/robustness tradeoff (no real JS parser involved),
+ * and it's exactly the check that would have failed on the original,
+ * unguarded `ctx.measureText(text).width` calls before this fix.
+ */
+const RISKY_CANVAS_2D_MEMBERS = [
+  "measureText",
+  "createLinearGradient",
+  "createRadialGradient",
+  "createConicGradient",
+  "roundRect",
+  "setTransform",
+  "resetTransform",
+  "filter",
+];
+
+function hasAvailabilityGuard(source, member) {
+  const typeofGuard = new RegExp(`typeof\\s+ctx\\.${member}\\s*(===|!==)\\s*["']function["']`);
+  const inGuard = new RegExp(`["']${member}["']\\s+in\\s+ctx\\b`);
+  return typeofGuard.test(source) || inGuard.test(source);
+}
+
+test("risky Canvas 2D members (not guaranteed to exist on every UXP host) are feature-detected before use", () => {
+  const problems = [];
+  for (const file of listJsFiles(SRC_DIR)) {
+    const source = stripComments(fs.readFileSync(file, "utf8"));
+    const usedMembers = new Set(findCanvasContextCalls(source));
+    for (const member of RISKY_CANVAS_2D_MEMBERS) {
+      if (usedMembers.has(member) && !hasAvailabilityGuard(source, member)) {
+        problems.push(
+          `${path.relative(SRC_DIR, file)}: ctx.${member} is used but no ` +
+            `'typeof ctx.${member} === "function"' or '"${member}" in ctx' guard was found in that file`
+        );
+      }
+    }
+  }
+  assert.deepEqual(
+    problems,
+    [],
+    `Found unguarded use of a Canvas 2D member known to be missing/inconsistent across hosts:\n${problems.join("\n")}`
   );
 });

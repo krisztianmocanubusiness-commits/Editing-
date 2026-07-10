@@ -125,6 +125,21 @@ This is a hard block, not just a warning — `apply()` in
 resolvable template, so there's no way to trigger a timeline write with a
 missing template path.
 
+## Diagnostic Inspector ("2. Diagnostic Inspector")
+
+A separate, more verbose read-only mode for the case where a template's
+discovered params don't look like editable graphic/text controls at all
+(e.g. only `Motion`/`Opacity`/`Crop`-style names) and you need to know
+whether that's because the template genuinely has nothing exposed, or
+because `getComponentChain()` isn't surfacing its real controls. Click
+**"Run Diagnostic Inspector"** to get every component's display name *and*
+best-effort match name, classified as `intrinsic` (Motion/Opacity/Crop/Time
+Remapping), `graphic-or-mogrt`, or `effect-or-unknown`, with every param's
+name/type/current value — logged in full and saveable as JSON via **"Save
+diagnostic JSON…"**. See `docs/MOGRT_DIAGNOSTIC.md` for why this exists,
+what was and wasn't confirmed about Premiere's UXP API surface for MOGRTs,
+and how to read the output.
+
 ## What this does not do (yet)
 
 - It does not require the active template to be `KERIS_CAPTION_V1`-

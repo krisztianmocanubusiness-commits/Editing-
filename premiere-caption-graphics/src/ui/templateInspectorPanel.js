@@ -3,6 +3,7 @@ import { store } from "../state/store.js";
 import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { inspectMogrt } from "../ppro/templateInspector.js";
+import { diagnoseMogrt } from "../ppro/diagnostics.js";
 import { saveActiveTemplate } from "../state/settings.js";
 import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
 import { describeCompatibilityLabel } from "../presets/contractValidation.js";
@@ -91,6 +92,64 @@ function complianceSummaryBlock(result) {
   ]);
 }
 
+async function runDiagnostic() {
+  const { mogrtPath } = store.getState().templateInspector;
+  if (!mogrtPath) {
+    log("Choose a .mogrt to inspect first.", "error");
+    return;
+  }
+  patchInspector({ diagnosing: true, lastDiagnostic: null });
+  try {
+    const result = await diagnoseMogrt({ mogrtPath, log });
+    patchInspector({ lastDiagnostic: result });
+  } catch (err) {
+    log(`Diagnostic Inspector crashed unexpectedly: ${err.message || err}`, "error");
+    patchInspector({ lastDiagnostic: { ok: false, step: "crash" } });
+  } finally {
+    patchInspector({ diagnosing: false });
+  }
+}
+
+async function saveDiagnosticJson() {
+  const { lastDiagnostic } = store.getState().templateInspector;
+  if (!lastDiagnostic || !lastDiagnostic.ok) {
+    log("Run the Diagnostic Inspector successfully before saving its output.", "error");
+    return;
+  }
+  try {
+    const uxp = getUxp();
+    // @ts-ignore
+    const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-diagnostic.json", { types: ["json"] });
+    if (!file) return;
+    await file.write(JSON.stringify(lastDiagnostic, null, 2));
+    log(`Diagnostic saved to ${file.nativePath}.`, "success");
+  } catch (err) {
+    log(`Saving diagnostic JSON failed: ${err.message || err}`, "error");
+  }
+}
+
+function diagnosticSummaryBlock(result) {
+  if (!result || !result.ok) return null;
+  const byClass = result.components.reduce((acc, c) => {
+    acc[c.classification] = (acc[c.classification] || 0) + 1;
+    return acc;
+  }, {});
+  return el("div", { class: "inspector-results" }, [
+    el("div", {
+      class: "status-line",
+      text: `${result.components.length} component(s) found: ${byClass.intrinsic ?? 0} intrinsic, ` +
+        `${byClass["graphic-or-mogrt"] ?? 0} graphic-or-mogrt, ${byClass["effect-or-unknown"] ?? 0} effect-or-unknown.`,
+    }),
+    ...result.components.map((c) =>
+      el("div", {
+        class: "status-line",
+        text: `  [${c.classification}] "${c.displayName ?? "n/a"}" — ${c.paramCount} param(s)`,
+      })
+    ),
+    el("div", { class: "status-line", text: "Full detail (every param's name/type/value) is in the Log below and in the saved JSON." }),
+  ]);
+}
+
 function activeTemplateLine(activeTemplate) {
   if (!activeTemplate) {
     return el("div", { class: "status-line log-warn", text: "No active template saved yet." });
@@ -127,6 +186,22 @@ export function renderTemplateInspectorPanel(onChange) {
     },
   });
 
+  const diagnosticBtn = el("button", {
+    class: "btn",
+    text: ti.diagnosing ? "Diagnosing…" : "Run Diagnostic Inspector",
+    disabled: !isHosted() || ti.diagnosing || !ti.mogrtPath || undefined,
+    onClick: async () => {
+      await runDiagnostic();
+      onChange();
+    },
+  });
+  const saveDiagnosticBtn = el("button", {
+    class: "btn",
+    text: "Save diagnostic JSON…",
+    disabled: !ti.lastDiagnostic || !ti.lastDiagnostic.ok || undefined,
+    onClick: () => saveDiagnosticJson(),
+  });
+
   return el("section", { class: "panel panel-template-inspector" }, [
     el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
     el(
@@ -148,5 +223,20 @@ export function renderTemplateInspectorPanel(onChange) {
     complianceSummaryBlock(ti.lastResult),
     el("div", { class: "row" }, [saveBtn]),
     activeTemplateLine(state.activeTemplate),
+    el("h3", { text: "Diagnostic Inspector (troubleshooting)" }),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Dumps the full component/param graph found on this .mogrt with no assumptions about which " +
+          "params are meaningful — every component's display name and best-effort match name, classified " +
+          "as intrinsic (Motion/Opacity/Crop/Time Remapping — present on every clip), graphic-or-mogrt " +
+          "(name/matchName suggests it's the template's own content), or effect-or-unknown. Use this to see " +
+          "exactly what Premiere's scripting API can see on a given .mogrt before assuming any param name. " +
+          "See docs/MOGRT_DIAGNOSTIC.md.",
+      ]
+    ),
+    el("div", { class: "row" }, [diagnosticBtn, saveDiagnosticBtn]),
+    diagnosticSummaryBlock(ti.lastDiagnostic),
   ]);
 }

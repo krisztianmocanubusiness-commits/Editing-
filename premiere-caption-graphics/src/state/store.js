@@ -77,5 +77,7 @@ export const store = createStore({
     mogrtPath: "",
     running: false,
     lastResult: null, // full inspectMogrt() return value, or null
+    diagnosing: false,
+    lastDiagnostic: null, // full diagnoseMogrt() return value, or null — see src/ppro/diagnostics.js
   },
 });

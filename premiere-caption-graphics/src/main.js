@@ -23,6 +23,7 @@
 
 import { mountApp } from "./ui/render.js";
 import { getUxp } from "./ppro/client.js";
+import { log, clearLog, copyLogToClipboard } from "./util/log.js";
 
 const TAG = "[Caption Graphics Studio]";
 
@@ -42,6 +43,28 @@ try {
 } catch (err) {
   console.error(`${TAG} startup failed:`, err);
   renderStartupError(err);
+}
+
+wireLogPanelControls();
+
+// The Log panel (index.html's static #log-body/#copy-log-btn/#clear-log-btn)
+// lives outside #app and is never touched by render.js's re-renders, so it
+// only needs wiring once here — not on every store change.
+function wireLogPanelControls() {
+  const copyBtn = document.querySelector("#copy-log-btn");
+  if (copyBtn) {
+    copyBtn.addEventListener("click", async () => {
+      const result = await copyLogToClipboard();
+      log(result.ok ? `Log copied to clipboard (via ${result.method}).` : `Couldn't copy the log: ${result.error}`, result.ok ? "success" : "error");
+    });
+  }
+  const clearBtn = document.querySelector("#clear-log-btn");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      clearLog();
+      log("Log cleared.", "info");
+    });
+  }
 }
 
 function logHostInfo() {

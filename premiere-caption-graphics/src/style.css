@@ -91,7 +91,33 @@ input[type="range"] { width: 100%; }
 
 .preview-canvas { width: 100%; max-width: 400px; aspect-ratio: 16 / 9; border: 1px solid var(--panel-border); border-radius: 4px; display: block; margin: 8px 0; background: #000; }
 
-.log-body { max-height: 160px; overflow-y: auto; font-family: "SF Mono", Consolas, monospace; font-size: 10.5px; background: #161616; border: 1px solid var(--panel-border); border-radius: 4px; padding: 6px 8px; }
+/*
+ * max-height + overflow-y:auto make this its own independent scroll region
+ * regardless of how tall the rest of the panel grows — confirmed necessary
+ * in Premiere Pro's UXP host (a Chromium/CEF webview): without an explicit
+ * bounded height the box just grows to fit every log line instead of
+ * scrolling, and the panel's own default (near-invisible, ~0px-wide)
+ * scrollbar makes an actually-scrollable box look broken. The
+ * ::-webkit-scrollbar rules below give it a visible thumb/track against
+ * the dark theme so the scroll affordance is obvious, and overscroll-
+ * behavior:contain stops a wheel-scroll at the log's own bottom/top edge
+ * from also scrolling the panel behind it.
+ */
+.log-body {
+  max-height: 280px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 10.5px;
+  background: #161616;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+.log-body::-webkit-scrollbar { width: 10px; }
+.log-body::-webkit-scrollbar-track { background: #161616; }
+.log-body::-webkit-scrollbar-thumb { background: #4a4a4a; border-radius: 5px; }
+.log-body::-webkit-scrollbar-thumb:hover { background: #5c5c5c; }
 .log-line { white-space: pre-wrap; }
 .log-error { color: var(--error); }
 .log-warn { color: var(--warn); }

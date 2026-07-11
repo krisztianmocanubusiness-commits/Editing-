@@ -172,8 +172,14 @@ async function runSourceTextRoundTripTest() {
   patchInspector({ sourceTextRoundTripRunning: true, lastSourceTextRoundTrip: null });
   try {
     const result = await testSourceTextRoundTrip({ mogrtPath, log });
+    // TEMPORARY: also dump the full result to console.error() (not just the
+    // panel log/UI) so it's still retrievable via the UXP Developer Tool's
+    // Console tab even if the panel's log UI breaks or scrolls it away.
+    // Remove once the Source Text round trip is confirmed stable on a real host.
+    console.error("[Caption Graphics Studio] Source Text Round Trip result:", JSON.stringify(result, null, 2));
     patchInspector({ lastSourceTextRoundTrip: result });
   } catch (err) {
+    console.error("[Caption Graphics Studio] Source Text Round Trip crashed:", err);
     log(`Source Text Round Trip crashed unexpectedly: ${err.message || err}`, "error");
     patchInspector({ lastSourceTextRoundTrip: { ok: false, step: "crash" } });
   } finally {

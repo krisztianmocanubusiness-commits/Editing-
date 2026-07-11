@@ -472,3 +472,95 @@ export async function probeHostObject(obj, label, log, budget) {
   const [shape, methods] = await Promise.all([probeObjectShape(obj, label, log, budget), probeSafeMethods(obj, label, log, budget)]);
   return { label, shape, methods };
 }
+
+const MAX_UNWRAP_DEPTH = 5;
+
+/**
+ * Reduces a resolved host value down to its actual primitive/simple-shape
+ * payload — a `resolvedValue`, not just a shape summary. Built because
+ * summarizeHostValue() alone was stopping at things like
+ * `{ ownKeys: ["value"], shallowPrimitiveFields: { value: 100 } }` for a
+ * `Keyframe`, when what's actually wanted is just `100`.
+ *
+ * Handles three confirmed real-host shapes:
+ *   - A single-field `{ value: X }` wrapper (Keyframe/PointKeyframe) —
+ *     unwrapped one level and recursed, in case of nested wrapping.
+ *   - PointF-shaped (`x`/`y`, case-insensitive) — read into `{ x, y }`.
+ *   - Color-shaped (`red`/`green`/`blue`, optional `alpha`,
+ *     case-insensitive) — read into `{ red, green, blue }` or
+ *     `{ red, green, blue, alpha }`.
+ * Anything else returns `null` — callers should keep using
+ * summarizeHostValue()'s fuller shape summary alongside this, not instead
+ * of it, for values this can't reduce further.
+ *
+ * Same safety posture as the rest of this module: every field read is
+ * timeout-guarded, depth is capped (MAX_UNWRAP_DEPTH), and a WeakSet
+ * guards against a cyclic object being unwrapped forever.
+ *
+ * @param {*} value
+ * @param {(message: string, level?: string) => void} [log]
+ * @param {{ label?: string, timeoutMs?: number, depth?: number, seen?: WeakSet<object> }} [opts]
+ * @returns {Promise<string|number|boolean|{x:number,y:number}|{red:number,green:number,blue:number,alpha?:number}|null>}
+ */
+export async function unwrapValueDeep(value, log, opts = {}) {
+  const { label = "value", timeoutMs = PROBE_CALL_TIMEOUT_MS, depth = 0, seen = new WeakSet() } = opts;
+  if (depth > MAX_UNWRAP_DEPTH) return null;
+
+  const resolved = await resolveHostValueDetailed(value, { log, label, timeoutMs });
+  if (!resolved.ok) return null;
+  const v = resolved.value;
+
+  if (v === null || v === undefined) return null;
+  const t = typeof v;
+  if (t === "string" || t === "number" || t === "boolean") return v;
+  if (t !== "object") return null;
+  if (seen.has(v)) return null;
+  seen.add(v);
+
+  const readProp = async (name) => {
+    const raw = safe(() => v[name]);
+    if (!raw.ok || raw.value === undefined) return undefined;
+    const r = await resolveHostValueDetailed(raw.value, { log, label: `${label}.${name}`, timeoutMs });
+    return r.ok ? r.value : undefined;
+  };
+
+  // Own + inherited (prototype-chain) property names — Keyframe/
+  // PointKeyframe's `.value`/`.position` are confirmed real-host accessor
+  // properties defined on the prototype, not own-enumerable, so an
+  // own-only scan (Object.keys/getOwnPropertyNames) misses them entirely.
+  // "constructor" and methods are excluded — same filtering probeObjectShape
+  // applies — since every class instance has an inherited "constructor" own
+  // property on its prototype, which would otherwise defeat the single-field
+  // `{ value: X }` wrapper check below on any real (non-plain-object) host value.
+  const propNames = [...walkPrototypeChain(v).keys()].filter(
+    (name) => name !== "constructor" && safe(() => typeof v[name] === "function").value !== true
+  );
+  const lowerNames = propNames.map((n) => n.toLowerCase());
+  const findName = (lower) => propNames[lowerNames.indexOf(lower)];
+  const has = (lower) => lowerNames.includes(lower);
+
+  if (has("x") && has("y")) {
+    const x = await readProp(findName("x"));
+    const y = await readProp(findName("y"));
+    if (typeof x === "number" && typeof y === "number") return { x, y };
+  }
+
+  if (has("red") && has("green") && has("blue")) {
+    const red = await readProp(findName("red"));
+    const green = await readProp(findName("green"));
+    const blue = await readProp(findName("blue"));
+    const alpha = has("alpha") ? await readProp(findName("alpha")) : undefined;
+    if (typeof red === "number" && typeof green === "number" && typeof blue === "number") {
+      return alpha !== undefined ? { red, green, blue, alpha } : { red, green, blue };
+    }
+  }
+
+  if (propNames.length === 1 && lowerNames[0] === "value") {
+    const inner = await readProp(propNames[0]);
+    if (inner !== undefined) {
+      return unwrapValueDeep(inner, log, { label: `${label}.value`, timeoutMs, depth: depth + 1, seen });
+    }
+  }
+
+  return null;
+}

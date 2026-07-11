@@ -79,5 +79,7 @@ export const store = createStore({
     lastResult: null, // full inspectMogrt() return value, or null
     diagnosing: false,
     lastDiagnostic: null, // full diagnoseMogrt() return value, or null — see src/ppro/diagnostics.js
+    sourceTextRoundTripRunning: false,
+    lastSourceTextRoundTrip: null, // full testSourceTextRoundTrip() return value, or null — see src/ppro/sourceTextProbe.js
   },
 });

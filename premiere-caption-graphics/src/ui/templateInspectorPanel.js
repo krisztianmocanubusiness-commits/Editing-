@@ -4,6 +4,7 @@ import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { inspectMogrt } from "../ppro/templateInspector.js";
 import { diagnoseMogrt, cancelActiveDiagnostic } from "../ppro/diagnostics.js";
+import { testSourceTextRoundTrip, cancelActiveSourceTextRoundTrip } from "../ppro/sourceTextProbe.js";
 import { saveActiveTemplate } from "../state/settings.js";
 import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
 import { describeCompatibilityLabel } from "../presets/contractValidation.js";
@@ -162,6 +163,34 @@ async function saveRawProbeJson() {
   }
 }
 
+async function runSourceTextRoundTripTest() {
+  const { mogrtPath } = store.getState().templateInspector;
+  if (!mogrtPath) {
+    log("Choose a .mogrt to inspect first.", "error");
+    return;
+  }
+  patchInspector({ sourceTextRoundTripRunning: true, lastSourceTextRoundTrip: null });
+  try {
+    const result = await testSourceTextRoundTrip({ mogrtPath, log });
+    patchInspector({ lastSourceTextRoundTrip: result });
+  } catch (err) {
+    log(`Source Text Round Trip crashed unexpectedly: ${err.message || err}`, "error");
+    patchInspector({ lastSourceTextRoundTrip: { ok: false, step: "crash" } });
+  } finally {
+    patchInspector({ sourceTextRoundTripRunning: false });
+  }
+}
+
+function cancelSourceTextRoundTrip() {
+  const cancelled = cancelActiveSourceTextRoundTrip();
+  log(
+    cancelled
+      ? "Cancel requested — the round trip will stop at its next checkpoint and still clean up the temporary clip."
+      : "Nothing to cancel — no Source Text round trip is currently running.",
+    cancelled ? "warn" : "info"
+  );
+}
+
 function diagnosticSummaryBlock(result, diagnosing) {
   if (diagnosing) {
     return el("div", { class: "inspector-results" }, [
@@ -256,6 +285,75 @@ function diagnosticSummaryBlock(result, diagnosing) {
   ]);
 }
 
+// Picks exactly one of the four user-facing outcome messages for a
+// completed sourceTextProbe. Priority: a full write+read-back match beats
+// a failed write action, which beats a successful plain read, which beats
+// "found but null" — see docs/MOGRT_DIAGNOSTIC.md.
+function sourceTextOutcomeMessage(probe) {
+  const { readAttempts, actionCreation, readBack } = probe;
+  if (readBack?.ok && readBack?.matched) {
+    return { text: "Source Text write/read-back succeeded.", cls: "log-success" };
+  }
+  if (actionCreation?.attempted && !actionCreation?.ok) {
+    return { text: `Source Text write action could not be created: ${actionCreation.error ?? "unknown error"}`, cls: "log-error" };
+  }
+  const successfulRead = (readAttempts ?? []).find((r) => r.ok && r.resolvedValue !== null && r.resolvedValue !== undefined);
+  if (successfulRead) {
+    return { text: `Source Text read successfully: ${JSON.stringify(successfulRead.resolvedValue)}`, cls: "log-info" };
+  }
+  const anyOkRead = (readAttempts ?? []).some((r) => r.ok);
+  if (anyOkRead) {
+    return { text: "Source Text parameter was found, but Premiere returned null when reading it.", cls: "log-warn" };
+  }
+  return { text: "Source Text parameter was found, but no read attempt succeeded — see Log for details.", cls: "log-warn" };
+}
+
+function sourceTextRoundTripBlock(result, running) {
+  if (running) {
+    return el("div", { class: "inspector-results" }, [
+      el("div", {
+        class: "status-line log-info",
+        text: "⏳ Running Source Text round trip — inserting a temporary clip, waiting for it to stabilize, reading Source Text, testing a " +
+          "non-mutating sentinel keyframe, then (only if that succeeds) writing it and reading it back. The temporary clip is always removed " +
+          "afterwards. See Log below for live progress, or click Cancel to stop early.",
+      }),
+    ]);
+  }
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Source Text Round Trip failed${stepLabel}${result.error ? `: ${result.error}` : ""}. See Log below.` }),
+    ]);
+  }
+  if (!result.found) {
+    const reasonText =
+      result.reason === "no-source-text-param"
+        ? "AE.ADBE Text was found, but no param with displayName exactly \"Source Text\" was found on it."
+        : "MOGRT component chain did not fully initialise before timeout — AE.ADBE Text was not found within the wait window.";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-warn", text: `⚠ ${reasonText} Temporary clip removed either way. Try again, or check the Log for the discovery timeline.` }),
+    ]);
+  }
+  const probe = result.sourceTextProbe;
+  const outcome = sourceTextOutcomeMessage(probe);
+  return el("div", { class: "inspector-results" }, [
+    el("div", {
+      class: "status-line",
+      text: `AE.ADBE Text found (component ${probe.componentIndex}), Source Text param at index ${probe.paramIndex} ` +
+        `(isTimeVarying: ${String(probe.isTimeVarying)}, areKeyframesSupported: ${String(probe.areKeyframesSupported)}).`,
+    }),
+    el("div", { class: `status-line ${outcome.cls}`, text: `${outcome.text}` }),
+    el("div", {
+      class: "status-line",
+      text: `createKeyframe: ${probe.keyframeCreation.ok ? "✓ succeeded" + (probe.keyframeCreation.sentinelPreserved ? " (sentinel preserved)" : "") : "✗ " + (probe.keyframeCreation.error ?? "failed")}` +
+        (probe.actionCreation.attempted ? ` — createSetValueAction: ${probe.actionCreation.ok ? "✓ succeeded" : "✗ " + (probe.actionCreation.error ?? "failed")}` : "") +
+        (probe.transaction.attempted ? ` — executeTransaction: ${probe.transaction.ok ? "✓ succeeded" : "✗ " + (probe.transaction.error ?? "failed")}` : ""),
+    }),
+    el("div", { class: "status-line", text: `Temporary clip removed: ${result.cleanupOk ? "yes" : "NO — you may need to delete it from the timeline by hand"}.` }),
+  ]);
+}
+
 function activeTemplateLine(activeTemplate) {
   if (!activeTemplate) {
     return el("div", { class: "status-line log-warn", text: "No active template saved yet." });
@@ -320,6 +418,22 @@ export function renderTemplateInspectorPanel(onChange) {
     onClick: () => saveRawProbeJson(),
   });
 
+  const sourceTextRoundTripBtn = el("button", {
+    class: "btn",
+    text: ti.sourceTextRoundTripRunning ? "Testing…" : "Test Source Text Round Trip",
+    disabled: !isHosted() || ti.sourceTextRoundTripRunning || !ti.mogrtPath || undefined,
+    onClick: async () => {
+      await runSourceTextRoundTripTest();
+      onChange();
+    },
+  });
+  const cancelSourceTextRoundTripBtn = el("button", {
+    class: "btn",
+    text: "Cancel",
+    disabled: !ti.sourceTextRoundTripRunning || undefined,
+    onClick: () => cancelSourceTextRoundTrip(),
+  });
+
   return el("section", { class: "panel panel-template-inspector" }, [
     el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
     el(
@@ -364,5 +478,19 @@ export function renderTemplateInspectorPanel(onChange) {
     ),
     el("div", { class: "row" }, [diagnosticBtn, cancelDiagnosticBtn, saveDiagnosticBtn, saveRawProbeBtn]),
     diagnosticSummaryBlock(ti.lastDiagnostic, ti.diagnosing),
+    el("h3", { text: "Source Text Round Trip (troubleshooting)" }),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Narrowly scoped: locates the AE.ADBE Text component's \"Source Text\" param (matched by display name, " +
+          "not just the last-seen index), reads it with several valid TickTime arguments, tests a non-mutating " +
+          "sentinel keyframe, and — only if that succeeds — writes the sentinel and reads it back on the " +
+          "temporary inspection clip. Does not touch anything else and does not require re-running the full " +
+          "Diagnostic Inspector above. The temporary clip is always removed afterwards. See docs/MOGRT_DIAGNOSTIC.md.",
+      ]
+    ),
+    el("div", { class: "row" }, [sourceTextRoundTripBtn, cancelSourceTextRoundTripBtn]),
+    sourceTextRoundTripBlock(ti.lastSourceTextRoundTrip, ti.sourceTextRoundTripRunning),
   ]);
 }

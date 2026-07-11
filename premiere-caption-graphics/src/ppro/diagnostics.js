@@ -29,6 +29,7 @@ import {
   createScanBudget,
   DEFAULT_SCAN_BUDGET_MS,
   PROBE_CALL_TIMEOUT_MS,
+  unwrapValueDeep,
 } from "./deepProbe.js";
 
 const MAX_COMPONENT_SCAN = 64;
@@ -226,7 +227,7 @@ async function readParamType(param, ci, pi, log) {
  * NEVER_AUTO_CALL_EXACT_NAMES in src/ppro/deepProbe.js for why the latter
  * must never be auto-invoked.
  */
-async function readParamCount(component, ci, log) {
+export async function readParamCount(component, ci, log) {
   if (typeof component.getParamCount !== "function") return null;
   const result = await safeResolve(() => component.getParamCount(), { log, label: `component[${ci}].getParamCount()` });
   return result.ok && typeof result.value === "number" ? result.value : null;
@@ -499,20 +500,28 @@ export async function buildComponentDetailReport(trackItem, orderedComponents, d
       const paramType = await readParamType(param, ci, pi, log);
       const startValue = await safeResolve(() => param.getStartValue(), { log, label: `component[${ci}].param[${pi}].getStartValue()` });
       let valueSummary;
+      let resolvedValue = null;
       if (!startValue.ok) {
         valueSummary = { kind: "unreadable", error: startValue.timedOut ? "getStartValue() timed out" : String(startValue.error?.message || startValue.error) };
       } else {
         const resolved = await resolveHostValueDetailed(startValue.value, { log, label: `component[${ci}].param[${pi}].value`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
-        valueSummary = resolved.ok
-          ? summarizeHostValue(resolved.value)
-          : { kind: "unreadable", error: resolved.timedOut ? "value resolution timed out" : String(resolved.error?.message || resolved.error) };
+        if (resolved.ok) {
+          valueSummary = summarizeHostValue(resolved.value);
+          // resolvedValue is the "just give me the real number/string/point/
+          // colour" reduction — normalizes past the {ownKeys:["value"],
+          // shallowPrimitiveFields:{value:100}}-shaped summary above. See
+          // deepProbe.js's unwrapValueDeep().
+          resolvedValue = await unwrapValueDeep(resolved.value, log, { label: `component[${ci}].param[${pi}].value` });
+        } else {
+          valueSummary = { kind: "unreadable", error: resolved.timedOut ? "value resolution timed out" : String(resolved.error?.message || resolved.error) };
+        }
       }
       const isTextLike = textLikeSignal(paramDisplayName, paramMatchNameResult.value);
 
       log(
         `  Param ${pi}: displayName="${paramDisplayName ?? "n/a"}", matchName=${paramMatchNameResult.value ?? "n/a"}` +
           `${paramMatchNameResult.source ? ` (via ${paramMatchNameResult.source})` : ""}, type=${paramType}, ` +
-          `value=${formatSummaryForLog(valueSummary)}${isTextLike ? " — TEXT-LIKE NAME" : ""}`,
+          `value=${formatSummaryForLog(valueSummary)}${resolvedValue !== null ? `, resolvedValue=${JSON.stringify(resolvedValue)}` : ""}${isTextLike ? " — TEXT-LIKE NAME" : ""}`,
         "info"
       );
 
@@ -523,6 +532,7 @@ export async function buildComponentDetailReport(trackItem, orderedComponents, d
         matchNameSource: paramMatchNameResult.source,
         type: paramType,
         value: valueSummary,
+        resolvedValue,
         textLikeSignal: isTextLike,
       });
     }

@@ -447,3 +447,105 @@ Net effect: total worst-case wall-clock time for one diagnostic run is now
 bounded by stabilization (~6s) plus a fresh probing budget (~12s) — around
 18s — instead of a single shared 12s budget that a slow MOGRT startup could
 silently eat into before any real probing even began.
+
+## Fifth real host run: `Source Text` found, but `getStartValue()` returns null — and the read/write round trip
+
+With stabilization in place, a real host run reliably found `AE.ADBE Text`
+at component index 3 with all 22 params probed (`partial: false`,
+`cleanupOk: true`, no timeouts). The most important single param:
+
+```
+componentIndex: 3, matchName: "AE.ADBE Text"
+paramIndex: 0, displayName: "Source Text"
+isTimeVarying: false, areKeyframesSupported: false
+startValueConstructor: null, value: null
+```
+
+`Source Text` is unambiguously the real editable caption text control — but
+`getStartValue()` reports `null` for it, and both `isTimeVarying` and
+`areKeyframesSupported` are `false`. Per the UXP API docs, a param with
+`areKeyframesSupported: false` still supports `getValueAtTime(time)` (it
+just isn't keyframe-animatable) — `getStartValue()` returning `null` here
+looks like a real quirk of this specific param type, not evidence the
+param is unreadable. This needed to be proven before wiring caption
+generation into it.
+
+### `src/ppro/sourceTextProbe.js`: a narrow, separate read/write round-trip diagnostic
+
+Deliberately **not** part of `diagnoseMogrt()` — nobody testing whether
+`Source Text` writes should have to re-run the full classification report
++ raw probe + text extraction pass every time. `testSourceTextRoundTrip()`
+does its own insert → stabilize → locate → round-trip → cleanup cycle
+(same `runScanWithGuaranteedCleanup` guarantee as the Diagnostic Inspector
+— the temporary clip is removed whether `createKeyframe` throws, action
+creation fails, `executeTransaction` fails, read-back fails, the operation
+times out, or the user cancels).
+
+Steps, each independently recorded so a failure partway through still
+returns everything that DID complete:
+
+1. **Locate by displayName, not index.** `AE.ADBE Text` component index 3
+   and `Source Text` param index 0 are kept only as diagnostic metadata —
+   every lookup (including the post-write reacquire) re-derives both from
+   `matchName`/`displayName`, since a different .mogrt could expose
+   `Source Text` at a different index.
+2. **Read with several explicit, valid `TickTime` arguments** —
+   `TickTime.createWithSeconds(0)`, `trackItem.getInPoint()`,
+   `trackItem.getStartTime()`, and an optional midpoint
+   (`getInPoint() + getDuration()/2`) — **never** `getValueAtTime()` with
+   no argument (see `NEVER_AUTO_CALL_EXACT_NAMES` below for why that's
+   unsafe even when the host misreports the method as zero-arg). Each
+   attempt has its own timeout and is recorded independently.
+3. **Non-mutating sentinel keyframe construction first:**
+   `sourceTextParam.createKeyframe("KERIS_DIAGNOSTIC_SENTINEL")`. Per the
+   official API this only constructs a local `Keyframe` object — it does
+   not touch the sequence — so it's always safe to attempt.
+4. **Only if that succeeds**, a real write on the temporary clip:
+   `createSetValueAction(keyframe, true)`, executed through
+   `project.lockedAccess(() => project.executeTransaction(...))` — the
+   same pattern `src/ppro/componentParams.js`'s `setParamValue()` uses for
+   every other param write in this extension.
+5. **Only if the transaction succeeds**, a fresh reacquire-and-read-back:
+   wait briefly, call `trackItem.getComponentChain()` again (never reuse
+   the pre-write `Component`/`ComponentParam` references), re-locate
+   `AE.ADBE Text` and `Source Text` by name, and read with a fresh
+   `TickTime.createWithSeconds(0)`. Success means the read-back string
+   equals the sentinel exactly.
+
+The UI (a new "Test Source Text Round Trip" button, separate from "Run
+Diagnostic Inspector") shows exactly one of four outcomes based on which
+step actually succeeded: a full write/read-back match, a plain successful
+read (write not yet proven), "found but null", or a write-action creation
+failure with its error.
+
+### `unwrapValueDeep()`: a real `resolvedValue`, not just a shape summary
+
+The existing `summarizeHostValue()` was stopping at
+`{ ownKeys: ["value"], shallowPrimitiveFields: { value: 100 } }` for a
+`Keyframe` — useful as a shape summary, useless as an actual value to
+compare against the sentinel. `unwrapValueDeep()` (`src/ppro/deepProbe.js`)
+reduces a resolved host value down to its real payload: a single-field
+`{ value: X }` wrapper (Keyframe/PointKeyframe) unwraps one level and
+recurses (depth-capped); a PointF-shaped value reads into `{ x, y }`; a
+Color-shaped value reads into `{ red, green, blue, alpha? }`. Same safety
+posture as the rest of this module — every field read is timeout-guarded,
+a `WeakSet` guards cycles, depth is capped.
+
+**Bug caught before it ever reached a real host:** the wrapper-detection
+heuristic (`propNames.length === 1 && lowerNames[0] === "value"`) walks
+the object's own **and inherited** property names (via the existing
+`walkPrototypeChain()`, since `Keyframe.value` is confirmed to be an
+inherited, prototype-only accessor, not own-enumerable) — but every real
+class instance also has an inherited, own `constructor` property sitting
+on its prototype (auto-added by the JS engine), which would make
+`propNames.length` come out to 2 and silently defeat the wrapper check on
+any real (non-plain-object) host value, even though it works fine against
+plain-object test fixtures. Fixed by filtering out `"constructor"` and any
+function-typed property before the check — the same filtering
+`probeObjectShape()` already applies when separating methods from data
+fields, applied here too.
+
+`resolvedValue` is also now wired into `buildComponentDetailReport()`'s
+per-param output generally (not just the Source Text round trip), so the
+classification report's saved JSON gets a direct value alongside the
+existing shape summary for every param, where one is derivable.

@@ -8,6 +8,7 @@ import {
   probeSafeMethods,
   probeHostObject,
   createScanBudget,
+  unwrapValueDeep,
 } from "../src/ppro/deepProbe.js";
 
 function neverResolves() {
@@ -436,4 +437,91 @@ test("probeObjectShape reads an inherited PointKeyframe.position accessor proper
   assert.equal(result.inheritedFields.position.wasPromiseLike, false);
   assert.equal(result.inheritedFields.position.summary.kind, "point-like");
   assert.deepEqual(result.inheritedFields.position.summary.shallowPrimitiveFields, { x: 100, y: 200 });
+});
+
+// --- unwrapValueDeep ---
+
+test("unwrapValueDeep passes primitives straight through", async () => {
+  assert.equal(await unwrapValueDeep("hello"), "hello");
+  assert.equal(await unwrapValueDeep(42), 42);
+  assert.equal(await unwrapValueDeep(true), true);
+  assert.equal(await unwrapValueDeep(null), null);
+  assert.equal(await unwrapValueDeep(undefined), null);
+});
+
+test("unwrapValueDeep unwraps a single-field { value: X } wrapper (Keyframe shape) down to the primitive", async () => {
+  const keyframe = { value: "KERIS_DIAGNOSTIC_SENTINEL" };
+  assert.equal(await unwrapValueDeep(keyframe), "KERIS_DIAGNOSTIC_SENTINEL");
+});
+
+test("unwrapValueDeep unwraps an inherited (prototype-only) Keyframe.value accessor, not just an own-enumerable one", async () => {
+  const keyframe = makeInheritedAccessorInstance({ value: 100 });
+  assert.equal(await unwrapValueDeep(keyframe), 100);
+});
+
+test("unwrapValueDeep recurses through nested { value: { value: X } } wrapping", async () => {
+  const nested = { value: { value: "deeply nested" } };
+  assert.equal(await unwrapValueDeep(nested), "deeply nested");
+});
+
+test("unwrapValueDeep reads PointF-shaped values into { x, y }", async () => {
+  const point = { x: 12.5, y: -3 };
+  assert.deepEqual(await unwrapValueDeep(point), { x: 12.5, y: -3 });
+});
+
+test("unwrapValueDeep reads PointF fields case-insensitively", async () => {
+  const point = { X: 1, Y: 2 };
+  assert.deepEqual(await unwrapValueDeep(point), { x: 1, y: 2 });
+});
+
+test("unwrapValueDeep reads Color-shaped values into { red, green, blue, alpha }", async () => {
+  const color = { red: 255, green: 128, blue: 0, alpha: 1 };
+  assert.deepEqual(await unwrapValueDeep(color), { red: 255, green: 128, blue: 0, alpha: 1 });
+});
+
+test("unwrapValueDeep reads a Color without alpha into { red, green, blue } only", async () => {
+  const color = { red: 10, green: 20, blue: 30 };
+  assert.deepEqual(await unwrapValueDeep(color), { red: 10, green: 20, blue: 30 });
+});
+
+test("unwrapValueDeep returns null for a shape it can't reduce (not value/point/color-shaped)", async () => {
+  const mystery = { foo: 1, bar: 2 };
+  assert.equal(await unwrapValueDeep(mystery), null);
+});
+
+test("unwrapValueDeep detects a self-referential object instead of recursing forever", async () => {
+  const cyclic = {};
+  cyclic.value = cyclic;
+  const start = Date.now();
+  const result = await unwrapValueDeep(cyclic);
+  const elapsed = Date.now() - start;
+  assert.equal(result, null);
+  assert.ok(elapsed < 2000, `expected cycle detection to bail out quickly, took ${elapsed}ms`);
+});
+
+test("unwrapValueDeep stops at the depth cap instead of recursing indefinitely through nested { value } wrappers", async () => {
+  let deeplyNested = "bottom";
+  for (let i = 0; i < 20; i++) deeplyNested = { value: deeplyNested };
+  const start = Date.now();
+  const result = await unwrapValueDeep(deeplyNested);
+  const elapsed = Date.now() - start;
+  assert.equal(result, null, "expected the depth cap to stop unwrapping before reaching the bottom primitive");
+  assert.ok(elapsed < 2000, `expected the depth-capped unwrap to finish quickly, took ${elapsed}ms`);
+});
+
+test("unwrapValueDeep returns null (not a hang) for a value that is a Promise that never resolves", async () => {
+  const start = Date.now();
+  const result = await unwrapValueDeep(neverResolves());
+  const elapsed = Date.now() - start;
+  assert.equal(result, null);
+  assert.ok(elapsed < 2000, `expected unwrapValueDeep to time out well under 2s, took ${elapsed}ms`);
+});
+
+test("unwrapValueDeep returns null (not a hang) when a candidate field's own value is a Promise that never resolves", async () => {
+  const keyframe = { value: neverResolves() };
+  const start = Date.now();
+  const result = await unwrapValueDeep(keyframe);
+  const elapsed = Date.now() - start;
+  assert.equal(result, null);
+  assert.ok(elapsed < 2000, `expected unwrapValueDeep to time out well under 2s, took ${elapsed}ms`);
 });

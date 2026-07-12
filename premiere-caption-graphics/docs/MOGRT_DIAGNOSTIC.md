@@ -729,3 +729,53 @@ calls `createKeyframe` or anything else that could mutate the sequence.
 `testExploreKeyframeObject()` is the standalone entry point: the same
 insert → stabilize → locate → cleanup cycle as the other two Source Text
 diagnostics, stopping at exploration.
+
+## Ninth: pivoting from read investigation to a write-only probe
+
+Enough evidence had accumulated that Premiere's UXP API exposes Source
+Text but does not expose a reliably usable read path for it: no
+`getValue()`, `.value` is `undefined`, `getStartValue()` returns `null`,
+and the keyframe API explored above (`getKeyframePtr`/
+`getKeyframeAtTime`) hadn't (yet) turned up a working value either. Rather
+than continue reverse-engineering reads, this turn stops that line of
+investigation entirely and tests ONE narrow hypothesis: does
+`createSetValueAction()` accept the sentinel string **directly**, with no
+`createKeyframe()` call at all (which is known to throw "Illegal
+Parameter type" for this param)?
+
+### `runWriteOnlyProbe()` (new in `src/ppro/sourceTextProbe.js`)
+
+1. Locates `AE.ADBE Text` / `Source Text` exactly as every other Source
+   Text diagnostic in this module does — but never reads it first.
+2. `param.createSetValueAction("__KERIS_WRITE_TEST__", true)` — the
+   sentinel passed as a raw string, not wrapped in a `Keyframe`. Logs the
+   argument's `typeof`, whether creation succeeded, and the resulting
+   action's constructor name.
+3. Executes the transaction via the same `project.lockedAccess()` +
+   `executeTransaction()` pattern used everywhere else in this codebase.
+   `runTransaction()` was extended to log the transaction label, the
+   `executeTransaction()` boolean result, and — if it throws — the full
+   error **and stack**, not just the message.
+4. Waits briefly (500ms), then re-acquires the `TrackItem`'s component
+   chain and the Source Text param **completely fresh** — never reusing
+   the pre-write `Component`/`ComponentParam` references.
+5. Makes exactly ONE best-effort automated check (reusing
+   `readSourceTextValueOnly()` — not new read-API exploration, just
+   checking whether the write happened to make the param newly readable)
+   and is explicit that this check is **not authoritative**. Per the task
+   requirement to report this case separately rather than assume: if the
+   write API reports success but the automated check can't confirm the
+   sentinel, the result's `outcome` is the distinct
+   `write-api-succeeded-visible-change-unconfirmed` — not silently folded
+   into either "success" or "failure". A human visually checking the
+   Premiere timeline during the settle window is the only fully reliable
+   signal this diagnostic can point toward; there is no way for a UXP
+   panel script in this codebase to capture what's rendered in Premiere's
+   own timeline/Program Monitor.
+
+`testWriteOnlyProbe()` is the standalone entry point — same insert/
+stabilize/locate/cleanup cycle, with its own "Write-Only Probe"
+button/cancel-token/"Save JSON" UI. Cleanup is unconditional (the same
+`runScanWithGuaranteedCleanup` guarantee as every other diagnostic here),
+which matters even more for this one since it's the first Source Text
+diagnostic that actually mutates the sequence on a real host run.

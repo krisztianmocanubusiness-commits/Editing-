@@ -13,10 +13,13 @@ import {
   runTransaction,
   readBackSourceText,
   runSourceTextRoundTrip,
+  runWriteOnlyProbe,
   cancelActiveSourceTextRoundTrip,
   cancelActiveReadSourceTextOnly,
   cancelActiveExploreKeyframeObject,
+  cancelActiveWriteOnlyProbe,
   DEFAULT_SENTINEL,
+  WRITE_PROBE_SENTINEL,
 } from "../src/ppro/sourceTextProbe.js";
 
 function noopLog() {}
@@ -875,4 +878,179 @@ test("exploreKeyframeObject reports getKeyframeListAsTickTimes() failure without
   assert.match(result.keyframeList.error, /list failed/);
   // getKeyframePtr should still fall back to index 0 despite the list failing.
   assert.equal(result.workingMethod, "getKeyframePtr(0)");
+});
+
+// --- runWriteOnlyProbe ---
+//
+// Regression coverage for the pivot away from read-side investigation:
+// every read API explored so far came back empty/unreliable, so this
+// probe writes the sentinel directly via createSetValueAction() — never
+// reading first, never calling createKeyframe (which throws for this
+// param) — then re-acquires everything fresh to make one best-effort,
+// explicitly-non-authoritative automated check.
+
+test("cancelActiveWriteOnlyProbe returns false when nothing is running", () => {
+  assert.equal(cancelActiveWriteOnlyProbe(), false);
+});
+
+test("runWriteOnlyProbe passes the sentinel string directly to createSetValueAction — never calls createKeyframe, never reads first", async () => {
+  let createKeyframeCalled = false;
+  let getValueAtTimeCalledBeforeWrite = false;
+  let createSetValueActionArgs = null;
+
+  const param = fakeSourceTextParam({
+    createKeyframe: () => { createKeyframeCalled = true; throw new Error("must never be called"); },
+    getValueAtTime: () => { getValueAtTimeCalledBeforeWrite = true; return "should never be read"; },
+    createSetValueAction: (value, applyToAll) => {
+      createSetValueActionArgs = { value, applyToAll };
+      return { constructor: { name: "SetParamValueAction" } };
+    },
+  });
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  await runWriteOnlyProbe({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(createKeyframeCalled, false, "createKeyframe must never be called by the write-only probe");
+  assert.equal(getValueAtTimeCalledBeforeWrite, false, "the write-only probe must never read the param before writing");
+  assert.deepEqual(createSetValueActionArgs, { value: WRITE_PROBE_SENTINEL, applyToAll: true });
+});
+
+test("runWriteOnlyProbe records the argument type and reports write-action-failed when createSetValueAction throws", async () => {
+  const param = fakeSourceTextParam({ createSetValueAction: () => { throw new Error("Illegal Parameter type"); } });
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: () => { throw new Error("must not be called"); }, executeTransaction: () => { throw new Error("must not be called"); } };
+
+  const report = await runWriteOnlyProbe({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.write.argumentType, "string");
+  assert.equal(report.write.ok, false);
+  assert.match(report.write.error, /Illegal Parameter type/);
+  assert.equal(report.outcome, "write-action-failed");
+  assert.equal(report.transaction.attempted, false);
+  assert.equal(report.postWrite, null);
+});
+
+test("runWriteOnlyProbe reports transaction-failed when executeTransaction fails, without attempting a post-write check", async () => {
+  const param = fakeSourceTextParam({ createSetValueAction: () => ({ constructor: { name: "SetParamValueAction" } }) });
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: () => false };
+
+  const report = await runWriteOnlyProbe({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.write.ok, true);
+  assert.equal(report.transaction.attempted, true);
+  assert.equal(report.transaction.ok, false);
+  assert.equal(report.outcome, "transaction-failed");
+  assert.equal(report.postWrite, null);
+});
+
+test("runWriteOnlyProbe reports write-succeeded-reacquire-failed when the component chain can't be reacquired after a successful write", async () => {
+  const param = fakeSourceTextParam({ createSetValueAction: () => ({ constructor: { name: "SetParamValueAction" } }) });
+  const trackItem = { getComponentChain: () => { throw new Error("gone"); } };
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  const report = await runWriteOnlyProbe({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.transaction.ok, true);
+  assert.equal(report.outcome, "write-succeeded-reacquire-failed");
+  assert.equal(report.postWrite.reacquired, false);
+});
+
+test("runWriteOnlyProbe reports write-succeeded-and-confirmed when a FRESH re-acquired param's best-effort read-back returns the sentinel", async () => {
+  const originalParam = fakeSourceTextParam({ createSetValueAction: () => ({ constructor: { name: "SetParamValueAction" } }) });
+  const freshParam = fakeSourceTextParam({ getValue: () => WRITE_PROBE_SENTINEL });
+  const freshComponent = fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: [freshParam] });
+  const trackItem = { getComponentChain: () => fakeChain([freshComponent]) };
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  const report = await runWriteOnlyProbe({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.outcome, "write-succeeded-and-confirmed");
+  assert.equal(report.postWrite.reacquired, true);
+  assert.equal(report.postWrite.automatedCheckConfirmsChange, true);
+  assert.equal(report.postWrite.bestEffortRead.resolvedValue, WRITE_PROBE_SENTINEL);
+  assert.equal(report.manualVisualConfirmationNeeded, false);
+});
+
+test("runWriteOnlyProbe reports write-api-succeeded-visible-change-unconfirmed (not silently success or failure) when the automated check can't confirm the change", async () => {
+  const originalParam = fakeSourceTextParam({ createSetValueAction: () => ({ constructor: { name: "SetParamValueAction" } }) });
+  const freshParam = fakeSourceTextParam({}); // no working read method at all — matches the confirmed real-host finding.
+  const freshComponent = fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: [freshParam] });
+  const trackItem = { getComponentChain: () => fakeChain([freshComponent]) };
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  const report = await runWriteOnlyProbe({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.write.ok, true);
+  assert.equal(report.transaction.ok, true);
+  assert.equal(report.outcome, "write-api-succeeded-visible-change-unconfirmed");
+  assert.equal(report.postWrite.automatedCheckConfirmsChange, false);
+  assert.equal(report.manualVisualConfirmationNeeded, true);
 });

@@ -85,5 +85,7 @@ export const store = createStore({
     lastReadSourceTextOnly: null, // full testReadSourceTextOnly() return value, or null — see src/ppro/sourceTextProbe.js
     exploreKeyframeObjectRunning: false,
     lastExploreKeyframeObject: null, // full testExploreKeyframeObject() return value, or null — see src/ppro/sourceTextProbe.js
+    writeOnlyProbeRunning: false,
+    lastWriteOnlyProbe: null, // full testWriteOnlyProbe() return value, or null — see src/ppro/sourceTextProbe.js
   },
 });

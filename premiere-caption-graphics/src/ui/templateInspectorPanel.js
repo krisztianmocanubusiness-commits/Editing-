@@ -11,6 +11,9 @@ import {
   cancelActiveReadSourceTextOnly,
   testExploreKeyframeObject,
   cancelActiveExploreKeyframeObject,
+  testWriteOnlyProbe,
+  cancelActiveWriteOnlyProbe,
+  WRITE_PROBE_SENTINEL,
 } from "../ppro/sourceTextProbe.js";
 import { saveActiveTemplate } from "../state/settings.js";
 import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
@@ -303,6 +306,57 @@ async function saveExploreKeyframeObjectJson() {
     log(`Keyframe exploration diagnostic saved to ${file.nativePath}.`, "success");
   } catch (err) {
     log(`Saving keyframe exploration JSON failed: ${err.message || err}`, "error");
+  }
+}
+
+async function runWriteOnlyProbeTest() {
+  const { mogrtPath } = store.getState().templateInspector;
+  if (!mogrtPath) {
+    log("Choose a .mogrt to inspect first.", "error");
+    return;
+  }
+  patchInspector({ writeOnlyProbeRunning: true, lastWriteOnlyProbe: null });
+  try {
+    const result = await testWriteOnlyProbe({ mogrtPath, log });
+    // TEMPORARY: also dump the full result to console.error(), same
+    // reasoning as the other Source Text diagnostics — retrievable via the
+    // UXP Developer Tool's Console tab even if the panel UI breaks.
+    console.error("[Caption Graphics Studio] Write-Only Probe result:", JSON.stringify(result, null, 2));
+    patchInspector({ lastWriteOnlyProbe: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] Write-Only Probe crashed:", err);
+    log(`Write-Only Probe crashed unexpectedly: ${err.message || err}`, "error");
+    patchInspector({ lastWriteOnlyProbe: { ok: false, step: "crash" } });
+  } finally {
+    patchInspector({ writeOnlyProbeRunning: false });
+  }
+}
+
+function cancelWriteOnlyProbe() {
+  const cancelled = cancelActiveWriteOnlyProbe();
+  log(
+    cancelled
+      ? "Cancel requested — the probe will stop at its next checkpoint and still clean up the temporary clip."
+      : "Nothing to cancel — no Write-Only Probe is currently running.",
+    cancelled ? "warn" : "info"
+  );
+}
+
+async function saveWriteOnlyProbeJson() {
+  const { lastWriteOnlyProbe } = store.getState().templateInspector;
+  if (!lastWriteOnlyProbe || !lastWriteOnlyProbe.ok || !lastWriteOnlyProbe.found) {
+    log("Run Write-Only Probe successfully (with Source Text found) before saving its output.", "error");
+    return;
+  }
+  try {
+    const uxp = getUxp();
+    // @ts-ignore
+    const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-write-only-probe.json", { types: ["json"] });
+    if (!file) return;
+    await file.write(JSON.stringify(lastWriteOnlyProbe, null, 2));
+    log(`Write-only probe diagnostic saved to ${file.nativePath}.`, "success");
+  } catch (err) {
+    log(`Saving write-only probe JSON failed: ${err.message || err}`, "error");
   }
 }
 
@@ -610,6 +664,72 @@ function exploreKeyframeObjectBlock(result, running) {
   ]);
 }
 
+const WRITE_PROBE_OUTCOME_MESSAGES = {
+  "write-succeeded-and-confirmed": { text: "Write succeeded AND the automated read-back confirms it.", cls: "log-success" },
+  "write-api-succeeded-visible-change-unconfirmed": {
+    text: "The write API reported success, but the visible/automated change could NOT be confirmed — check the Premiere timeline manually. Reported separately, not assumed either way.",
+    cls: "log-warn",
+  },
+  "write-action-failed": { text: "createSetValueAction(sentinel, true) failed — see Log for the full host error.", cls: "log-error" },
+  "transaction-failed": { text: "executeTransaction failed — see Log for the full host error.", cls: "log-error" },
+  "write-succeeded-reacquire-failed": { text: "The write transaction succeeded, but re-acquiring the param afterward failed — see Log.", cls: "log-warn" },
+};
+
+function writeOnlyProbeBlock(result, running) {
+  if (running) {
+    return el("div", { class: "inspector-results" }, [
+      el("div", {
+        class: "status-line log-info",
+        text: "⏳ Running the write-only probe — inserting a temporary clip, waiting for it to stabilize, then writing the sentinel " +
+          "directly via createSetValueAction() (no read attempted first, no createKeyframe call), waiting briefly, and re-acquiring " +
+          "everything fresh to make one best-effort (not authoritative) automated check. Watch the Premiere timeline now for the " +
+          "most reliable confirmation — the temporary clip is always removed afterwards. See Log below for live progress, or click " +
+          "Cancel to stop early.",
+      }),
+    ]);
+  }
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Write-Only Probe failed${stepLabel}${result.error ? `: ${result.error}` : ""}. See Log below.` }),
+    ]);
+  }
+  if (!result.found) {
+    const reasonText =
+      result.reason === "no-source-text-param"
+        ? "AE.ADBE Text was found, but no param with displayName exactly \"Source Text\" was found on it."
+        : "MOGRT component chain did not fully initialise before timeout — AE.ADBE Text was not found within the wait window.";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-warn", text: `⚠ ${reasonText} Temporary clip removed either way. Try again, or check the Log for the discovery timeline.` }),
+    ]);
+  }
+  const probe = result.writeProbe;
+  const outcome = WRITE_PROBE_OUTCOME_MESSAGES[probe?.outcome] ?? { text: "Unexpected state — see Log.", cls: "log-warn" };
+  return el("div", { class: "inspector-results" }, [
+    el("div", {
+      class: "status-line",
+      text: `createSetValueAction argument: ${JSON.stringify(WRITE_PROBE_SENTINEL)} (typeof ${probe?.write?.argumentType ?? "n/a"}) — ` +
+        `${probe?.write?.ok ? `✓ action created${probe.write.actionConstructorName ? ` (${probe.write.actionConstructorName})` : ""}` : `✗ ${probe?.write?.error ?? "failed"}`}.`,
+    }),
+    probe?.transaction?.attempted
+      ? el("div", { class: "status-line", text: `executeTransaction: ${probe.transaction.ok ? "✓ succeeded" : `✗ ${probe.transaction.error ?? "failed"}`}.` })
+      : null,
+    el("div", { class: `status-line ${outcome.cls}`, text: `${outcome.text}` }),
+    probe?.postWrite?.bestEffortRead
+      ? el("div", {
+          class: "status-line",
+          text: `Best-effort automated read-back (not authoritative): ${
+            probe.postWrite.automatedCheckConfirmsChange
+              ? `✓ ${probe.postWrite.bestEffortRead.workingMethod}() returned the sentinel`
+              : `did not confirm the sentinel (workingMethod: ${probe.postWrite.bestEffortRead.workingMethod ?? "none"})`
+          }.`,
+        })
+      : null,
+    el("div", { class: "status-line", text: `Temporary clip removed: ${result.cleanupOk ? "yes" : "NO — you may need to delete it from the timeline by hand"}.` }),
+  ]);
+}
+
 function activeTemplateLine(activeTemplate) {
   if (!activeTemplate) {
     return el("div", { class: "status-line log-warn", text: "No active template saved yet." });
@@ -734,6 +854,28 @@ export function renderTemplateInspectorPanel(onChange) {
     onClick: () => saveExploreKeyframeObjectJson(),
   });
 
+  const writeOnlyProbeBtn = el("button", {
+    class: "btn",
+    text: ti.writeOnlyProbeRunning ? "Writing…" : "Write-Only Probe",
+    disabled: !isHosted() || ti.writeOnlyProbeRunning || !ti.mogrtPath || undefined,
+    onClick: async () => {
+      await runWriteOnlyProbeTest();
+      onChange();
+    },
+  });
+  const cancelWriteOnlyProbeBtn = el("button", {
+    class: "btn",
+    text: "Cancel",
+    disabled: !ti.writeOnlyProbeRunning || undefined,
+    onClick: () => cancelWriteOnlyProbe(),
+  });
+  const saveWriteOnlyProbeBtn = el("button", {
+    class: "btn",
+    text: "Save write-only probe JSON…",
+    disabled: !ti.lastWriteOnlyProbe || !ti.lastWriteOnlyProbe.ok || !ti.lastWriteOnlyProbe.found || undefined,
+    onClick: () => saveWriteOnlyProbeJson(),
+  });
+
   return el("section", { class: "panel panel-template-inspector" }, [
     el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
     el(
@@ -811,6 +953,23 @@ export function renderTemplateInspectorPanel(onChange) {
     ),
     el("div", { class: "row" }, [exploreKeyframeObjectBtn, cancelExploreKeyframeObjectBtn, saveExploreKeyframeObjectBtn]),
     exploreKeyframeObjectBlock(ti.lastExploreKeyframeObject, ti.exploreKeyframeObjectRunning),
+    el("h3", { text: "Write-Only Probe (troubleshooting)" }),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        `Stops trying to find a working read path. Locates AE.ADBE Text / Source Text exactly as the diagnostics ` +
+          `above do, but never reads it first — goes straight to createSetValueAction(${JSON.stringify(WRITE_PROBE_SENTINEL)}, ` +
+          "true), passing the sentinel string directly (no createKeyframe call, since that throws for this param). " +
+          "Executes the transaction, waits briefly, then re-acquires the TrackItem and Source Text param completely " +
+          "fresh and makes one best-effort (NOT authoritative) automated check. Watch the Premiere timeline during " +
+          "the wait for the only fully reliable confirmation — if the write API reports success but the automated " +
+          "check can't confirm it, that's reported as its own distinct outcome, not assumed either way. The " +
+          "temporary clip is always removed afterwards. See docs/MOGRT_DIAGNOSTIC.md.",
+      ]
+    ),
+    el("div", { class: "row" }, [writeOnlyProbeBtn, cancelWriteOnlyProbeBtn, saveWriteOnlyProbeBtn]),
+    writeOnlyProbeBlock(ti.lastWriteOnlyProbe, ti.writeOnlyProbeRunning),
     el("h3", { text: "Source Text Round Trip (troubleshooting)" }),
     el(
       "p",

@@ -492,6 +492,172 @@ export async function exploreKeyframeObject(param, ppro, trackItem, log, budget)
   };
 }
 
+export const WRITE_PROBE_SENTINEL = "__KERIS_WRITE_TEST__";
+const WRITE_PROBE_SETTLE_DELAY_MS = 500;
+
+/**
+ * Write-only probe: after every read-side avenue (getValue/.value/
+ * getStartValue/reflection-discovered getters/getValueAtTime, then the
+ * keyframe API — getKeyframeListAsTickTimes/getKeyframePtr/
+ * getKeyframeAtTime) came back empty, this stops reverse-engineering reads
+ * entirely and tests ONE thing: does `createSetValueAction()` accept the
+ * sentinel string DIRECTLY — no `createKeyframe()` call at all, since that
+ * throws "Illegal Parameter type" for a param reporting
+ * `areKeyframesSupported: false` (confirmed two diagnostics ago). Never
+ * reads the param's value before writing.
+ *
+ * After the transaction: reacquires the TrackItem's component chain and
+ * the Source Text param completely fresh (never reusing pre-write
+ * references), then makes ONE best-effort automated read-back attempt
+ * (reusing `readSourceTextValueOnly()` — not new read-API exploration,
+ * just checking whether the write itself happened to make the param
+ * readable). That check is explicitly NOT treated as authoritative: if
+ * the write API reports success but the automated check can't confirm a
+ * visible change, this is reported as its own distinct outcome
+ * (`write-api-succeeded-visible-change-unconfirmed`) rather than silently
+ * assumed to mean success OR failure — a human visually checking the
+ * Premiere timeline during the brief settle window is the only fully
+ * reliable signal this diagnostic can point you toward.
+ *
+ * @param {Object} args
+ * @param {import("@adobe/premierepro").Project} args.project
+ * @param {import("@adobe/premierepro").TrackItem} args.trackItem
+ * @param {number} args.componentIndex
+ * @param {number} args.paramIndex
+ * @param {*} args.param
+ * @param {string} args.displayName
+ * @param {string} args.sentinel
+ * @param {(message: string, level?: string) => void} args.log
+ * @param {ReturnType<typeof createScanBudget>} [args.budget]
+ * @param {*} args.ppro
+ */
+export async function runWriteOnlyProbe({ project, trackItem, componentIndex, paramIndex, param, displayName, sentinel, log, budget, ppro }) {
+  log(`[stage] write-only probe (component ${componentIndex}, param ${paramIndex}) — no read attempted before writing…`, "info");
+
+  const argumentType = typeof sentinel;
+  log(`[writeOnlyProbe] createSetValueAction argument: value=${JSON.stringify(sentinel)}, typeof=${argumentType} (passed directly — no createKeyframe call)`, "info");
+
+  const actionResult = await safeResolve(() => param.createSetValueAction(sentinel, true), {
+    log,
+    label: "createSetValueAction(sentinel, true) [raw string, no createKeyframe]",
+    timeoutMs: PROBE_CALL_TIMEOUT_MS,
+  });
+
+  if (!actionResult.ok) {
+    const error = actionResult.timedOut ? "timed out" : String(actionResult.error?.message || actionResult.error);
+    log(`✗ createSetValueAction(sentinel, true) failed: ${error}${actionResult.error?.stack ? `\n${actionResult.error.stack}` : ""}`, "error");
+    return {
+      componentIndex,
+      paramIndex,
+      displayName,
+      write: { argumentType, ok: false, error },
+      transaction: { attempted: false, ok: false },
+      postWrite: null,
+      outcome: "write-action-failed",
+    };
+  }
+
+  const constructorResult = await safeResolve(() => actionResult.value?.constructor?.name, { log, label: "createSetValueAction(...).constructor" });
+  const actionConstructorName = (constructorResult.ok && constructorResult.value) || null;
+  log(`✓ createSetValueAction(sentinel, true) succeeded (constructor: ${actionConstructorName ?? "n/a"}).`, "success");
+
+  log("[stage] executing the set-value transaction on the temporary clip…", "info");
+  const transaction = runTransaction(project, actionResult.value, displayName, log, `Write-only probe: ${displayName ?? "Source Text"}`);
+
+  if (!transaction.ok) {
+    log("✗ Transaction did not succeed — the write probe cannot verify anything further.", "warn");
+    return {
+      componentIndex,
+      paramIndex,
+      displayName,
+      write: { argumentType, ok: true, actionConstructorName },
+      transaction,
+      postWrite: null,
+      outcome: "transaction-failed",
+    };
+  }
+
+  log(`[stage] waiting ${WRITE_PROBE_SETTLE_DELAY_MS}ms for Premiere to apply the transaction…`, "info");
+  await new Promise((resolve) => setTimeout(resolve, WRITE_PROBE_SETTLE_DELAY_MS));
+
+  log("[stage] reacquiring the component chain and Source Text param from scratch (no stale references)…", "info");
+  const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain() (write probe reacquire)" });
+  if (!chainResult.ok || !chainResult.value) {
+    log("✗ Couldn't reacquire the component chain after the write.", "warn");
+    return {
+      componentIndex,
+      paramIndex,
+      displayName,
+      write: { argumentType, ok: true, actionConstructorName },
+      transaction,
+      postWrite: { reacquired: false, error: "couldn't reacquire the component chain" },
+      outcome: "write-succeeded-reacquire-failed",
+    };
+  }
+  const { textInfo } = await locateTextComponent(chainResult.value, log);
+  if (!textInfo) {
+    log("✗ AE.ADBE Text component not found on the reacquired chain.", "warn");
+    return {
+      componentIndex,
+      paramIndex,
+      displayName,
+      write: { argumentType, ok: true, actionConstructorName },
+      transaction,
+      postWrite: { reacquired: false, error: "AE.ADBE Text component not found on the reacquired chain" },
+      outcome: "write-succeeded-reacquire-failed",
+    };
+  }
+  const located = await locateSourceTextParam(textInfo.component, textInfo.componentIndex, log);
+  if (!located) {
+    log("✗ Source Text param not found on the reacquired component.", "warn");
+    return {
+      componentIndex,
+      paramIndex,
+      displayName,
+      write: { argumentType, ok: true, actionConstructorName },
+      transaction,
+      postWrite: { reacquired: false, error: "Source Text param not found on the reacquired component" },
+      outcome: "write-succeeded-reacquire-failed",
+    };
+  }
+
+  log(
+    "[stage] making ONE best-effort automated read-back attempt — NOT a confirmed reliable signal (see the earlier read/keyframe " +
+      "diagnostics); a human visually checking the Premiere timeline right now is the only way to be certain…",
+    "info"
+  );
+  const bestEffortRead = await readSourceTextValueOnly(located.param, ppro, trackItem, log, budget);
+  const automatedCheckConfirmsChange = bestEffortRead.resolvedValue === sentinel;
+
+  if (automatedCheckConfirmsChange) {
+    log(`✓ Best-effort automated read-back ALSO confirms the change (via ${bestEffortRead.workingMethod}()).`, "success");
+  } else {
+    log(
+      "⚠ The write API reported success, but the best-effort automated read-back could not confirm the visible text actually " +
+        "changed. This does NOT necessarily mean the write failed — it may only mean there is still no reliable read path. " +
+        "Reported separately below rather than assumed either way.",
+      "warn"
+    );
+  }
+
+  return {
+    componentIndex,
+    paramIndex,
+    displayName,
+    write: { argumentType, ok: true, actionConstructorName },
+    transaction,
+    postWrite: {
+      reacquired: true,
+      componentIndex: textInfo.componentIndex,
+      paramIndex: located.paramIndex,
+      bestEffortRead,
+      automatedCheckConfirmsChange,
+    },
+    manualVisualConfirmationNeeded: !automatedCheckConfirmsChange,
+    outcome: automatedCheckConfirmsChange ? "write-succeeded-and-confirmed" : "write-api-succeeded-visible-change-unconfirmed",
+  };
+}
+
 /**
  * Non-mutating: constructs a Keyframe from the sentinel string via
  * `param.createKeyframe(sentinel)`. Per the official API this is
@@ -562,18 +728,20 @@ export async function testActionCreation(param, keyframe, log, budget) {
  * codebase — not timeout-wrapped, since none of the established call
  * sites await it either.
  */
-export function runTransaction(project, action, paramLabel, log) {
+export function runTransaction(project, action, paramLabel, log, transactionLabel) {
+  log(`[transaction] executeTransaction — label: "${transactionLabel ?? `Diagnostic Source Text round trip (${paramLabel ?? "Source Text"})`}"`, "info");
   let success = false;
   let error = null;
   try {
     project.lockedAccess(() => {
       success = project.executeTransaction((compoundAction) => {
         compoundAction.addAction(action);
-      }, `Diagnostic Source Text round trip (${paramLabel ?? "Source Text"})`);
+      }, transactionLabel ?? `Diagnostic Source Text round trip (${paramLabel ?? "Source Text"})`);
     });
+    log(`[transaction] executeTransaction result: ${success}`, success ? "success" : "warn");
   } catch (err) {
     error = String(err.message || err);
-    log(`✗ executeTransaction threw: ${error}`, "error");
+    log(`✗ executeTransaction threw: ${error}${err.stack ? `\n${err.stack}` : ""}`, "error");
   }
   return { attempted: true, ok: success && !error, error };
 }
@@ -1253,5 +1421,165 @@ export async function testExploreKeyframeObject(opts) {
     return { ok: true, found: true, ...report, cleanupOk };
   } finally {
     if (activeExploreKeyframeCancelToken === cancelToken) activeExploreKeyframeCancelToken = null;
+  }
+}
+
+// Separate cancel-token slot from the other three entry points', for the
+// same reason they're separate from each other.
+let activeWriteOnlyProbeCancelToken = null;
+
+export function cancelActiveWriteOnlyProbe() {
+  if (activeWriteOnlyProbeCancelToken) {
+    activeWriteOnlyProbeCancelToken.cancelled = true;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Dedicated entry point for `runWriteOnlyProbe()`: insert a temporary
+ * clip, wait for its component chain to stabilize, locate Source Text
+ * (no read attempted), run the write-only probe, clean up the temporary
+ * clip (ALWAYS — whether any step above threw, failed, timed out, or was
+ * cancelled; this is the one diagnostic in this module that actually
+ * mutates the sequence, so guaranteed cleanup matters even more here),
+ * and return a JSON-safe report.
+ *
+ * @param {Object} opts
+ * @param {string} opts.mogrtPath
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {string} [opts.sentinel]
+ * @param {number} [opts.scanBudgetMs]
+ */
+export async function testWriteOnlyProbe(opts) {
+  const { mogrtPath, log, sentinel = WRITE_PROBE_SENTINEL, scanBudgetMs = DEFAULT_ROUND_TRIP_BUDGET_MS } = opts;
+
+  log("════ Write-Only Probe — start ════", "info");
+
+  if (!mogrtPath) {
+    log("✗ No .mogrt selected.", "error");
+    return { ok: false, step: "mogrt-path" };
+  }
+
+  const cancelToken = { cancelled: false };
+  activeWriteOnlyProbeCancelToken = cancelToken;
+
+  try {
+    let project, sequence;
+    try {
+      ({ project, sequence } = await requireActiveProjectAndSequence());
+    } catch (err) {
+      log(`✗ No active project/sequence: ${err.message || err}`, "error");
+      return { ok: false, step: "sequence" };
+    }
+
+    const tracksResult = await safeAsync(() => listVideoTracks(sequence));
+    if (!tracksResult.ok || tracksResult.value.length === 0) {
+      log(
+        tracksResult.ok
+          ? "✗ No video track available to insert a temporary inspection clip onto."
+          : `✗ listVideoTracks() threw: ${tracksResult.error.message || tracksResult.error}`,
+        "error"
+      );
+      return { ok: false, step: "track" };
+    }
+    const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
+
+    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
+    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+
+    log(`[stage] inserting clip from: ${mogrtPath}`, "info");
+    const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
+    if (!insertResult.ok) {
+      log(`✗ Couldn't insert this .mogrt: ${insertResult.error.message || insertResult.error}`, "error");
+      return { ok: false, step: "insert" };
+    }
+    const trackItem = insertResult.value;
+    log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
+
+    const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
+      async () => {
+        log("[stage] waiting for MOGRT components to finish initializing…", "info");
+        const stabilization = await stabilizeComponentChain(trackItem, log, { cancelToken });
+        const textInfo = stabilization.discovery.components.find((c) => c.classification === "text-editing");
+
+        if (!textInfo) {
+          log(`${MOGRT_INIT_TIMEOUT_MESSAGE} No AE.ADBE Text component found — cannot write-probe Source Text this run.`, "warn");
+          return { found: false, reason: "no-text-component", componentDiscoveryTimeline: stabilization.timeline };
+        }
+
+        log(`[stage] AE.ADBE Text found at index ${textInfo.componentIndex} — locating Source Text by displayName (not reading it)…`, "info");
+        const located = await locateSourceTextParam(textInfo.component, textInfo.componentIndex, log);
+        if (!located) {
+          log('✗ No param with displayName exactly "Source Text" was found on the AE.ADBE Text component.', "error");
+          return {
+            found: false,
+            reason: "no-source-text-param",
+            componentDiscoveryTimeline: stabilization.timeline,
+            componentIndex: textInfo.componentIndex,
+          };
+        }
+
+        const probeBudget = createScanBudget({ totalMs: scanBudgetMs, cancelToken });
+        const writeProbe = await runWriteOnlyProbe({
+          project,
+          trackItem,
+          componentIndex: textInfo.componentIndex,
+          paramIndex: located.paramIndex,
+          param: located.param,
+          displayName: located.displayName,
+          sentinel,
+          log,
+          budget: probeBudget,
+          ppro: getPpro(),
+        });
+
+        return { found: true, writeProbe, componentDiscoveryTimeline: stabilization.timeline };
+      },
+      () => {
+        log("[stage] cleaning up (removing temporary inspection clip)…", "info");
+        return safeAsync(() => removeTrackItem(project, sequence, trackItem));
+      },
+      log
+    );
+
+    const cleanupOk = cleanupResult.ok && cleanupResult.value === true;
+    if (cleanupResult.ok && cleanupResult.value) {
+      log("Removed temporary inspection clip.", "info");
+    } else {
+      log(
+        `Couldn't remove the temporary inspection clip (${
+          cleanupResult.ok ? "transaction reported failure" : cleanupResult.error.message || cleanupResult.error
+        }) — you may need to delete it from the timeline by hand.`,
+        "warn"
+      );
+    }
+
+    if (scanError) {
+      log("════ Write-Only Probe — finished with errors (cleanup still ran) ════", "error");
+      return { ok: false, step: "scan", error: String(scanError.message || scanError), cleanupOk, componentDiscoveryTimeline: [] };
+    }
+
+    const report = scanReport ?? { found: false, reason: "crash", componentDiscoveryTimeline: [] };
+
+    if (!report.found) {
+      log("════ Write-Only Probe — finished (Source Text not found this run) ════", "warn");
+      return { ok: true, found: false, reason: report.reason, componentDiscoveryTimeline: report.componentDiscoveryTimeline, cleanupOk };
+    }
+
+    const outcome = report.writeProbe?.outcome;
+    const summaryText = {
+      "write-succeeded-and-confirmed": "════ Write-Only Probe — finished: SUCCESS (write reported success AND the automated read-back confirms it) ════",
+      "write-api-succeeded-visible-change-unconfirmed":
+        "════ Write-Only Probe — finished: API reported success, but the visible/automated change could NOT be confirmed — reported separately, see writeProbe ════",
+      "write-action-failed": "════ Write-Only Probe — finished: createSetValueAction failed — see writeProbe ════",
+      "transaction-failed": "════ Write-Only Probe — finished: executeTransaction failed — see writeProbe ════",
+      "write-succeeded-reacquire-failed": "════ Write-Only Probe — finished: write succeeded but re-acquiring the param afterward failed — see writeProbe ════",
+    }[outcome] ?? "════ Write-Only Probe — finished (unexpected state — see writeProbe) ════";
+    log(summaryText, outcome === "write-succeeded-and-confirmed" ? "success" : "warn");
+
+    return { ok: true, found: true, writeProbe: report.writeProbe, componentDiscoveryTimeline: report.componentDiscoveryTimeline, cleanupOk };
+  } finally {
+    if (activeWriteOnlyProbeCancelToken === cancelToken) activeWriteOnlyProbeCancelToken = null;
   }
 }

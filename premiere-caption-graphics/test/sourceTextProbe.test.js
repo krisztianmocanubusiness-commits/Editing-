@@ -7,6 +7,7 @@ import {
   computeMidpointTickTime,
   readSourceTextAttempts,
   readSourceTextValueOnly,
+  exploreKeyframeObject,
   testKeyframeCreation,
   testActionCreation,
   runTransaction,
@@ -14,6 +15,7 @@ import {
   runSourceTextRoundTrip,
   cancelActiveSourceTextRoundTrip,
   cancelActiveReadSourceTextOnly,
+  cancelActiveExploreKeyframeObject,
   DEFAULT_SENTINEL,
 } from "../src/ppro/sourceTextProbe.js";
 
@@ -715,4 +717,162 @@ test("runSourceTextRoundTrip still attempts createKeyframe when areKeyframesSupp
 
   assert.equal(report.keyframeCreation.ok, true);
   assert.equal(report.keyframeCreation.skipped, undefined);
+});
+
+// --- exploreKeyframeObject ---
+//
+// Regression coverage for the next confirmed real-host finding:
+// getValueAtTime() on Source Text returned the host message "Use
+// GetKeyframeAtTime to get a keyframe object at time. The value can be
+// extracted from the keyframe object." — even though the same param
+// reports areKeyframesSupported:false. These tests exercise the keyframe-
+// object exploration path this led to.
+
+test("cancelActiveExploreKeyframeObject returns false when nothing is running", () => {
+  assert.equal(cancelActiveExploreKeyframeObject(), false);
+});
+
+test("exploreKeyframeObject enumerates keyframe times via getKeyframeListAsTickTimes() and extracts text via getKeyframePtr(index)", async () => {
+  const keyframeTimes = [fakeTickTime(0)];
+  const keyframeObj = { value: "Hello From Keyframe Ptr" };
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    extraMethods: {
+      getKeyframeListAsTickTimes: () => keyframeTimes,
+      getKeyframePtr: (i) => (i === 0 ? keyframeObj : null),
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.keyframeList.ok, true);
+  assert.equal(result.keyframeList.count, 1);
+  assert.equal(result.workingMethod, "getKeyframePtr(0)");
+  assert.equal(result.workingField, "value");
+  assert.equal(result.resolvedValue, "Hello From Keyframe Ptr");
+});
+
+test("exploreKeyframeObject falls back to getKeyframePtr(0) when the enumerated keyframe list is empty", async () => {
+  const keyframeObj = { getValue: () => "Implicit Single Keyframe" };
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    extraMethods: {
+      getKeyframeListAsTickTimes: () => [],
+      getKeyframePtr: (i) => (i === 0 ? keyframeObj : null),
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.keyframeList.count, 0);
+  assert.equal(result.workingMethod, "getKeyframePtr(0)");
+  assert.equal(result.workingField, "getValue");
+  assert.equal(result.resolvedValue, "Implicit Single Keyframe");
+});
+
+test("exploreKeyframeObject extracts text via getKeyframeAtTime(TickTime) — the exact method the host error message pointed to", async () => {
+  const t0 = fakeTickTime(0);
+  const keyframeObj = { text: "Hello From getKeyframeAtTime" };
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    extraMethods: {
+      getKeyframeListAsTickTimes: () => [t0],
+      getKeyframeAtTime: (t) => (t === t0 ? keyframeObj : null),
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.match(result.workingMethod, /^getKeyframeAtTime/);
+  assert.equal(result.workingField, "text");
+  assert.equal(result.resolvedValue, "Hello From getKeyframeAtTime");
+});
+
+test("exploreKeyframeObject dumps the returned keyframe object's full prototype/property shape", async () => {
+  const keyframeObj = { sourceText: "Dumped Shape Text", someOtherField: 42 };
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    extraMethods: {
+      getKeyframeListAsTickTimes: () => [],
+      getKeyframePtr: () => keyframeObj,
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+
+  const exploration = result.explorations.find((e) => e.method === "getKeyframePtr" && e.ok);
+  assert.ok(exploration, "expected a successful getKeyframePtr exploration");
+  assert.ok(exploration.shape, "expected a full probed shape on the exploration result");
+  assert.ok(exploration.shape.ownKeys.includes("sourceText"));
+  assert.ok(exploration.shape.ownKeys.includes("someOtherField"));
+  assert.equal(result.resolvedValue, "Dumped Shape Text");
+  assert.equal(result.workingField, "sourceText");
+});
+
+test("exploreKeyframeObject finds text via a reflection-discovered field beyond the hardcoded value/getValue/text/string/sourceText candidates", async () => {
+  const keyframeObj = { getDisplayString: () => "Discovered Field Text" };
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    extraMethods: {
+      getKeyframeListAsTickTimes: () => [],
+      getKeyframePtr: () => keyframeObj,
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingField, "getDisplayString");
+  assert.equal(result.resolvedValue, "Discovered Field Text");
+});
+
+test("exploreKeyframeObject never calls createKeyframe or any other mutating method while exploring", async () => {
+  let createKeyframeCalled = false;
+  const keyframeObj = { value: "Safe Text" };
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    createKeyframe: () => { createKeyframeCalled = true; throw new Error("must never be called"); },
+    extraMethods: {
+      getKeyframeListAsTickTimes: () => [fakeTickTime(0)],
+      getKeyframePtr: () => keyframeObj,
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+  assert.equal(createKeyframeCalled, false);
+});
+
+test("exploreKeyframeObject reports no working method (not a crash) when getKeyframePtr/getKeyframeAtTime are absent", async () => {
+  const param = fakeSourceTextParam({ isTimeVarying: false, areKeyframesSupported: false });
+  const trackItem = fakeTrackItem({});
+  const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, null);
+  assert.equal(result.resolvedValue, null);
+  assert.ok(result.explorations.some((e) => e.method === "getKeyframePtr" && !e.ok));
+  assert.ok(result.explorations.some((e) => e.method === "getKeyframeAtTime" && !e.ok));
+});
+
+test("exploreKeyframeObject reports getKeyframeListAsTickTimes() failure without crashing the rest of the exploration", async () => {
+  const keyframeObj = { value: "Still Found It" };
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    extraMethods: {
+      getKeyframeListAsTickTimes: () => { throw new Error("list failed"); },
+      getKeyframePtr: (i) => (i === 0 ? keyframeObj : null),
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.keyframeList.ok, false);
+  assert.match(result.keyframeList.error, /list failed/);
+  // getKeyframePtr should still fall back to index 0 despite the list failing.
+  assert.equal(result.workingMethod, "getKeyframePtr(0)");
 });

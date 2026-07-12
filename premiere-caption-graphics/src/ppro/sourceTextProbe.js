@@ -148,12 +148,17 @@ export async function readSourceTextAttempts(trackItem, param, ppro, log, budget
 }
 
 const VALUE_GETTER_NAME_PATTERN = /value/i;
-const VALUE_GETTER_EXCLUDE_PATTERNS = [/AtTime$/i, /Keyframe/i, /^create/i, /^set/i, /^find/i];
+const NON_MUTATING_EXCLUDE_PATTERNS = [/AtTime$/i, /Keyframe/i, /^create/i, /^set/i, /^find/i];
+
+/** Never call something that looks like a keyframe/time-based/mutating method by name alone, regardless of what else its name contains. */
+function isSafeNonMutatingFieldName(name) {
+  return !NON_MUTATING_EXCLUDE_PATTERNS.some((re) => re.test(name));
+}
 
 /** A method name that looks like a plain, non-keyframed, non-time-based value getter by name alone. */
 function isPlausibleValueGetterMethod(name) {
   if (!VALUE_GETTER_NAME_PATTERN.test(name)) return false;
-  return !VALUE_GETTER_EXCLUDE_PATTERNS.some((re) => re.test(name));
+  return isSafeNonMutatingFieldName(name);
 }
 
 /**
@@ -289,6 +294,202 @@ export async function readSourceTextValueOnly(param, ppro, trackItem, log, budge
   }
 
   return { paramShape, valueGetterAttempts: attempts, getValueAtTimeAttempts, workingMethod, resolvedValue };
+}
+
+// Names to look for directly on a returned keyframe object — the task's
+// exact list: value, getValue, text, string, sourceText, plus their
+// get-prefixed method forms. Tried by exact name first, before the
+// broader reflection scan below.
+const KEYFRAME_FIELD_CANDIDATES = ["value", "getValue", "text", "getText", "string", "getString", "sourceText", "getSourceText"];
+
+/**
+ * Dumps a returned keyframe object's full shape (every own + inherited
+ * property/method name, via the same `probeObjectShape` used elsewhere in
+ * this module) and tries every plausible text-bearing field on it: the
+ * exact named candidates above, then any other field/method whose name
+ * contains "value", "text", or "string" and isn't itself a keyframe/
+ * AtTime/create/set/find method (so this can never accidentally call
+ * something mutating just because of a name match). Also runs
+ * `unwrapValueDeep` on the keyframe object itself as a catch-all, in case
+ * the text is reachable by a direct unwrap without needing a named field
+ * at all (e.g. a bare single-field wrapper).
+ *
+ * @param {*} keyframeObj
+ * @param {string} label
+ * @param {(message: string, level?: string) => void} log
+ * @param {ReturnType<typeof createScanBudget>} [budget]
+ */
+async function dumpKeyframeObjectShape(keyframeObj, label, log, budget) {
+  const shape = await probeObjectShape(keyframeObj, label, log, budget);
+  log(
+    `[exploreKeyframe] ${label} — constructor=${shape.constructorName ?? "n/a"}, methods=[${(shape.prototypeMethodNames ?? []).join(", ") || "none"}], ` +
+      `properties=[${(shape.prototypeNonMethodNames ?? []).join(", ") || "none"}]`,
+    "info"
+  );
+
+  const allNames = [...new Set([...(shape.prototypeMethodNames ?? []), ...(shape.prototypeNonMethodNames ?? []), ...(shape.ownKeys ?? [])])];
+  const attempts = [];
+  const tried = new Set();
+
+  for (const name of KEYFRAME_FIELD_CANDIDATES) {
+    if (!allNames.includes(name)) continue;
+    const kind = (shape.prototypeMethodNames ?? []).includes(name) ? "method" : "property";
+    // eslint-disable-next-line no-await-in-loop
+    attempts.push(await attemptRead({ param: keyframeObj, name, kind, log, budget }));
+    tried.add(name);
+  }
+
+  const broaderNames = allNames.filter((name) => !tried.has(name) && /(value|text|string)/i.test(name) && isSafeNonMutatingFieldName(name));
+  for (const name of broaderNames) {
+    const kind = (shape.prototypeMethodNames ?? []).includes(name) ? "method" : "property";
+    // eslint-disable-next-line no-await-in-loop
+    attempts.push(await attemptRead({ param: keyframeObj, name, kind, log, budget }));
+    tried.add(name);
+  }
+
+  const directUnwrap = await unwrapValueDeep(keyframeObj, log, { label: `${label} (direct unwrap)` });
+
+  const workingAttempt = attempts.find((a) => a.ok && a.resolvedValue !== null && a.resolvedValue !== undefined);
+  const workingField = workingAttempt ? workingAttempt.name : directUnwrap !== null && directUnwrap !== undefined ? "(direct unwrap)" : null;
+  const resolvedValue = workingAttempt ? workingAttempt.resolvedValue : directUnwrap;
+
+  return { label, shape, fieldAttempts: attempts, directUnwrap, workingField, resolvedValue };
+}
+
+/**
+ * Dedicated exploration of `ComponentParam`'s keyframe API — built because
+ * a confirmed real-host run showed `getValueAtTime` returning the explicit
+ * host message "Use GetKeyframeAtTime to get a keyframe object at time.
+ * The value can be extracted from the keyframe object.", for a param that
+ * ALSO reports `areKeyframesSupported: false`. So this param apparently
+ * still exposes a keyframe-shaped access path despite that flag — this
+ * function investigates it without ever calling `createKeyframe` (still
+ * gated on `areKeyframesSupported`, unrelated to this exploration) or any
+ * other method that could mutate the sequence.
+ *
+ * 1. `getKeyframeListAsTickTimes()` — enumerates existing keyframe times,
+ *    if any. Tried first since `getKeyframePtr` may need a real index from
+ *    this list rather than an arbitrary guess.
+ * 2. `getKeyframePtr(index)` — tried at every index the list produced, or
+ *    a single best-effort `getKeyframePtr(0)` if the list came back empty
+ *    (a non-time-varying param may still expose exactly one implicit
+ *    keyframe holding its static value, even with nothing enumerated).
+ * 3. `getKeyframeAtTime(TickTime)` — the exact method the host error
+ *    message pointed us at, tried with every enumerated keyframe time plus
+ *    the same valid-TickTime candidates used elsewhere in this module
+ *    (never called with no argument).
+ *
+ * Whatever object any of these calls returns is deep-dumped via
+ * `dumpKeyframeObjectShape()` above.
+ *
+ * @param {*} param
+ * @param {*} ppro
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {(message: string, level?: string) => void} log
+ * @param {ReturnType<typeof createScanBudget>} [budget]
+ */
+export async function exploreKeyframeObject(param, ppro, trackItem, log, budget) {
+  log("[stage] exploring the ComponentParam keyframe API (getKeyframeListAsTickTimes, getKeyframePtr, getKeyframeAtTime)…", "info");
+
+  const hasList = safe(() => typeof param.getKeyframeListAsTickTimes).value === "function";
+  log(`[exploreKeyframe] getKeyframeListAsTickTimes: typeof=${hasList ? "function" : "undefined"}`, "info");
+
+  let keyframeTimes = [];
+  let listOk = false;
+  let listError = null;
+  if (hasList) {
+    const listResult = await safeResolve(() => param.getKeyframeListAsTickTimes(), {
+      log,
+      label: "getKeyframeListAsTickTimes()",
+      timeoutMs: PROBE_CALL_TIMEOUT_MS,
+    });
+    listOk = listResult.ok;
+    if (listResult.ok) {
+      keyframeTimes = Array.isArray(listResult.value) ? listResult.value : listResult.value ? [listResult.value] : [];
+      log(`[exploreKeyframe] getKeyframeListAsTickTimes(): ${keyframeTimes.length} keyframe time(s) found`, "info");
+    } else {
+      listError = listResult.timedOut ? "timed out" : String(listResult.error?.message || listResult.error);
+      log(`[exploreKeyframe] getKeyframeListAsTickTimes() failed: ${listError}`, "warn");
+    }
+  }
+
+  const explorations = [];
+
+  const hasPtr = safe(() => typeof param.getKeyframePtr).value === "function";
+  log(`[exploreKeyframe] getKeyframePtr: typeof=${hasPtr ? "function" : "undefined"}`, "info");
+  if (hasPtr) {
+    const indices = keyframeTimes.length > 0 ? keyframeTimes.map((_, i) => i) : [0];
+    for (const i of indices) {
+      if (budget && budget.isExpired()) break;
+      // eslint-disable-next-line no-await-in-loop
+      const ptrResult = await safeResolve(() => param.getKeyframePtr(i), { log, label: `getKeyframePtr(${i})`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
+      if (ptrResult.ok && ptrResult.value !== null && ptrResult.value !== undefined) {
+        // eslint-disable-next-line no-await-in-loop
+        const dump = await dumpKeyframeObjectShape(ptrResult.value, `getKeyframePtr(${i})`, log, budget);
+        explorations.push({ method: "getKeyframePtr", args: `(${i})`, ok: true, ...dump });
+      } else {
+        explorations.push({
+          method: "getKeyframePtr",
+          args: `(${i})`,
+          ok: false,
+          timedOut: Boolean(ptrResult.timedOut),
+          error: ptrResult.timedOut ? "timed out" : String(ptrResult.error?.message || ptrResult.error || "returned null/undefined"),
+        });
+      }
+    }
+  } else {
+    explorations.push({ method: "getKeyframePtr", ok: false, error: "not present on this ComponentParam" });
+  }
+
+  const hasAtTime = safe(() => typeof param.getKeyframeAtTime).value === "function";
+  log(`[exploreKeyframe] getKeyframeAtTime: typeof=${hasAtTime ? "function" : "undefined"}`, "info");
+  if (hasAtTime) {
+    const timeCandidates = keyframeTimes.map((t, i) => ({ label: `enumerated keyframe time [${i}]`, time: t }));
+    const zeroResult = await safeResolve(() => ppro.TickTime.createWithSeconds(0), { log, label: "TickTime.createWithSeconds(0)" });
+    if (zeroResult.ok) timeCandidates.push({ label: "TickTime.createWithSeconds(0)", time: zeroResult.value });
+    const inPointResult = await safeResolve(() => trackItem.getInPoint(), { log, label: "trackItem.getInPoint()" });
+    if (inPointResult.ok) timeCandidates.push({ label: "trackItem.getInPoint()", time: inPointResult.value });
+
+    for (const { label: timeLabel, time } of timeCandidates) {
+      if (budget && budget.isExpired()) break;
+      // eslint-disable-next-line no-await-in-loop
+      const atTimeResult = await safeResolve(() => param.getKeyframeAtTime(time), { log, label: `getKeyframeAtTime(${timeLabel})`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
+      if (atTimeResult.ok && atTimeResult.value !== null && atTimeResult.value !== undefined) {
+        // eslint-disable-next-line no-await-in-loop
+        const dump = await dumpKeyframeObjectShape(atTimeResult.value, `getKeyframeAtTime(${timeLabel})`, log, budget);
+        explorations.push({ method: "getKeyframeAtTime", args: `(${timeLabel})`, ok: true, ...dump });
+      } else {
+        explorations.push({
+          method: "getKeyframeAtTime",
+          args: `(${timeLabel})`,
+          ok: false,
+          timedOut: Boolean(atTimeResult.timedOut),
+          error: atTimeResult.timedOut ? "timed out" : String(atTimeResult.error?.message || atTimeResult.error || "returned null/undefined"),
+        });
+      }
+    }
+  } else {
+    explorations.push({ method: "getKeyframeAtTime", ok: false, error: "not present on this ComponentParam" });
+  }
+
+  const workingExploration = explorations.find((e) => e.ok && e.resolvedValue !== null && e.resolvedValue !== undefined);
+
+  if (workingExploration) {
+    log(
+      `✓ Extracted a value via ${workingExploration.method}${workingExploration.args} → ${workingExploration.workingField}: ${JSON.stringify(workingExploration.resolvedValue)}`,
+      "success"
+    );
+  } else {
+    log("✗ No keyframe exploration path returned a usable value.", "warn");
+  }
+
+  return {
+    keyframeList: { ok: listOk, count: keyframeTimes.length, error: listError },
+    explorations,
+    workingMethod: workingExploration ? `${workingExploration.method}${workingExploration.args}` : null,
+    workingField: workingExploration ? workingExploration.workingField : null,
+    resolvedValue: workingExploration ? workingExploration.resolvedValue : null,
+  };
 }
 
 /**
@@ -890,5 +1091,167 @@ export async function testReadSourceTextOnly(opts) {
     return { ok: true, found: true, ...report, cleanupOk };
   } finally {
     if (activeReadOnlyCancelToken === cancelToken) activeReadOnlyCancelToken = null;
+  }
+}
+
+// Separate cancel-token slot from the other two entry points', for the
+// same reason they're separate from each other.
+let activeExploreKeyframeCancelToken = null;
+
+export function cancelActiveExploreKeyframeObject() {
+  if (activeExploreKeyframeCancelToken) {
+    activeExploreKeyframeCancelToken.cancelled = true;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Dedicated entry point for `exploreKeyframeObject()`: insert a temporary
+ * clip, wait for its component chain to stabilize, locate Source Text,
+ * explore its keyframe API (never createKeyframe or anything else that
+ * could mutate the sequence), clean up the temporary clip (always,
+ * whether any step above threw, failed, timed out, or was cancelled), and
+ * return a JSON-safe report.
+ *
+ * @param {Object} opts
+ * @param {string} opts.mogrtPath
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {number} [opts.scanBudgetMs]
+ */
+export async function testExploreKeyframeObject(opts) {
+  const { mogrtPath, log, scanBudgetMs = DEFAULT_ROUND_TRIP_BUDGET_MS } = opts;
+
+  log("════ Explore Keyframe Object — start ════", "info");
+
+  if (!mogrtPath) {
+    log("✗ No .mogrt selected.", "error");
+    return { ok: false, step: "mogrt-path" };
+  }
+
+  const cancelToken = { cancelled: false };
+  activeExploreKeyframeCancelToken = cancelToken;
+
+  try {
+    let project, sequence;
+    try {
+      ({ project, sequence } = await requireActiveProjectAndSequence());
+    } catch (err) {
+      log(`✗ No active project/sequence: ${err.message || err}`, "error");
+      return { ok: false, step: "sequence" };
+    }
+
+    const tracksResult = await safeAsync(() => listVideoTracks(sequence));
+    if (!tracksResult.ok || tracksResult.value.length === 0) {
+      log(
+        tracksResult.ok
+          ? "✗ No video track available to insert a temporary inspection clip onto."
+          : `✗ listVideoTracks() threw: ${tracksResult.error.message || tracksResult.error}`,
+        "error"
+      );
+      return { ok: false, step: "track" };
+    }
+    const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
+
+    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
+    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+
+    log(`[stage] inserting clip from: ${mogrtPath}`, "info");
+    const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
+    if (!insertResult.ok) {
+      log(`✗ Couldn't insert this .mogrt: ${insertResult.error.message || insertResult.error}`, "error");
+      return { ok: false, step: "insert" };
+    }
+    const trackItem = insertResult.value;
+    log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
+
+    const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
+      async () => {
+        log("[stage] waiting for MOGRT components to finish initializing…", "info");
+        const stabilization = await stabilizeComponentChain(trackItem, log, { cancelToken });
+        const textInfo = stabilization.discovery.components.find((c) => c.classification === "text-editing");
+
+        if (!textInfo) {
+          log(`${MOGRT_INIT_TIMEOUT_MESSAGE} No AE.ADBE Text component found — cannot explore Source Text this run.`, "warn");
+          return { found: false, reason: "no-text-component", componentDiscoveryTimeline: stabilization.timeline };
+        }
+
+        log(`[stage] AE.ADBE Text found at index ${textInfo.componentIndex} — locating Source Text by displayName…`, "info");
+        const located = await locateSourceTextParam(textInfo.component, textInfo.componentIndex, log);
+        if (!located) {
+          log('✗ No param with displayName exactly "Source Text" was found on the AE.ADBE Text component.', "error");
+          return {
+            found: false,
+            reason: "no-source-text-param",
+            componentDiscoveryTimeline: stabilization.timeline,
+            componentIndex: textInfo.componentIndex,
+          };
+        }
+
+        const isTimeVaryingResult =
+          typeof located.param.isTimeVarying === "function"
+            ? await safeResolve(() => located.param.isTimeVarying(), { log, label: "sourceText.isTimeVarying()" })
+            : { ok: false };
+        const areKeyframesSupportedResult =
+          typeof located.param.areKeyframesSupported === "function"
+            ? await safeResolve(() => located.param.areKeyframesSupported(), { log, label: "sourceText.areKeyframesSupported()" })
+            : { ok: false };
+
+        const probeBudget = createScanBudget({ totalMs: scanBudgetMs, cancelToken });
+        const keyframeExploration = await exploreKeyframeObject(located.param, getPpro(), trackItem, log, probeBudget);
+
+        return {
+          found: true,
+          componentIndex: textInfo.componentIndex,
+          paramIndex: located.paramIndex,
+          displayName: located.displayName,
+          isTimeVarying: isTimeVaryingResult.ok ? isTimeVaryingResult.value : null,
+          areKeyframesSupported: areKeyframesSupportedResult.ok ? areKeyframesSupportedResult.value : null,
+          keyframeExploration,
+          componentDiscoveryTimeline: stabilization.timeline,
+        };
+      },
+      () => {
+        log("[stage] cleaning up (removing temporary inspection clip)…", "info");
+        return safeAsync(() => removeTrackItem(project, sequence, trackItem));
+      },
+      log
+    );
+
+    const cleanupOk = cleanupResult.ok && cleanupResult.value === true;
+    if (cleanupResult.ok && cleanupResult.value) {
+      log("Removed temporary inspection clip.", "info");
+    } else {
+      log(
+        `Couldn't remove the temporary inspection clip (${
+          cleanupResult.ok ? "transaction reported failure" : cleanupResult.error.message || cleanupResult.error
+        }) — you may need to delete it from the timeline by hand.`,
+        "warn"
+      );
+    }
+
+    if (scanError) {
+      log("════ Explore Keyframe Object — finished with errors (cleanup still ran) ════", "error");
+      return { ok: false, step: "scan", error: String(scanError.message || scanError), cleanupOk, componentDiscoveryTimeline: [] };
+    }
+
+    const report = scanReport ?? { found: false, reason: "crash", componentDiscoveryTimeline: [] };
+
+    if (!report.found) {
+      log("════ Explore Keyframe Object — finished (Source Text not found this run) ════", "warn");
+      return { ok: true, found: false, reason: report.reason, componentDiscoveryTimeline: report.componentDiscoveryTimeline, cleanupOk };
+    }
+
+    const success = Boolean(report.keyframeExploration?.resolvedValue !== null && report.keyframeExploration?.resolvedValue !== undefined);
+    log(
+      success
+        ? `════ Explore Keyframe Object — finished: SUCCESS via ${report.keyframeExploration.workingMethod} ════`
+        : "════ Explore Keyframe Object — finished (no exploration path returned a value — see keyframeExploration for details) ════",
+      success ? "success" : "warn"
+    );
+
+    return { ok: true, found: true, ...report, cleanupOk };
+  } finally {
+    if (activeExploreKeyframeCancelToken === cancelToken) activeExploreKeyframeCancelToken = null;
   }
 }

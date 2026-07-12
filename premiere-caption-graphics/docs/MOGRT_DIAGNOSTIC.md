@@ -679,3 +679,53 @@ this bug report needed but the tooling didn't previously offer.
 narrower `readSourceTextAttempts()` (bare `getValueAtTime` calls only) to
 this same richer `readSourceTextValueOnly()` — its report field is now
 named `valueRead` (was `readAttempts`).
+
+## Eighth real host run: no generic value getter exists — the host points at a keyframe API instead
+
+`getValue()` doesn't exist on this param. `.value` is `undefined`.
+`getStartValue()` returns `null` (already known). And `getValueAtTime()`
+returned an explicit host message instead of a value:
+
+> "Use GetKeyframeAtTime to get a keyframe object at time. The value can
+> be extracted from the keyframe object."
+
+So despite reporting `areKeyframesSupported: false`, Source Text
+apparently still exposes a keyframe-shaped access path — the host itself
+told us to use it.
+
+### `exploreKeyframeObject()` — a dedicated keyframe-API exploration
+
+New in `src/ppro/sourceTextProbe.js`, with its own "Explore Keyframe
+Object" button/cancel-token/"Save JSON" UI, separate from Read Source Text
+Only:
+
+1. **`getKeyframeListAsTickTimes()`** — enumerates existing keyframe
+   times first, since `getKeyframePtr` may need a real index derived from
+   this list rather than an arbitrary guess.
+2. **`getKeyframePtr(index)`** — tried at every index the list produced,
+   or a single best-effort `getKeyframePtr(0)` if the list came back
+   empty (a non-time-varying param may still expose exactly one implicit
+   keyframe holding its static value, even with nothing enumerated).
+3. **`getKeyframeAtTime(TickTime)`** — the exact method the host error
+   message pointed at, tried with every enumerated keyframe time plus the
+   same valid-`TickTime` candidates used elsewhere in this module (never
+   called bare).
+
+Whatever object any of these calls returns is fully dumped
+(`dumpKeyframeObjectShape()`): every own + inherited property/method name
+via `probeObjectShape`, then checked for `value`, `getValue`, `text`,
+`getText`, `string`, `getString`, `sourceText`, `getSourceText` by exact
+name, then any OTHER field whose name contains "value", "text", or
+"string" and isn't itself a keyframe/`AtTime`/`create`/`set`/`find` method
+(a bug caught by this turn's own test suite before it ever ran against a
+real host: the broader-scan filter was accidentally reusing
+`isPlausibleValueGetterMethod`, which requires "value" specifically in the
+name, silently excluding a field like `getDisplayString` that only
+matches on "string" — fixed by splitting the exclude-pattern check
+(`isSafeNonMutatingFieldName`) out from the value-specific one). `unwrapValueDeep`
+also runs on the whole keyframe object directly, as a catch-all. Never
+calls `createKeyframe` or anything else that could mutate the sequence.
+
+`testExploreKeyframeObject()` is the standalone entry point: the same
+insert → stabilize → locate → cleanup cycle as the other two Source Text
+diagnostics, stopping at exploration.

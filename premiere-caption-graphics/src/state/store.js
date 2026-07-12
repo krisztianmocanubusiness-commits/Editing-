@@ -83,5 +83,7 @@ export const store = createStore({
     lastSourceTextRoundTrip: null, // full testSourceTextRoundTrip() return value, or null — see src/ppro/sourceTextProbe.js
     readSourceTextOnlyRunning: false,
     lastReadSourceTextOnly: null, // full testReadSourceTextOnly() return value, or null — see src/ppro/sourceTextProbe.js
+    exploreKeyframeObjectRunning: false,
+    lastExploreKeyframeObject: null, // full testExploreKeyframeObject() return value, or null — see src/ppro/sourceTextProbe.js
   },
 });

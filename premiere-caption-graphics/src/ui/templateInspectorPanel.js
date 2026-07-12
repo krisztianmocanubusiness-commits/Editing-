@@ -4,7 +4,14 @@ import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { inspectMogrt } from "../ppro/templateInspector.js";
 import { diagnoseMogrt, cancelActiveDiagnostic } from "../ppro/diagnostics.js";
-import { testSourceTextRoundTrip, cancelActiveSourceTextRoundTrip, testReadSourceTextOnly, cancelActiveReadSourceTextOnly } from "../ppro/sourceTextProbe.js";
+import {
+  testSourceTextRoundTrip,
+  cancelActiveSourceTextRoundTrip,
+  testReadSourceTextOnly,
+  cancelActiveReadSourceTextOnly,
+  testExploreKeyframeObject,
+  cancelActiveExploreKeyframeObject,
+} from "../ppro/sourceTextProbe.js";
 import { saveActiveTemplate } from "../state/settings.js";
 import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
 import { describeCompatibilityLabel } from "../presets/contractValidation.js";
@@ -248,6 +255,57 @@ async function saveReadSourceTextOnlyJson() {
   }
 }
 
+async function runExploreKeyframeObjectTest() {
+  const { mogrtPath } = store.getState().templateInspector;
+  if (!mogrtPath) {
+    log("Choose a .mogrt to inspect first.", "error");
+    return;
+  }
+  patchInspector({ exploreKeyframeObjectRunning: true, lastExploreKeyframeObject: null });
+  try {
+    const result = await testExploreKeyframeObject({ mogrtPath, log });
+    // TEMPORARY: also dump the full result to console.error(), same
+    // reasoning as the other Source Text diagnostics — retrievable via the
+    // UXP Developer Tool's Console tab even if the panel UI breaks.
+    console.error("[Caption Graphics Studio] Explore Keyframe Object result:", JSON.stringify(result, null, 2));
+    patchInspector({ lastExploreKeyframeObject: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] Explore Keyframe Object crashed:", err);
+    log(`Explore Keyframe Object crashed unexpectedly: ${err.message || err}`, "error");
+    patchInspector({ lastExploreKeyframeObject: { ok: false, step: "crash" } });
+  } finally {
+    patchInspector({ exploreKeyframeObjectRunning: false });
+  }
+}
+
+function cancelExploreKeyframeObject() {
+  const cancelled = cancelActiveExploreKeyframeObject();
+  log(
+    cancelled
+      ? "Cancel requested — the exploration will stop at its next checkpoint and still clean up the temporary clip."
+      : "Nothing to cancel — no Explore Keyframe Object diagnostic is currently running.",
+    cancelled ? "warn" : "info"
+  );
+}
+
+async function saveExploreKeyframeObjectJson() {
+  const { lastExploreKeyframeObject } = store.getState().templateInspector;
+  if (!lastExploreKeyframeObject || !lastExploreKeyframeObject.ok || !lastExploreKeyframeObject.found) {
+    log("Run Explore Keyframe Object successfully (with Source Text found) before saving its output.", "error");
+    return;
+  }
+  try {
+    const uxp = getUxp();
+    // @ts-ignore
+    const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-keyframe-explore.json", { types: ["json"] });
+    if (!file) return;
+    await file.write(JSON.stringify(lastExploreKeyframeObject, null, 2));
+    log(`Keyframe exploration diagnostic saved to ${file.nativePath}.`, "success");
+  } catch (err) {
+    log(`Saving keyframe exploration JSON failed: ${err.message || err}`, "error");
+  }
+}
+
 function diagnosticSummaryBlock(result, diagnosing) {
   if (diagnosing) {
     return el("div", { class: "inspector-results" }, [
@@ -480,6 +538,78 @@ function readSourceTextOnlyBlock(result, running) {
   ]);
 }
 
+function exploreKeyframeObjectOutcomeMessage(exploration) {
+  if (exploration?.workingMethod && exploration.resolvedValue !== null && exploration.resolvedValue !== undefined) {
+    return {
+      text: `Extracted a value via ${exploration.workingMethod} → ${exploration.workingField}: ${JSON.stringify(exploration.resolvedValue)}`,
+      cls: "log-success",
+    };
+  }
+  const anyOk = (exploration?.explorations ?? []).some((e) => e.ok);
+  if (anyOk) {
+    return { text: "A keyframe object was returned, but no field on it (value/getValue/text/string/sourceText/other) held a usable value.", cls: "log-warn" };
+  }
+  return { text: "No keyframe exploration path returned an object — see Log for details.", cls: "log-warn" };
+}
+
+function exploreKeyframeObjectBlock(result, running) {
+  if (running) {
+    return el("div", { class: "inspector-results" }, [
+      el("div", {
+        class: "status-line log-info",
+        text: "⏳ Exploring the keyframe API — inserting a temporary clip, waiting for it to stabilize, then trying " +
+          "getKeyframeListAsTickTimes(), getKeyframePtr(index), and getKeyframeAtTime(TickTime), dumping the full shape of " +
+          "whatever object each one returns. createKeyframe is never called here. The temporary clip is always removed " +
+          "afterwards. See Log below for live progress, or click Cancel to stop early.",
+      }),
+    ]);
+  }
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Explore Keyframe Object failed${stepLabel}${result.error ? `: ${result.error}` : ""}. See Log below.` }),
+    ]);
+  }
+  if (!result.found) {
+    const reasonText =
+      result.reason === "no-source-text-param"
+        ? "AE.ADBE Text was found, but no param with displayName exactly \"Source Text\" was found on it."
+        : "MOGRT component chain did not fully initialise before timeout — AE.ADBE Text was not found within the wait window.";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-warn", text: `⚠ ${reasonText} Temporary clip removed either way. Try again, or check the Log for the discovery timeline.` }),
+    ]);
+  }
+  const exploration = result.keyframeExploration;
+  const outcome = exploreKeyframeObjectOutcomeMessage(exploration);
+  const explorationLines = (exploration?.explorations ?? []).map((e) => {
+    if (!e.ok) {
+      return el("div", { class: "status-line", text: `  ${e.method}${e.args ?? ""}: ✗ ${e.error ?? "failed"}` });
+    }
+    const fieldSummary = (e.fieldAttempts ?? [])
+      .filter((a) => a.ok)
+      .map((a) => `${a.name}=${JSON.stringify(a.resolvedValue)}`)
+      .join(", ");
+    return el("div", {
+      class: "status-line",
+      text: `  ${e.method}${e.args ?? ""}: ✓ shape=${e.shape?.constructorName ?? "n/a"}${fieldSummary ? `, fields: ${fieldSummary}` : ", no field held a value"}${
+        e.workingField ? ` — WORKING FIELD: ${e.workingField}` : ""
+      }`,
+    });
+  });
+  return el("div", { class: "inspector-results" }, [
+    el("div", {
+      class: "status-line",
+      text: `AE.ADBE Text found (component ${result.componentIndex}), Source Text param at index ${result.paramIndex} ` +
+        `(isTimeVarying: ${String(result.isTimeVarying)}, areKeyframesSupported: ${String(result.areKeyframesSupported)}).`,
+    }),
+    el("div", { class: "status-line", text: `getKeyframeListAsTickTimes(): ${exploration?.keyframeList?.ok ? `${exploration.keyframeList.count} keyframe time(s) found` : `failed (${exploration?.keyframeList?.error ?? "n/a"})`}` }),
+    el("div", { class: `status-line ${outcome.cls}`, text: `${outcome.text}` }),
+    ...explorationLines,
+    el("div", { class: "status-line", text: `Temporary clip removed: ${result.cleanupOk ? "yes" : "NO — you may need to delete it from the timeline by hand"}.` }),
+  ]);
+}
+
 function activeTemplateLine(activeTemplate) {
   if (!activeTemplate) {
     return el("div", { class: "status-line log-warn", text: "No active template saved yet." });
@@ -582,6 +712,28 @@ export function renderTemplateInspectorPanel(onChange) {
     onClick: () => saveReadSourceTextOnlyJson(),
   });
 
+  const exploreKeyframeObjectBtn = el("button", {
+    class: "btn",
+    text: ti.exploreKeyframeObjectRunning ? "Exploring…" : "Explore Keyframe Object",
+    disabled: !isHosted() || ti.exploreKeyframeObjectRunning || !ti.mogrtPath || undefined,
+    onClick: async () => {
+      await runExploreKeyframeObjectTest();
+      onChange();
+    },
+  });
+  const cancelExploreKeyframeObjectBtn = el("button", {
+    class: "btn",
+    text: "Cancel",
+    disabled: !ti.exploreKeyframeObjectRunning || undefined,
+    onClick: () => cancelExploreKeyframeObject(),
+  });
+  const saveExploreKeyframeObjectBtn = el("button", {
+    class: "btn",
+    text: "Save keyframe exploration JSON…",
+    disabled: !ti.lastExploreKeyframeObject || !ti.lastExploreKeyframeObject.ok || !ti.lastExploreKeyframeObject.found || undefined,
+    onClick: () => saveExploreKeyframeObjectJson(),
+  });
+
   return el("section", { class: "panel panel-template-inspector" }, [
     el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
     el(
@@ -641,6 +793,24 @@ export function renderTemplateInspectorPanel(onChange) {
     ),
     el("div", { class: "row" }, [readSourceTextOnlyBtn, cancelReadSourceTextOnlyBtn, saveReadSourceTextOnlyBtn]),
     readSourceTextOnlyBlock(ti.lastReadSourceTextOnly, ti.readSourceTextOnlyRunning),
+    el("h3", { text: "Explore Keyframe Object (troubleshooting)" }),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Run this if Read Source Text Only above found no working value getter: a real host run showed " +
+          "getValueAtTime() returning the message \"Use GetKeyframeAtTime to get a keyframe object at time. The " +
+          "value can be extracted from the keyframe object.\" — this explores that keyframe API specifically. " +
+          "Tries getKeyframeListAsTickTimes() to enumerate existing keyframe times, getKeyframePtr(index) at " +
+          "every enumerated index, and getKeyframeAtTime(TickTime) with every enumerated time plus a few valid " +
+          "fallbacks, then dumps the full shape (every property/method name) of whatever object each call " +
+          "returns and checks it for value/getValue/text/string/sourceText fields. Never calls createKeyframe " +
+          "or anything else that could mutate the sequence. The temporary clip is always removed afterwards. " +
+          "See docs/MOGRT_DIAGNOSTIC.md.",
+      ]
+    ),
+    el("div", { class: "row" }, [exploreKeyframeObjectBtn, cancelExploreKeyframeObjectBtn, saveExploreKeyframeObjectBtn]),
+    exploreKeyframeObjectBlock(ti.lastExploreKeyframeObject, ti.exploreKeyframeObjectRunning),
     el("h3", { text: "Source Text Round Trip (troubleshooting)" }),
     el(
       "p",

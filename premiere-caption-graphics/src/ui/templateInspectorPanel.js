@@ -14,6 +14,8 @@ import {
   testWriteOnlyProbe,
   cancelActiveWriteOnlyProbe,
   WRITE_PROBE_SENTINEL,
+  testProbeSourceTextValueShapes,
+  cancelActiveValueShapesProbe,
 } from "../ppro/sourceTextProbe.js";
 import { saveActiveTemplate } from "../state/settings.js";
 import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
@@ -357,6 +359,57 @@ async function saveWriteOnlyProbeJson() {
     log(`Write-only probe diagnostic saved to ${file.nativePath}.`, "success");
   } catch (err) {
     log(`Saving write-only probe JSON failed: ${err.message || err}`, "error");
+  }
+}
+
+async function runValueShapesProbeTest() {
+  const { mogrtPath } = store.getState().templateInspector;
+  if (!mogrtPath) {
+    log("Choose a .mogrt to inspect first.", "error");
+    return;
+  }
+  patchInspector({ valueShapesProbeRunning: true, lastValueShapesProbe: null });
+  try {
+    const result = await testProbeSourceTextValueShapes({ mogrtPath, log });
+    // TEMPORARY: also dump the full result to console.error(), same
+    // reasoning as the other Source Text diagnostics — retrievable via the
+    // UXP Developer Tool's Console tab even if the panel UI breaks.
+    console.error("[Caption Graphics Studio] Probe Source Text Value Shapes result:", JSON.stringify(result, null, 2));
+    patchInspector({ lastValueShapesProbe: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] Probe Source Text Value Shapes crashed:", err);
+    log(`Probe Source Text Value Shapes crashed unexpectedly: ${err.message || err}`, "error");
+    patchInspector({ lastValueShapesProbe: { ok: false, step: "crash" } });
+  } finally {
+    patchInspector({ valueShapesProbeRunning: false });
+  }
+}
+
+function cancelValueShapesProbe() {
+  const cancelled = cancelActiveValueShapesProbe();
+  log(
+    cancelled
+      ? "Cancel requested — the probe will stop at its next checkpoint and still clean up the temporary clip."
+      : "Nothing to cancel — no value-shapes probe is currently running.",
+    cancelled ? "warn" : "info"
+  );
+}
+
+async function saveValueShapesProbeJson() {
+  const { lastValueShapesProbe } = store.getState().templateInspector;
+  if (!lastValueShapesProbe || !lastValueShapesProbe.ok || !lastValueShapesProbe.found) {
+    log("Run Probe Source Text Value Shapes successfully (with Source Text found) before saving its output.", "error");
+    return;
+  }
+  try {
+    const uxp = getUxp();
+    // @ts-ignore
+    const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-source-text-value-shapes.json", { types: ["json"] });
+    if (!file) return;
+    await file.write(JSON.stringify(lastValueShapesProbe, null, 2));
+    log(`Value-shapes probe diagnostic saved to ${file.nativePath}.`, "success");
+  } catch (err) {
+    log(`Saving value-shapes probe JSON failed: ${err.message || err}`, "error");
   }
 }
 
@@ -730,6 +783,69 @@ function writeOnlyProbeBlock(result, running) {
   ]);
 }
 
+function valueShapesProbeBlock(result, running) {
+  if (running) {
+    return el("div", { class: "inspector-results" }, [
+      el("div", {
+        class: "status-line log-info",
+        text: "⏳ Probing Source Text value shapes — inserting a temporary clip, waiting for it to stabilize, then trying only value shapes " +
+          "grounded in Adobe's official ComponentParam/Keyframe docs (a raw string, the documented { value: X } Keyframe wrapper shape, " +
+          "and an existing Keyframe with its documented-Writable .value mutated directly) — never random objects. The temporary clip is " +
+          "always removed afterwards. See Log below for live progress, or click Cancel to stop early.",
+      }),
+    ]);
+  }
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Probe Source Text Value Shapes failed${stepLabel}${result.error ? `: ${result.error}` : ""}. See Log below.` }),
+    ]);
+  }
+  if (!result.found) {
+    const reasonText =
+      result.reason === "no-source-text-param"
+        ? "AE.ADBE Text was found, but no param with displayName exactly \"Source Text\" was found on it."
+        : "MOGRT component chain did not fully initialise before timeout — AE.ADBE Text was not found within the wait window.";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-warn", text: `⚠ ${reasonText} Temporary clip removed either way. Try again, or check the Log for the discovery timeline.` }),
+    ]);
+  }
+  const probe = result.valueShapesProbe;
+  const confirmed = Boolean(probe?.verifiedWrite?.automatedCheckConfirmsChange);
+  const outcomeLine = probe?.workingCandidateName
+    ? el("div", {
+        class: `status-line ${confirmed ? "log-success" : "log-warn"}`,
+        text: confirmed
+          ? `✓ Working value shape found: "${probe.workingCandidateName}" — transaction executed and confirmed.`
+          : `⚠ "${probe.workingCandidateName}" constructed and executed a transaction, but the automated check couldn't confirm the visible change.`,
+      })
+    : el("div", {
+        class: "status-line log-error",
+        text: "✗ None of the documented value shapes were accepted. No text/rich-text wrapper type is documented for ComponentParam in Adobe's " +
+          "public reference — this strongly suggests writing native Premiere MOGRT Source Text is not currently supported through the " +
+          "documented UXP scripting API.",
+      });
+  const candidateLines = (probe?.candidates ?? []).map((c) =>
+    el("div", {
+      class: "status-line",
+      text: `  ${c.name}: ${
+        !c.attempted
+          ? `not attempted (${c.error ?? c.reason ?? "unknown"})`
+          : c.ok
+          ? `✓ createSetValueAction succeeded (${c.actionConstructorName ?? "action"})`
+          : `✗ ${c.error ?? "failed"}`
+      }`,
+    })
+  );
+  return el("div", { class: "inspector-results" }, [
+    el("div", { class: "status-line", text: `ComponentParam constructor: ${probe?.metadata?.constructorName ?? "n/a"}.` }),
+    outcomeLine,
+    ...candidateLines,
+    el("div", { class: "status-line", text: `Temporary clip removed: ${result.cleanupOk ? "yes" : "NO — you may need to delete it from the timeline by hand"}.` }),
+  ]);
+}
+
 function activeTemplateLine(activeTemplate) {
   if (!activeTemplate) {
     return el("div", { class: "status-line log-warn", text: "No active template saved yet." });
@@ -876,6 +992,28 @@ export function renderTemplateInspectorPanel(onChange) {
     onClick: () => saveWriteOnlyProbeJson(),
   });
 
+  const valueShapesProbeBtn = el("button", {
+    class: "btn",
+    text: ti.valueShapesProbeRunning ? "Probing…" : "Probe Source Text Value Shapes",
+    disabled: !isHosted() || ti.valueShapesProbeRunning || !ti.mogrtPath || undefined,
+    onClick: async () => {
+      await runValueShapesProbeTest();
+      onChange();
+    },
+  });
+  const cancelValueShapesProbeBtn = el("button", {
+    class: "btn",
+    text: "Cancel",
+    disabled: !ti.valueShapesProbeRunning || undefined,
+    onClick: () => cancelValueShapesProbe(),
+  });
+  const saveValueShapesProbeBtn = el("button", {
+    class: "btn",
+    text: "Save value-shapes probe JSON…",
+    disabled: !ti.lastValueShapesProbe || !ti.lastValueShapesProbe.ok || !ti.lastValueShapesProbe.found || undefined,
+    onClick: () => saveValueShapesProbeJson(),
+  });
+
   return el("section", { class: "panel panel-template-inspector" }, [
     el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
     el(
@@ -970,6 +1108,22 @@ export function renderTemplateInspectorPanel(onChange) {
     ),
     el("div", { class: "row" }, [writeOnlyProbeBtn, cancelWriteOnlyProbeBtn, saveWriteOnlyProbeBtn]),
     writeOnlyProbeBlock(ti.lastWriteOnlyProbe, ti.writeOnlyProbeRunning),
+    el("h3", { text: "Probe Source Text Value Shapes (troubleshooting)" }),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Run this after Write-Only Probe confirmed createSetValueAction rejects a raw string with \"Illegal Parameter type\". Tries ONLY " +
+          "value shapes grounded in Adobe's official ComponentParam/Keyframe/PointKeyframe documentation — never invented objects: (1) a raw " +
+          "string, the documented createSetValueAction inValue type; (2) { value: sentinel }, the documented Keyframe.value wrapper shape; " +
+          "(3) an existing Keyframe fetched via getKeyframePtr(TickTime) with its documented-Writable .value property mutated directly. " +
+          "Whichever candidate succeeds at construction is also executed and given a best-effort read-back check. If none are accepted, " +
+          "that's reported plainly — the official docs list no text/rich-text wrapper type at all. The temporary clip is always removed " +
+          "afterwards. See docs/MOGRT_DIAGNOSTIC.md.",
+      ]
+    ),
+    el("div", { class: "row" }, [valueShapesProbeBtn, cancelValueShapesProbeBtn, saveValueShapesProbeBtn]),
+    valueShapesProbeBlock(ti.lastValueShapesProbe, ti.valueShapesProbeRunning),
     el("h3", { text: "Source Text Round Trip (troubleshooting)" }),
     el(
       "p",

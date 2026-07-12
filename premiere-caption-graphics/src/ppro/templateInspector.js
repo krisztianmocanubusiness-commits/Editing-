@@ -15,7 +15,7 @@
  * inspection results are still returned, just with a warning that the
  * editor may need to delete the clip by hand.
  */
-import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
+import { requireActiveProjectAndSequence, resolveInsertionTimeSec, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
 import { safeAsync, dumpComponentChain } from "./introspect.js";
 import { CONTRACTS, KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
@@ -65,8 +65,7 @@ export async function inspectMogrt(opts) {
   }
   const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
 
-  const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-  const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+  const startSec = await resolveInsertionTimeSec(sequence, log);
 
   log(`Inserting temporary inspection clip from: ${mogrtPath}`, "info");
   const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));

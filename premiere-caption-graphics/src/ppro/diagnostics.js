@@ -19,7 +19,7 @@
  * AE.ADBE Text component first), instead of each independently re-walking
  * the chain and risking disagreeing about what's even there.
  */
-import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
+import { requireActiveProjectAndSequence, resolveInsertionTimeSec, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
 import { safe, safeAsync, safeResolve, resolveHostValue, resolveHostValueDetailed, toSafeString } from "./introspect.js";
 import {
@@ -1035,8 +1035,7 @@ export async function diagnoseMogrt(opts) {
     }
     const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
 
-    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+    const startSec = await resolveInsertionTimeSec(sequence, log);
 
     log(`[stage] inserting clip from: ${mogrtPath}`, "info");
     const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));

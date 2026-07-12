@@ -14,10 +14,12 @@ import {
   readBackSourceText,
   runSourceTextRoundTrip,
   runWriteOnlyProbe,
+  probeSourceTextValueShapes,
   cancelActiveSourceTextRoundTrip,
   cancelActiveReadSourceTextOnly,
   cancelActiveExploreKeyframeObject,
   cancelActiveWriteOnlyProbe,
+  cancelActiveValueShapesProbe,
   DEFAULT_SENTINEL,
   WRITE_PROBE_SENTINEL,
 } from "../src/ppro/sourceTextProbe.js";
@@ -735,15 +737,16 @@ test("cancelActiveExploreKeyframeObject returns false when nothing is running", 
   assert.equal(cancelActiveExploreKeyframeObject(), false);
 });
 
-test("exploreKeyframeObject enumerates keyframe times via getKeyframeListAsTickTimes() and extracts text via getKeyframePtr(index)", async () => {
-  const keyframeTimes = [fakeTickTime(0)];
+test("exploreKeyframeObject enumerates keyframe times via getKeyframeListAsTickTimes() and extracts text via getKeyframePtr(TickTime) — CONFIRMED (Adobe's official docs): getKeyframePtr takes a TickTime, not an index", async () => {
+  const kfTime = fakeTickTime(0);
+  const keyframeTimes = [kfTime];
   const keyframeObj = { value: "Hello From Keyframe Ptr" };
   const param = fakeSourceTextParam({
     isTimeVarying: false,
     areKeyframesSupported: false,
     extraMethods: {
       getKeyframeListAsTickTimes: () => keyframeTimes,
-      getKeyframePtr: (i) => (i === 0 ? keyframeObj : null),
+      getKeyframePtr: (t) => (t === kfTime ? keyframeObj : null),
     },
   });
   const trackItem = fakeTrackItem({});
@@ -751,26 +754,26 @@ test("exploreKeyframeObject enumerates keyframe times via getKeyframeListAsTickT
 
   assert.equal(result.keyframeList.ok, true);
   assert.equal(result.keyframeList.count, 1);
-  assert.equal(result.workingMethod, "getKeyframePtr(0)");
+  assert.equal(result.workingMethod, "getKeyframePtr(enumerated keyframe time [0])");
   assert.equal(result.workingField, "value");
   assert.equal(result.resolvedValue, "Hello From Keyframe Ptr");
 });
 
-test("exploreKeyframeObject falls back to getKeyframePtr(0) when the enumerated keyframe list is empty", async () => {
+test("exploreKeyframeObject falls back to getKeyframePtr(TickTime.createWithSeconds(0)) when the enumerated keyframe list is empty", async () => {
   const keyframeObj = { getValue: () => "Implicit Single Keyframe" };
   const param = fakeSourceTextParam({
     isTimeVarying: false,
     areKeyframesSupported: false,
     extraMethods: {
       getKeyframeListAsTickTimes: () => [],
-      getKeyframePtr: (i) => (i === 0 ? keyframeObj : null),
+      getKeyframePtr: (t) => (t && t.seconds === 0 ? keyframeObj : null),
     },
   });
   const trackItem = fakeTrackItem({});
   const result = await exploreKeyframeObject(param, fakePpro(), trackItem, noopLog, undefined);
 
   assert.equal(result.keyframeList.count, 0);
-  assert.equal(result.workingMethod, "getKeyframePtr(0)");
+  assert.equal(result.workingMethod, "getKeyframePtr(TickTime.createWithSeconds(0))");
   assert.equal(result.workingField, "getValue");
   assert.equal(result.resolvedValue, "Implicit Single Keyframe");
 });
@@ -868,7 +871,7 @@ test("exploreKeyframeObject reports getKeyframeListAsTickTimes() failure without
     areKeyframesSupported: false,
     extraMethods: {
       getKeyframeListAsTickTimes: () => { throw new Error("list failed"); },
-      getKeyframePtr: (i) => (i === 0 ? keyframeObj : null),
+      getKeyframePtr: (t) => (t && t.seconds === 0 ? keyframeObj : null),
     },
   });
   const trackItem = fakeTrackItem({});
@@ -876,8 +879,8 @@ test("exploreKeyframeObject reports getKeyframeListAsTickTimes() failure without
 
   assert.equal(result.keyframeList.ok, false);
   assert.match(result.keyframeList.error, /list failed/);
-  // getKeyframePtr should still fall back to index 0 despite the list failing.
-  assert.equal(result.workingMethod, "getKeyframePtr(0)");
+  // getKeyframePtr should still fall back to TickTime.createWithSeconds(0) despite the list failing.
+  assert.equal(result.workingMethod, "getKeyframePtr(TickTime.createWithSeconds(0))");
 });
 
 // --- runWriteOnlyProbe ---
@@ -1053,4 +1056,178 @@ test("runWriteOnlyProbe reports write-api-succeeded-visible-change-unconfirmed (
   assert.equal(report.outcome, "write-api-succeeded-visible-change-unconfirmed");
   assert.equal(report.postWrite.automatedCheckConfirmsChange, false);
   assert.equal(report.manualVisualConfirmationNeeded, true);
+});
+
+// --- probeSourceTextValueShapes ---
+//
+// Regression coverage for Part B: after a real host run confirmed
+// createSetValueAction("__KERIS_WRITE_TEST__", true) throws "Illegal
+// Parameter type" for a raw string, this probe tries ONLY value shapes
+// grounded in Adobe's official ComponentParam/Keyframe/PointKeyframe docs
+// (confirmed via AdobeDocs/uxp-premiere-pro): a raw string (the documented
+// createSetValueAction inValue type), { value: X } (the documented
+// Keyframe.value wrapper shape), and an existing Keyframe (fetched via
+// getKeyframePtr(TickTime) — confirmed to take a TickTime, not an index —
+// with its documented-Writable .value mutated directly).
+
+test("cancelActiveValueShapesProbe returns false when nothing is running", () => {
+  assert.equal(cancelActiveValueShapesProbe(), false);
+});
+
+test("probeSourceTextValueShapes succeeds with the raw string candidate when the host accepts it directly, and verifies via a freshly re-acquired param", async () => {
+  const freshParam = fakeSourceTextParam({ getValue: () => WRITE_PROBE_SENTINEL });
+  const freshComponent = fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: [freshParam] });
+  const trackItem = { getComponentChain: () => fakeChain([freshComponent]) };
+  const originalParam = fakeSourceTextParam({ createSetValueAction: () => ({ constructor: { name: "SetParamValueAction" } }) });
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  const report = await probeSourceTextValueShapes({
+    project,
+    trackItem,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.candidates[0].name, "raw string (documented createSetValueAction inValue type)");
+  assert.equal(report.candidates[0].ok, true);
+  assert.equal(report.workingCandidateName, report.candidates[0].name);
+  assert.equal(report.verifiedWrite.automatedCheckConfirmsChange, true);
+});
+
+test("probeSourceTextValueShapes falls back to { value: sentinel } when a raw string is rejected — the confirmed real-host case", async () => {
+  const freshParam = fakeSourceTextParam({ getValue: () => WRITE_PROBE_SENTINEL });
+  const freshComponent = fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: [freshParam] });
+  const trackItem = { getComponentChain: () => fakeChain([freshComponent]) };
+  const originalParam = fakeSourceTextParam({
+    createSetValueAction: (value) => {
+      if (typeof value === "string") throw new Error("Illegal Parameter type");
+      return { constructor: { name: "SetParamValueAction" } };
+    },
+  });
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  const report = await probeSourceTextValueShapes({
+    project,
+    trackItem,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.candidates[0].ok, false);
+  assert.match(report.candidates[0].error, /Illegal Parameter type/);
+  assert.equal(report.candidates[1].name, "{ value: sentinel } (Keyframe.value's documented wrapper shape)");
+  assert.equal(report.candidates[1].ok, true);
+  assert.equal(report.workingCandidateName, report.candidates[1].name);
+});
+
+test("probeSourceTextValueShapes falls back to mutating an existing Keyframe's .value (getKeyframePtr) when the first two candidates are rejected", async () => {
+  const existingKeyframeObj = { value: null };
+  const freshParam = fakeSourceTextParam({ getValue: () => WRITE_PROBE_SENTINEL });
+  const freshComponent = fakeComponent({ matchName: "AE.ADBE Text", displayName: "Text", params: [freshParam] });
+  const trackItem = { getComponentChain: () => fakeChain([freshComponent]) };
+  const originalParam = fakeSourceTextParam({
+    createSetValueAction: (value) => {
+      if (value === existingKeyframeObj && value.value === WRITE_PROBE_SENTINEL) {
+        return { constructor: { name: "SetParamValueAction" } };
+      }
+      throw new Error("Illegal Parameter type");
+    },
+    extraMethods: { getKeyframePtr: () => existingKeyframeObj },
+  });
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  const report = await probeSourceTextValueShapes({
+    project,
+    trackItem,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.candidates[0].ok, false);
+  assert.equal(report.candidates[1].ok, false);
+  assert.equal(report.candidates[2].name, "existing Keyframe (getKeyframePtr) with .value mutated directly (documented Writable)");
+  assert.equal(report.candidates[2].ok, true);
+  assert.equal(report.workingCandidateName, report.candidates[2].name);
+  assert.equal(existingKeyframeObj.value, WRITE_PROBE_SENTINEL, "the existing keyframe's .value must actually have been mutated");
+});
+
+test("probeSourceTextValueShapes reports no working candidate — states clearly, not pretending — when all three grounded shapes are rejected", async () => {
+  const originalParam = fakeSourceTextParam({
+    createSetValueAction: () => { throw new Error("Illegal Parameter type"); },
+    extraMethods: { getKeyframePtr: () => ({ value: null }) },
+  });
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: () => { throw new Error("must not be called"); }, executeTransaction: () => { throw new Error("must not be called"); } };
+
+  const report = await probeSourceTextValueShapes({
+    project,
+    trackItem,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.ok(report.candidates.every((c) => !c.ok));
+  assert.equal(report.workingCandidateName, null);
+  assert.equal(report.verifiedWrite, null);
+});
+
+test("probeSourceTextValueShapes never calls createKeyframe while probing candidate shapes", async () => {
+  let createKeyframeCalled = false;
+  const originalParam = fakeSourceTextParam({
+    createSetValueAction: () => { throw new Error("Illegal Parameter type"); },
+    createKeyframe: () => { createKeyframeCalled = true; throw new Error("must never be called"); },
+  });
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: () => { throw new Error("must not be called"); }, executeTransaction: () => { throw new Error("must not be called"); } };
+
+  await probeSourceTextValueShapes({
+    project,
+    trackItem,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(createKeyframeCalled, false);
+});
+
+test("probeSourceTextValueShapes records ComponentParam metadata (constructor name, field presence) before attempting any candidate", async () => {
+  const originalParam = fakeSourceTextParam({ createSetValueAction: () => { throw new Error("Illegal Parameter type"); } });
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: () => { throw new Error("must not be called"); }, executeTransaction: () => { throw new Error("must not be called"); } };
+
+  const report = await probeSourceTextValueShapes({
+    project,
+    trackItem,
+    param: originalParam,
+    displayName: "Source Text",
+    sentinel: WRITE_PROBE_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.ok(report.metadata);
+  assert.ok("constructorName" in report.metadata);
+  assert.ok(report.metadata.fields);
+  assert.ok("matchName" in report.metadata.fields);
 });

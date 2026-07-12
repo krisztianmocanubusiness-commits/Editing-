@@ -34,9 +34,8 @@
  * against the default KERIS_CAPTION_V1_PPRO target, so a Premiere-only
  * template that doesn't have it can still show PASS.
  */
-import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
+import { requireActiveProjectAndSequence, resolveInsertionTimeSec, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, setTrackItemEnd } from "./mogrt.js";
-import { tickToSec } from "./time.js";
 import { setParamValue, coerceValue, POINT_VALUE_ENCODINGS } from "./componentParams.js";
 import { KERIS_CAPTION_V1_PPRO, KERIS_CAPTION_V1 } from "../presets/contracts/index.js";
 import { validateAgainstContract, describeCompliance, describeCompatibilityLabel } from "../presets/contractValidation.js";
@@ -60,32 +59,6 @@ const SHADOW_OPACITY_CANDIDATES = [P.shadowOpacity, "Drop Shadow Opacity"];
 // Entrance Style only exists on the fuller (After Effects) contract — this
 // is a best-effort check even against the Premiere-only default target.
 const ENTRANCE_STYLE_CANDIDATES = [P_AE.animationStyleIndex, "Animation Style"];
-
-/**
- * Best-effort playhead read. Adobe's public sample panel does not
- * demonstrate a CTI/playhead getter on Sequence, so this tries a few
- * plausible method names, logs exactly which one (if any) worked, and
- * falls back to the sequence's in-point / 0 rather than guessing silently.
- */
-async function resolveStartTimeSec(sequence, fallbackSec, log) {
-  const candidateMethods = ["getPlayerPosition", "getPlayheadPosition", "getCurrentTime"];
-  for (const name of candidateMethods) {
-    if (typeof sequence[name] !== "function") continue;
-    const result = await safeAsync(() => sequence[name]());
-    if (result.ok) {
-      const sec = tickToSec(result.value);
-      log(`Playhead resolved via sequence.${name}() → ${sec.toFixed(3)}s`, "success");
-      return sec;
-    }
-    log(`sequence.${name}() exists but threw: ${result.error.message || result.error}`, "warn");
-  }
-  log(
-    `No working playhead getter found on Sequence (tried: ${candidateMethods.join(", ")}). ` +
-      `Falling back to ${fallbackSec.toFixed(3)}s (selected range / sequence start).`,
-    "warn"
-  );
-  return fallbackSec;
-}
 
 function findByCandidates(discovered, candidateNames) {
   for (const name of candidateNames) {
@@ -227,11 +200,8 @@ export async function runSmokeTest(opts) {
     return { ok: false, step: "track" };
   }
 
-  // 3. Start time (playhead best-effort, else selected range/sequence start).
-  const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-  const fallbackStartSec = rangeResult.ok ? rangeResult.value.startSec : 0;
-  if (!rangeResult.ok) log(`getSelectedRangeSeconds() threw: ${rangeResult.error.message || rangeResult.error}`, "warn");
-  const startSec = await resolveStartTimeSec(sequence, fallbackStartSec, log);
+  // 3. Start time (playhead best-effort, else selected range/sequence start, else 0 — see resolveInsertionTimeSec()).
+  const startSec = await resolveInsertionTimeSec(sequence, log);
 
   // 4. MOGRT path.
   if (!mogrtPath) {

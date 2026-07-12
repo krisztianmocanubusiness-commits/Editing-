@@ -779,3 +779,118 @@ button/cancel-token/"Save JSON" UI. Cleanup is unconditional (the same
 `runScanWithGuaranteedCleanup` guarantee as every other diagnostic here),
 which matters even more for this one since it's the first Source Text
 diagnostic that actually mutates the sequence on a real host run.
+
+## Tenth: the -400000s insertion-time bug, and grounding Source Text's value type in official docs
+
+Two independent, unrelated findings came out of the Write-Only Probe run:
+`createSetValueAction("__KERIS_WRITE_TEST__", true)` threw **"Illegal
+Parameter type"**, and separately, `insertMogrtAt` had resolved and used an
+insertion time of **-400000 seconds**.
+
+### Part A: the -400000s insertion time
+
+**Root cause:** `sequence.getInPoint()` (or `getOutPoint()`) can return a
+TickTime representing "no in/out point set" as a huge sentinel value
+instead of 0 or throwing — resolving through `tickToSec()` to exactly
+`-400000` seconds. The math is suspicious in a way that supports this
+being a deliberate internal sentinel, not arithmetic noise: `-400000 *
+254016000000` (Premiere's documented ticks-per-second resolution) =
+`-101606400000000000` ticks, a suspiciously round tick count. The old
+`getSelectedRangeSeconds()` only checked `outSec > inSec` before trusting
+`inSec`/`outSec` as a real range — a pair of sentinels (or one sentinel
+and one real value) can still satisfy that comparison by coincidence,
+silently poisoning every downstream calculation, including where a
+temporary diagnostic MOGRT got inserted.
+
+**Fix** (`src/ppro/timelineRange.js`):
+- `isValidTimelineSeconds(sec)` (new, exported): a TickTime-derived
+  seconds value is only trustworthy if it's finite, non-negative, and
+  under a generous 7-day sane upper bound. `getSelectedRangeSeconds()` now
+  validates `inSec`/`outSec`/the sequence end time individually before
+  trusting any of them — never just the `outSec > inSec` comparison alone.
+- `resolveInsertionTimeSec(sequence, log)` (new, exported): the ONE shared
+  insertion-time resolver, in the task's exact required priority order —
+  current playhead (tried via a few plausible getter names, since Adobe's
+  public sample doesn't document a CTI getter on Sequence) → sequence
+  in-point (via the now-validated `getSelectedRangeSeconds()`) → 0
+  seconds. Every candidate, from every source, is validated before being
+  trusted. This consolidates what used to be TWO divergent, both-buggy
+  implementations — Host Smoke Test's own local playhead-first
+  `resolveStartTimeSec()` (which still fell back to the unvalidated
+  `getSelectedRangeSeconds().startSec` as its last resort) and every other
+  diagnostic's direct, playhead-blind `getSelectedRangeSeconds().startSec`
+  — into one. All five insertion call sites (Host Smoke Test, Template
+  Inspector, the Diagnostic Inspector, and all four Source Text
+  diagnostics) now call this one function.
+- `test/timelineRange.test.js` (new): unit tests reproducing the exact
+  confirmed sentinel (-400000s) as both a fake in-point and a fake
+  playhead value, confirming it's rejected and the resolver falls through
+  to the next valid source, and confirming the result is never negative
+  even when every source returns the sentinel.
+
+### Part B: what value type does Source Text's createSetValueAction actually want?
+
+Rather than guess further, this pass inspected Adobe's official public
+documentation (`AdobeDocs/uxp-premiere-pro` on GitHub — the source for
+`https://developer.adobe.com/premiere-pro/uxp/ppro_reference/`) for the
+real, documented type contract. Confirmed findings:
+
+- `ComponentParam.createSetValueAction`'s documented `inValue` parameter
+  type is `number | string | boolean | PointF | Color` — **no text or
+  rich-text wrapper class is documented anywhere in the public reference.**
+  A plain string is explicitly one of the five documented types.
+- `ComponentParam.createKeyframe(value)`: "Creates and returns a keyframe
+  initialised with the ComponentParam's type and passed in value. **This
+  throws if the passed in value is not compatible with the component
+  param type.**" This is the documented explanation for the "Illegal
+  Parameter type" error from several diagnostics ago — the value must be
+  compatible with the param's own internal type, not just "any of the
+  five generically-supported JS types".
+- `Keyframe` class: `value` property type is documented as `{value:
+  string | number | boolean | Color | PointF}`, **Writable**, min version
+  25.6. `position` is a Writable `TickTime`.
+- `PointKeyframe` class: `value` property type is `{value: PointF}` — a
+  specialized subclass exists per value *kind*, following the same
+  `{value: X}` wrapper shape as the base `Keyframe` class.
+- `ComponentParam.getKeyframePtr`: **"Get the Keyframe at the given
+  tickTime position"** — confirmed to take a `TickTime`, not an integer
+  index. The previous turn's `exploreKeyframeObject()` incorrectly
+  assumed an index; **fixed** in this pass (`getKeyframePtr` is now called
+  with the enumerated `TickTime`s from `getKeyframeListAsTickTimes()`, or
+  `TickTime.createWithSeconds(0)` as a fallback), with its tests updated
+  to match.
+- No `getKeyframeAtTime` method exists in the public docs at all — the
+  earlier host error message's "Use GetKeyframeAtTime" phrasing doesn't
+  correspond to a documented JS method name; `getKeyframePtr(tickTime)`
+  is the real one. `exploreKeyframeObject()` still defensively tries
+  `getKeyframeAtTime` if present (harmless if absent), but no longer
+  treats it as the confirmed/primary path.
+- Searching the entire public docs repo for `TextValue`, `TextDocument`,
+  and any other text-specific wrapper class returned **zero results**.
+
+### `probeSourceTextValueShapes()` — "Probe Source Text Value Shapes"
+
+New in `src/ppro/sourceTextProbe.js`, with its own button/cancel-token/
+"Save JSON" UI. Tries exactly three candidates for `createSetValueAction`'s
+`inValue`, all directly grounded in the findings above — never invented
+objects:
+
+1. A raw string — the documented type. Re-tried here for one complete,
+   consolidated record (already confirmed to fail on a real host).
+2. `{value: sentinel}` — the documented `Keyframe.value` wrapper *shape*,
+   tried directly as `inValue`.
+3. An existing `Keyframe` fetched via `getKeyframePtr(TickTime)`, with its
+   documented-Writable `.value` mutated to the sentinel directly —
+   sidesteps `createKeyframe()`'s "compatible with the component param
+   type" check entirely.
+
+Whichever candidate first succeeds at *constructing* an action is also
+*executed* (via `runTransaction()`) and verified with one best-effort
+automated read-back against a **freshly re-acquired** param (never the
+pre-write reference). If none of the three succeed, the diagnostic states
+that plainly rather than pretending: per the official docs, no
+constructible text/rich-text value type exists for `ComponentParam` at
+all, so if none of these three grounded candidates work, writing native
+Premiere MOGRT Source Text is not currently supported through this
+documented UXP scripting API surface — the caption-generation feature
+cannot yet be safely connected to it.

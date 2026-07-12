@@ -22,7 +22,7 @@
  */
 import { getPpro } from "./client.js";
 import { tickToSec } from "./time.js";
-import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
+import { requireActiveProjectAndSequence, resolveInsertionTimeSec, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
 import { safe, safeAsync, safeResolve, isPromiseLike, resolveHostValueDetailed } from "./introspect.js";
 import { summarizeHostValue, unwrapValueDeep, createScanBudget, probeObjectShape, PROBE_CALL_TIMEOUT_MS } from "./deepProbe.js";
@@ -415,22 +415,33 @@ export async function exploreKeyframeObject(param, ppro, trackItem, log, budget)
 
   const explorations = [];
 
+  // CONFIRMED (Adobe's official docs, AdobeDocs/uxp-premiere-pro
+  // src/pages/ppro-reference/classes/componentparam.md): "getKeyframePtr —
+  // Get the Keyframe at the given tickTime position" — this takes a
+  // TickTime, NOT an integer index (an earlier version of this function
+  // incorrectly assumed an index; fixed here once the official docs were
+  // actually checked). Falls back to TickTime.createWithSeconds(0) if no
+  // keyframe times were enumerated.
   const hasPtr = safe(() => typeof param.getKeyframePtr).value === "function";
   log(`[exploreKeyframe] getKeyframePtr: typeof=${hasPtr ? "function" : "undefined"}`, "info");
   if (hasPtr) {
-    const indices = keyframeTimes.length > 0 ? keyframeTimes.map((_, i) => i) : [0];
-    for (const i of indices) {
+    let ptrTimeCandidates = keyframeTimes.map((t, i) => ({ label: `enumerated keyframe time [${i}]`, time: t }));
+    if (ptrTimeCandidates.length === 0) {
+      const zeroResult = await safeResolve(() => ppro.TickTime.createWithSeconds(0), { log, label: "TickTime.createWithSeconds(0) (getKeyframePtr fallback)" });
+      if (zeroResult.ok) ptrTimeCandidates = [{ label: "TickTime.createWithSeconds(0)", time: zeroResult.value }];
+    }
+    for (const { label: timeLabel, time } of ptrTimeCandidates) {
       if (budget && budget.isExpired()) break;
       // eslint-disable-next-line no-await-in-loop
-      const ptrResult = await safeResolve(() => param.getKeyframePtr(i), { log, label: `getKeyframePtr(${i})`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
+      const ptrResult = await safeResolve(() => param.getKeyframePtr(time), { log, label: `getKeyframePtr(${timeLabel})`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
       if (ptrResult.ok && ptrResult.value !== null && ptrResult.value !== undefined) {
         // eslint-disable-next-line no-await-in-loop
-        const dump = await dumpKeyframeObjectShape(ptrResult.value, `getKeyframePtr(${i})`, log, budget);
-        explorations.push({ method: "getKeyframePtr", args: `(${i})`, ok: true, ...dump });
+        const dump = await dumpKeyframeObjectShape(ptrResult.value, `getKeyframePtr(${timeLabel})`, log, budget);
+        explorations.push({ method: "getKeyframePtr", args: `(${timeLabel})`, ok: true, ...dump });
       } else {
         explorations.push({
           method: "getKeyframePtr",
-          args: `(${i})`,
+          args: `(${timeLabel})`,
           ok: false,
           timedOut: Boolean(ptrResult.timedOut),
           error: ptrResult.timedOut ? "timed out" : String(ptrResult.error?.message || ptrResult.error || "returned null/undefined"),
@@ -655,6 +666,247 @@ export async function runWriteOnlyProbe({ project, trackItem, componentIndex, pa
     },
     manualVisualConfirmationNeeded: !automatedCheckConfirmsChange,
     outcome: automatedCheckConfirmsChange ? "write-succeeded-and-confirmed" : "write-api-succeeded-visible-change-unconfirmed",
+  };
+}
+
+/**
+ * Reads whatever metadata is actually available on the ComponentParam
+ * itself — Part B's "value type / param type / data type / class name /
+ * matchName / serialization hints" — before attempting any value-shape
+ * candidate. Purely observational, never mutating.
+ */
+async function inspectParamMetadata(param, log, budget) {
+  const shape = await probeObjectShape(param, "sourceTextParam (metadata)", log, budget);
+  const candidateFieldNames = ["type", "paramType", "dataType", "valueType", "matchName"];
+  const fields = {};
+  for (const name of candidateFieldNames) {
+    const raw = safe(() => param[name]);
+    if (!raw.ok) {
+      fields[name] = { present: false };
+      continue;
+    }
+    fields[name] = { present: raw.value !== undefined, typeofValue: typeof raw.value, summary: raw.value !== undefined ? summarizeHostValue(raw.value) : null };
+  }
+  const jsonResult = safe(() => JSON.stringify(param));
+  log(
+    `[probeValueShapes] param metadata — constructor=${shape.constructorName ?? "n/a"}, ` +
+      `fields checked: ${candidateFieldNames.map((n) => `${n}=${fields[n].present ? "present" : "absent"}`).join(", ")}, ` +
+      `JSON.stringify ${jsonResult.ok ? "succeeded" : `threw (${jsonResult.error.message || jsonResult.error})`}`,
+    "info"
+  );
+  return {
+    constructorName: shape.constructorName,
+    prototypeMethodNames: shape.prototypeMethodNames,
+    prototypeNonMethodNames: shape.prototypeNonMethodNames,
+    fields,
+    jsonSerialization: jsonResult.ok ? jsonResult.value : null,
+    jsonSerializationError: jsonResult.ok ? null : String(jsonResult.error.message || jsonResult.error),
+  };
+}
+
+/**
+ * Fetches an existing Keyframe object via `getKeyframePtr(TickTime)` —
+ * CONFIRMED (Adobe's official docs) to take a TickTime, not an index —
+ * for candidate 3 below: mutating its documented-Writable `.value`
+ * property directly, sidestepping `createKeyframe()`'s "compatible with
+ * the component param type" check (the confirmed source of "Illegal
+ * Parameter type" for a bare string on this param).
+ */
+async function fetchExistingKeyframeObject(param, ppro, log) {
+  if (safe(() => typeof param.getKeyframePtr).value !== "function") {
+    return { ok: false, error: "getKeyframePtr not present on this ComponentParam" };
+  }
+  const timeResult = await safeResolve(() => ppro.TickTime.createWithSeconds(0), { log, label: "TickTime.createWithSeconds(0) (value-shapes probe)" });
+  if (!timeResult.ok) {
+    return { ok: false, error: "couldn't construct a TickTime" };
+  }
+  const ptrResult = await safeResolve(() => param.getKeyframePtr(timeResult.value), { log, label: "getKeyframePtr(0) (value-shapes probe)", timeoutMs: PROBE_CALL_TIMEOUT_MS });
+  if (!ptrResult.ok || ptrResult.value === null || ptrResult.value === undefined) {
+    return { ok: false, error: ptrResult.timedOut ? "timed out" : String(ptrResult.error?.message || ptrResult.error || "returned null/undefined") };
+  }
+  return { ok: true, value: ptrResult.value };
+}
+
+/**
+ * Attempts `param.createSetValueAction(value, true)` for exactly one
+ * candidate value shape, logging the shape tried and the host's exact
+ * response (success + action constructor, or the full thrown error).
+ * Never executes the resulting action — that's the caller's job, only for
+ * whichever candidate(s) actually succeed at construction.
+ */
+async function tryCreateSetValueActionCandidate(param, candidateName, buildValue, log, budget) {
+  if (budget && budget.isExpired()) return { name: candidateName, attempted: false, ok: false, skipped: true, reason: budget.reason() };
+
+  const valueResult = safe(buildValue);
+  if (!valueResult.ok || valueResult.value === undefined) {
+    const reason = valueResult.ok ? "buildValue returned undefined" : String(valueResult.error.message || valueResult.error);
+    log(`[probeValueShapes] ${candidateName}: couldn't build this candidate value (${reason}) — skipping.`, "warn");
+    return { name: candidateName, attempted: false, ok: false, error: reason };
+  }
+  const value = valueResult.value;
+  const valueSummary = summarizeHostValue(value);
+  log(`[probeValueShapes] trying ${candidateName} — value shape: ${JSON.stringify(valueSummary)}`, "info");
+
+  const actionResult = await safeResolve(() => param.createSetValueAction(value, true), {
+    log,
+    label: `createSetValueAction(${candidateName}, true)`,
+    timeoutMs: PROBE_CALL_TIMEOUT_MS,
+  });
+  if (!actionResult.ok) {
+    const error = actionResult.timedOut ? "timed out" : String(actionResult.error?.message || actionResult.error);
+    log(`✗ ${candidateName}: createSetValueAction threw: ${error}`, "warn");
+    return { name: candidateName, attempted: true, ok: false, valueSummary, error };
+  }
+  const constructorResult = await safeResolve(() => actionResult.value?.constructor?.name, { log, label: `createSetValueAction(${candidateName}).constructor` });
+  const actionConstructorName = (constructorResult.ok && constructorResult.value) || null;
+  log(`✓ ${candidateName}: createSetValueAction SUCCEEDED (constructor: ${actionConstructorName ?? "n/a"}).`, "success");
+  return { name: candidateName, attempted: true, ok: true, valueSummary, action: actionResult.value, actionConstructorName };
+}
+
+/**
+ * "Probe Source Text Value Shapes" — tests ONLY value shapes grounded in
+ * Adobe's official ComponentParam/Keyframe/PointKeyframe documentation
+ * (AdobeDocs/uxp-premiere-pro), never invented/random objects, per the
+ * explicit task requirement. Grounding, verified against the current
+ * public docs:
+ *
+ *   - `ComponentParam.createSetValueAction`'s documented `inValue` type is
+ *     `number | string | boolean | PointF | Color` — no text/rich-text
+ *     wrapper class is documented anywhere in the public reference.
+ *   - `Keyframe.value` is documented as
+ *     `{ value: string | number | boolean | Color | PointF }`, Writable.
+ *   - `PointKeyframe.value` is documented as `{ value: PointF }` — a
+ *     specialized subclass exists per value KIND, following the same
+ *     `{ value: X }` wrapper shape.
+ *   - `getKeyframePtr(tickTime)` is documented to return the Keyframe at a
+ *     given TickTime.
+ *
+ * Three candidates follow directly from this, and only these three:
+ *
+ *   1. Raw string — the documented `inValue` type. Already confirmed to
+ *      throw "Illegal Parameter type" on a real host for this param;
+ *      re-tried here for one complete, consolidated record.
+ *   2. `{ value: sentinel }` — the documented Keyframe/PointKeyframe
+ *      wrapper SHAPE, tried directly as `inValue` in case the same
+ *      wrapper form `createSetValueAction` ultimately serializes a
+ *      Keyframe's `.value` into is also accepted directly.
+ *   3. An EXISTING Keyframe object (via `getKeyframePtr`), with its
+ *      documented-Writable `.value` mutated to the sentinel, then passed
+ *      as `inValue` directly — sidesteps `createKeyframe()`'s "compatible
+ *      with the component param type" check entirely.
+ *
+ * For whichever candidate(s) successfully construct an action (i.e. the
+ * host accepted the value's type), the FIRST such candidate is also
+ * executed via `runTransaction()` and given one best-effort automated
+ * read-back check (reusing `readSourceTextValueOnly()`), so a viable
+ * shape is fully verified, not just "didn't throw at construction time".
+ *
+ * @param {Object} args
+ * @param {import("@adobe/premierepro").Project} args.project
+ * @param {import("@adobe/premierepro").TrackItem} args.trackItem
+ * @param {*} args.param
+ * @param {string} args.displayName
+ * @param {string} args.sentinel
+ * @param {(message: string, level?: string) => void} args.log
+ * @param {ReturnType<typeof createScanBudget>} [args.budget]
+ * @param {*} args.ppro
+ */
+export async function probeSourceTextValueShapes({ project, trackItem, param, displayName, sentinel, log, budget, ppro }) {
+  log("[stage] probing Source Text value shapes — ONLY candidates grounded in Adobe's official docs, never random objects…", "info");
+
+  const metadata = await inspectParamMetadata(param, log, budget);
+
+  const candidates = [];
+  candidates.push(
+    await tryCreateSetValueActionCandidate(param, "raw string (documented createSetValueAction inValue type)", () => sentinel, log, budget)
+  );
+  candidates.push(
+    await tryCreateSetValueActionCandidate(
+      param,
+      "{ value: sentinel } (Keyframe.value's documented wrapper shape)",
+      () => ({ value: sentinel }),
+      log,
+      budget
+    )
+  );
+
+  const existingKeyframe = await fetchExistingKeyframeObject(param, ppro, log);
+  if (existingKeyframe.ok) {
+    candidates.push(
+      await tryCreateSetValueActionCandidate(
+        param,
+        "existing Keyframe (getKeyframePtr) with .value mutated directly (documented Writable)",
+        () => {
+          const kf = existingKeyframe.value;
+          const setResult = safe(() => {
+            kf.value = sentinel;
+          });
+          return setResult.ok ? kf : undefined;
+        },
+        log,
+        budget
+      )
+    );
+  } else {
+    log(`[probeValueShapes] couldn't obtain an existing Keyframe via getKeyframePtr — skipping candidate 3: ${existingKeyframe.error}`, "warn");
+    candidates.push({
+      name: "existing Keyframe (getKeyframePtr) with .value mutated directly (documented Writable)",
+      attempted: false,
+      ok: false,
+      error: existingKeyframe.error,
+    });
+  }
+
+  const workingCandidate = candidates.find((c) => c.ok);
+  let verifiedWrite = null;
+
+  if (workingCandidate) {
+    log(`[stage] "${workingCandidate.name}" constructed an action successfully — executing the transaction to verify…`, "info");
+    const transaction = runTransaction(project, workingCandidate.action, displayName, log, `Probe Source Text value shapes (${workingCandidate.name})`);
+    if (transaction.ok) {
+      await new Promise((resolve) => setTimeout(resolve, READ_BACK_SETTLE_DELAY_MS));
+      // Reacquire fresh — never reuse the pre-write Component/ComponentParam
+      // reference, same discipline as every other write-verification path
+      // in this module (readBackSourceText, runWriteOnlyProbe).
+      const chainResult = await safeResolve(() => trackItem.getComponentChain(), { log, label: "getComponentChain() (value-shapes probe reacquire)" });
+      const freshTextInfo = chainResult.ok && chainResult.value ? (await locateTextComponent(chainResult.value, log)).textInfo : null;
+      const freshLocated = freshTextInfo ? await locateSourceTextParam(freshTextInfo.component, freshTextInfo.componentIndex, log) : null;
+      if (freshLocated) {
+        const bestEffortRead = await readSourceTextValueOnly(freshLocated.param, ppro, trackItem, log, budget);
+        verifiedWrite = { transaction, automatedCheckConfirmsChange: bestEffortRead.resolvedValue === sentinel, bestEffortRead };
+      } else {
+        log("✗ Couldn't reacquire Source Text fresh after the write — automated check skipped.", "warn");
+        verifiedWrite = { transaction, automatedCheckConfirmsChange: false, bestEffortRead: null, reacquireFailed: true };
+      }
+    } else {
+      verifiedWrite = { transaction, automatedCheckConfirmsChange: false, bestEffortRead: null };
+    }
+  }
+
+  // Strip live host handles before returning a JSON-safe report.
+  const candidatesSafe = candidates.map(({ action: _action, ...rest }) => rest);
+
+  if (workingCandidate) {
+    log(
+      verifiedWrite?.automatedCheckConfirmsChange
+        ? `✓ Found a working Source Text value shape: "${workingCandidate.name}" — transaction executed and the automated check confirms it.`
+        : `⚠ "${workingCandidate.name}" constructed and executed a transaction, but the automated check couldn't confirm the visible change.`,
+      verifiedWrite?.automatedCheckConfirmsChange ? "success" : "warn"
+    );
+  } else {
+    log(
+      "✗ None of the documented value shapes were accepted by createSetValueAction for this param. Per Adobe's public reference, no " +
+        "text/rich-text wrapper type is documented for ComponentParam at all — if none of these three grounded candidates work, this " +
+        "strongly suggests writing native Premiere MOGRT Source Text is not currently supported through the documented UXP scripting API.",
+      "error"
+    );
+  }
+
+  return {
+    metadata,
+    candidates: candidatesSafe,
+    workingCandidateName: workingCandidate ? workingCandidate.name : null,
+    verifiedWrite,
   };
 }
 
@@ -968,8 +1220,7 @@ export async function testSourceTextRoundTrip(opts) {
     }
     const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
 
-    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+    const startSec = await resolveInsertionTimeSec(sequence, log);
 
     log(`[stage] inserting clip from: ${mogrtPath}`, "info");
     const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
@@ -1159,8 +1410,7 @@ export async function testReadSourceTextOnly(opts) {
     }
     const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
 
-    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+    const startSec = await resolveInsertionTimeSec(sequence, log);
 
     log(`[stage] inserting clip from: ${mogrtPath}`, "info");
     const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
@@ -1321,8 +1571,7 @@ export async function testExploreKeyframeObject(opts) {
     }
     const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
 
-    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+    const startSec = await resolveInsertionTimeSec(sequence, log);
 
     log(`[stage] inserting clip from: ${mogrtPath}`, "info");
     const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
@@ -1485,8 +1734,7 @@ export async function testWriteOnlyProbe(opts) {
     }
     const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
 
-    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
-    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+    const startSec = await resolveInsertionTimeSec(sequence, log);
 
     log(`[stage] inserting clip from: ${mogrtPath}`, "info");
     const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
@@ -1581,5 +1829,164 @@ export async function testWriteOnlyProbe(opts) {
     return { ok: true, found: true, writeProbe: report.writeProbe, componentDiscoveryTimeline: report.componentDiscoveryTimeline, cleanupOk };
   } finally {
     if (activeWriteOnlyProbeCancelToken === cancelToken) activeWriteOnlyProbeCancelToken = null;
+  }
+}
+
+// Separate cancel-token slot from the other four entry points', for the
+// same reason they're separate from each other.
+let activeValueShapesCancelToken = null;
+
+export function cancelActiveValueShapesProbe() {
+  if (activeValueShapesCancelToken) {
+    activeValueShapesCancelToken.cancelled = true;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Dedicated entry point for `probeSourceTextValueShapes()`: insert a
+ * temporary clip, wait for its component chain to stabilize, locate
+ * Source Text, run the value-shapes probe, clean up the temporary clip
+ * (ALWAYS — this probe can execute a real transaction for whichever
+ * candidate succeeds), and return a JSON-safe report.
+ *
+ * @param {Object} opts
+ * @param {string} opts.mogrtPath
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {string} [opts.sentinel]
+ * @param {number} [opts.scanBudgetMs]
+ */
+export async function testProbeSourceTextValueShapes(opts) {
+  const { mogrtPath, log, sentinel = WRITE_PROBE_SENTINEL, scanBudgetMs = DEFAULT_ROUND_TRIP_BUDGET_MS } = opts;
+
+  log("════ Probe Source Text Value Shapes — start ════", "info");
+
+  if (!mogrtPath) {
+    log("✗ No .mogrt selected.", "error");
+    return { ok: false, step: "mogrt-path" };
+  }
+
+  const cancelToken = { cancelled: false };
+  activeValueShapesCancelToken = cancelToken;
+
+  try {
+    let project, sequence;
+    try {
+      ({ project, sequence } = await requireActiveProjectAndSequence());
+    } catch (err) {
+      log(`✗ No active project/sequence: ${err.message || err}`, "error");
+      return { ok: false, step: "sequence" };
+    }
+
+    const tracksResult = await safeAsync(() => listVideoTracks(sequence));
+    if (!tracksResult.ok || tracksResult.value.length === 0) {
+      log(
+        tracksResult.ok
+          ? "✗ No video track available to insert a temporary inspection clip onto."
+          : `✗ listVideoTracks() threw: ${tracksResult.error.message || tracksResult.error}`,
+        "error"
+      );
+      return { ok: false, step: "track" };
+    }
+    const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
+
+    const startSec = await resolveInsertionTimeSec(sequence, log);
+
+    log(`[stage] inserting clip from: ${mogrtPath}`, "info");
+    const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
+    if (!insertResult.ok) {
+      log(`✗ Couldn't insert this .mogrt: ${insertResult.error.message || insertResult.error}`, "error");
+      return { ok: false, step: "insert" };
+    }
+    const trackItem = insertResult.value;
+    log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
+
+    const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
+      async () => {
+        log("[stage] waiting for MOGRT components to finish initializing…", "info");
+        const stabilization = await stabilizeComponentChain(trackItem, log, { cancelToken });
+        const textInfo = stabilization.discovery.components.find((c) => c.classification === "text-editing");
+
+        if (!textInfo) {
+          log(`${MOGRT_INIT_TIMEOUT_MESSAGE} No AE.ADBE Text component found — cannot probe Source Text this run.`, "warn");
+          return { found: false, reason: "no-text-component", componentDiscoveryTimeline: stabilization.timeline };
+        }
+
+        log(`[stage] AE.ADBE Text found at index ${textInfo.componentIndex} — locating Source Text by displayName…`, "info");
+        const located = await locateSourceTextParam(textInfo.component, textInfo.componentIndex, log);
+        if (!located) {
+          log('✗ No param with displayName exactly "Source Text" was found on the AE.ADBE Text component.', "error");
+          return {
+            found: false,
+            reason: "no-source-text-param",
+            componentDiscoveryTimeline: stabilization.timeline,
+            componentIndex: textInfo.componentIndex,
+          };
+        }
+
+        const probeBudget = createScanBudget({ totalMs: scanBudgetMs, cancelToken });
+        const valueShapesProbe = await probeSourceTextValueShapes({
+          project,
+          trackItem,
+          param: located.param,
+          displayName: located.displayName,
+          sentinel,
+          log,
+          budget: probeBudget,
+          ppro: getPpro(),
+        });
+
+        return {
+          found: true,
+          componentIndex: textInfo.componentIndex,
+          paramIndex: located.paramIndex,
+          displayName: located.displayName,
+          valueShapesProbe,
+          componentDiscoveryTimeline: stabilization.timeline,
+        };
+      },
+      () => {
+        log("[stage] cleaning up (removing temporary inspection clip)…", "info");
+        return safeAsync(() => removeTrackItem(project, sequence, trackItem));
+      },
+      log
+    );
+
+    const cleanupOk = cleanupResult.ok && cleanupResult.value === true;
+    if (cleanupResult.ok && cleanupResult.value) {
+      log("Removed temporary inspection clip.", "info");
+    } else {
+      log(
+        `Couldn't remove the temporary inspection clip (${
+          cleanupResult.ok ? "transaction reported failure" : cleanupResult.error.message || cleanupResult.error
+        }) — you may need to delete it from the timeline by hand.`,
+        "warn"
+      );
+    }
+
+    if (scanError) {
+      log("════ Probe Source Text Value Shapes — finished with errors (cleanup still ran) ════", "error");
+      return { ok: false, step: "scan", error: String(scanError.message || scanError), cleanupOk, componentDiscoveryTimeline: [] };
+    }
+
+    const report = scanReport ?? { found: false, reason: "crash", componentDiscoveryTimeline: [] };
+
+    if (!report.found) {
+      log("════ Probe Source Text Value Shapes — finished (Source Text not found this run) ════", "warn");
+      return { ok: true, found: false, reason: report.reason, componentDiscoveryTimeline: report.componentDiscoveryTimeline, cleanupOk };
+    }
+
+    const success = Boolean(report.valueShapesProbe?.verifiedWrite?.automatedCheckConfirmsChange);
+    log(
+      success
+        ? `════ Probe Source Text Value Shapes — finished: SUCCESS via "${report.valueShapesProbe.workingCandidateName}" ════`
+        : "════ Probe Source Text Value Shapes — finished (no documented value shape was confirmed — see valueShapesProbe) ════",
+      success ? "success" : "warn"
+    );
+
+    return { ok: true, found: true, valueShapesProbe: report.valueShapesProbe, componentDiscoveryTimeline: report.componentDiscoveryTimeline, cleanupOk };
+  } finally {
+    if (activeValueShapesCancelToken === cancelToken) activeValueShapesCancelToken = null;
   }
 }

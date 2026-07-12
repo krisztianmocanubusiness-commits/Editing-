@@ -81,5 +81,7 @@ export const store = createStore({
     lastDiagnostic: null, // full diagnoseMogrt() return value, or null — see src/ppro/diagnostics.js
     sourceTextRoundTripRunning: false,
     lastSourceTextRoundTrip: null, // full testSourceTextRoundTrip() return value, or null — see src/ppro/sourceTextProbe.js
+    readSourceTextOnlyRunning: false,
+    lastReadSourceTextOnly: null, // full testReadSourceTextOnly() return value, or null — see src/ppro/sourceTextProbe.js
   },
 });

@@ -604,3 +604,78 @@ their arguments:
   `sourceTextProbe.js`'s `insertMogrtAt(...)` call has the exact same
   argument shape as `diagnostics.js`'s, and that no caller invokes
   `insertMogrtFromPath` directly (only `insertMogrtAt()` may).
+
+## Seventh real host run: Source Text found, but `createKeyframe` threw "Illegal Parameter type"
+
+With insertion fixed, a real host run reached Source Text itself:
+
+```
+AE.ADBE Text found (component 3), Source Text param at index 0
+isTimeVarying: false
+areKeyframesSupported: false
+```
+
+Outcome: every `getValueAtTime(TickTime)` read attempt failed, and
+`createKeyframe("KERIS_DIAGNOSTIC_SENTINEL")` threw **"Illegal Parameter
+type"**.
+
+**Root cause: the read/write strategy was keyframe-and-time-based by
+default, for a param that explicitly reports it is neither.** A param
+with `areKeyframesSupported: false` isn't just "keyframable but currently
+has no keyframes" — the API is telling us `createKeyframe` is not a valid
+operation for this param type at all, and (per this run) `getValueAtTime`
+doesn't work for it either. Treating those as the primary read/write path
+for a non-time-varying param was the wrong strategy from the start.
+
+### The fix: `readSourceTextValueOnly()` — non-keyframed value getters first
+
+New in `src/ppro/sourceTextProbe.js`, and the diagnostic every write
+attempt now runs first before touching `createKeyframe` at all:
+
+1. **`getValue()`** — the documented current-value getter for a
+   non-time-varying param, tried first and explicitly by name.
+2. **`.value`** as a plain property — some param types may expose it
+   directly, no method call needed.
+3. **`getStartValue()`** — already known to return `null` for Source Text;
+   re-checked here for one complete dump alongside everything else.
+4. **Reflection-discovered getters**: `probeObjectShape()` (already used
+   elsewhere in this module) lists every method on the param's prototype
+   chain; any name containing "value" that isn't a keyframe/`AtTime`/
+   `create`/`set`/`find` method is tried too — covers "any documented
+   current-value getter" without hardcoding an exhaustive guess list, and
+   without ever accidentally calling a mutating method just because its
+   name happens to contain "value" (e.g. a hypothetical `setValue`).
+5. **`getValueAtTime(TickTime)`** — kept, but demoted from "the" read
+   path to just one more attempt among several; always called with a
+   real, valid `TickTime`, never bare.
+
+Every attempt logs, per the task requirement: `typeof` the member, the
+exact arguments passed (always none — every candidate is a zero-arg
+getter or a plain property), the raw returned value's Promise-ness, the
+resolved value's shape (`summarizeHostValue`), the deeply-unwrapped
+`resolvedValue` (`unwrapValueDeep`), and — when the resolved value is
+itself a wrapper object (e.g. a `Keyframe`-shaped `{ value: X }`) — that
+wrapper's own full prototype/property shape (`probeObjectShape` run on
+the *result*, not just a summary of it).
+
+**`createKeyframe` is now never called when `areKeyframesSupported` is
+confirmed `false`.** `runSourceTextRoundTrip()` gates its keyframe step:
+`skipped: true, reason: "areKeyframesSupported is false"` instead of
+attempting it and getting an "Illegal Parameter type" host error. Only
+skipped on a confirmed `false` — if the flag couldn't be read
+(`null`/`undefined`), the write path is still attempted as before.
+
+### New: "Read Source Text Only" — a dedicated read-before-write diagnostic
+
+`testReadSourceTextOnly()` — a new top-level entry point, separate from
+the full round trip, with its own button/cancel-token/"Save JSON" UI —
+does the same insert → stabilize → locate → cleanup cycle but calls
+`readSourceTextValueOnly()` and stops there: it never calls
+`createKeyframe`, `createSetValueAction`, or `executeTransaction`. Meant
+to be run first, before ever attempting a write, exactly the sequence
+this bug report needed but the tooling didn't previously offer.
+
+`runSourceTextRoundTrip()`'s own read step was also swapped from the old,
+narrower `readSourceTextAttempts()` (bare `getValueAtTime` calls only) to
+this same richer `readSourceTextValueOnly()` — its report field is now
+named `valueRead` (was `readAttempts`).

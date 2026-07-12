@@ -24,8 +24,8 @@ import { getPpro } from "./client.js";
 import { tickToSec } from "./time.js";
 import { requireActiveProjectAndSequence, getSelectedRangeSeconds, listVideoTracks } from "./timelineRange.js";
 import { insertMogrtAt, removeTrackItem } from "./mogrt.js";
-import { safe, safeAsync, safeResolve } from "./introspect.js";
-import { summarizeHostValue, unwrapValueDeep, createScanBudget, PROBE_CALL_TIMEOUT_MS } from "./deepProbe.js";
+import { safe, safeAsync, safeResolve, isPromiseLike, resolveHostValueDetailed } from "./introspect.js";
+import { summarizeHostValue, unwrapValueDeep, createScanBudget, probeObjectShape, PROBE_CALL_TIMEOUT_MS } from "./deepProbe.js";
 import {
   discoverComponents,
   readDisplayName,
@@ -145,6 +145,150 @@ export async function readSourceTextAttempts(trackItem, param, ppro, log, budget
     results.push({ label: attempt.label, ok: true, rawSummary, resolvedValue });
   }
   return results;
+}
+
+const VALUE_GETTER_NAME_PATTERN = /value/i;
+const VALUE_GETTER_EXCLUDE_PATTERNS = [/AtTime$/i, /Keyframe/i, /^create/i, /^set/i, /^find/i];
+
+/** A method name that looks like a plain, non-keyframed, non-time-based value getter by name alone. */
+function isPlausibleValueGetterMethod(name) {
+  if (!VALUE_GETTER_NAME_PATTERN.test(name)) return false;
+  return !VALUE_GETTER_EXCLUDE_PATTERNS.some((re) => re.test(name));
+}
+
+/**
+ * Attempts exactly one read — a zero-argument method call or a plain
+ * property access — on `param`, logging every axis the task requires:
+ * `typeof` the member, the exact arguments passed (always none — every
+ * candidate here is either a zero-arg getter method or a plain property),
+ * the raw returned value's Promise-ness, the resolved value's shape
+ * (`summarizeHostValue`), the deeply-unwrapped `resolvedValue`, and — when
+ * the resolved value is itself a wrapper object — that wrapper's own full
+ * prototype/property shape (`probeObjectShape`), not just a summary.
+ * Never throws, never calls anything that could mutate the sequence.
+ */
+async function attemptRead({ param, name, kind, log, budget }) {
+  if (budget && budget.isExpired()) {
+    return { name, kind, skipped: true, reason: budget.reason() };
+  }
+  const typeofMember = safe(() => typeof param[name]).value ?? "undefined";
+  log(`[readSourceTextOnly] ${name} (${kind}): typeof=${typeofMember}, args=()`, "info");
+
+  if (kind === "method" && typeofMember !== "function") {
+    return { name, kind, typeofMember, ok: false, error: "not a function on this ComponentParam" };
+  }
+
+  const raw = safe(() => (kind === "method" ? param[name]() : param[name]));
+  if (!raw.ok) {
+    log(`[readSourceTextOnly] ${name} threw synchronously: ${raw.error.message || raw.error}`, "warn");
+    return { name, kind, typeofMember, ok: false, threwSynchronously: true, error: String(raw.error.message || raw.error) };
+  }
+
+  const isPromise = isPromiseLike(raw.value);
+  log(`[readSourceTextOnly] ${name}: raw isPromise=${isPromise}`, "info");
+
+  const resolved = await resolveHostValueDetailed(raw.value, { log, label: `sourceTextParam.${name}`, timeoutMs: PROBE_CALL_TIMEOUT_MS });
+  if (!resolved.ok) {
+    return {
+      name,
+      kind,
+      typeofMember,
+      ok: false,
+      isPromise,
+      timedOut: Boolean(resolved.timedOut),
+      error: resolved.timedOut ? "timed out" : String(resolved.error?.message || resolved.error),
+    };
+  }
+
+  const rawSummary = summarizeHostValue(resolved.value);
+  const resolvedValue = await unwrapValueDeep(resolved.value, log, { label: `sourceTextParam.${name}` });
+  const wrapperShape =
+    resolved.value !== null && typeof resolved.value === "object"
+      ? await probeObjectShape(resolved.value, `sourceTextParam.${name}() result`, log, budget)
+      : null;
+
+  log(
+    `[readSourceTextOnly] ${name} resolved: ${JSON.stringify(resolvedValue)} (raw kind: ${rawSummary.kind})`,
+    resolvedValue !== null && resolvedValue !== undefined ? "success" : "warn"
+  );
+
+  return { name, kind, typeofMember, ok: true, isPromise, rawSummary, resolvedValue, wrapperShape };
+}
+
+/**
+ * Dedicated READ-ONLY diagnostic for Source Text — never calls
+ * `createKeyframe` or anything else that could mutate the sequence. Built
+ * because a confirmed real-host run showed the old, keyframe-first read
+ * strategy failing outright: `createKeyframe(sentinel)` threw "Illegal
+ * Parameter type" for a param that reports `areKeyframesSupported: false`
+ * — the API telling us plainly this param isn't keyframe-based, so
+ * treating a time-based/keyframe-shaped read as the primary path was the
+ * wrong strategy for a non-time-varying param.
+ *
+ * Tries, in order, every plausible non-keyframed value getter:
+ *   1. `getValue()` — the documented current-value getter for a
+ *      non-time-varying param, tried first and explicitly by name.
+ *   2. `.value` as a plain property (some param types may expose it
+ *      directly, no method call needed).
+ *   3. `getStartValue()` — already known from earlier runs to return
+ *      `null` for Source Text; re-checked here for one complete dump.
+ *   4. Every OTHER method discovered on the param's prototype chain whose
+ *      name contains "value" and isn't a keyframe/AtTime/create/set/find
+ *      method — covers "any documented current-value getter" without
+ *      hardcoding an exhaustive guess list.
+ *   5. `getValueAtTime(TickTime)` — kept, but demoted to just one more
+ *      attempt among several rather than the primary strategy; always
+ *      called with a real, valid TickTime, never bare.
+ *
+ * @param {*} param
+ * @param {*} ppro
+ * @param {import("@adobe/premierepro").TrackItem} trackItem
+ * @param {(message: string, level?: string) => void} log
+ * @param {ReturnType<typeof createScanBudget>} [budget]
+ */
+export async function readSourceTextValueOnly(param, ppro, trackItem, log, budget) {
+  log("[stage] reading Source Text via non-keyframed value getters (createKeyframe is never called here)…", "info");
+
+  const paramShape = await probeObjectShape(param, "sourceTextParam", log, budget);
+  log(
+    `[readSourceTextOnly] ComponentParam prototype methods: ${(paramShape.prototypeMethodNames ?? []).join(", ") || "(none discovered)"}`,
+    "info"
+  );
+
+  const attempts = [];
+  const tried = new Set();
+
+  attempts.push(await attemptRead({ param, name: "getValue", kind: "method", log, budget }));
+  tried.add("getValue");
+
+  attempts.push(await attemptRead({ param, name: "value", kind: "property", log, budget }));
+  tried.add("value");
+
+  attempts.push(await attemptRead({ param, name: "getStartValue", kind: "method", log, budget }));
+  tried.add("getStartValue");
+
+  const discoveredNames = (paramShape.prototypeMethodNames ?? []).filter((name) => isPlausibleValueGetterMethod(name) && !tried.has(name));
+  for (const name of discoveredNames) {
+    // eslint-disable-next-line no-await-in-loop
+    attempts.push(await attemptRead({ param, name, kind: "method", log, budget }));
+    tried.add(name);
+  }
+
+  log("[stage] also trying getValueAtTime(TickTime) — kept as a fallback, never prioritized or called bare…", "info");
+  const getValueAtTimeAttempts = await readSourceTextAttempts(trackItem, param, ppro, log, budget);
+
+  const workingValueAttempt = attempts.find((a) => a.ok && a.resolvedValue !== null && a.resolvedValue !== undefined);
+  const workingTimeAttempt = getValueAtTimeAttempts.find((a) => a.ok && a.resolvedValue !== null && a.resolvedValue !== undefined);
+  const workingMethod = workingValueAttempt ? workingValueAttempt.name : workingTimeAttempt ? "getValueAtTime" : null;
+  const resolvedValue = workingValueAttempt ? workingValueAttempt.resolvedValue : workingTimeAttempt ? workingTimeAttempt.resolvedValue : null;
+
+  if (workingMethod) {
+    log(`✓ Source Text read successfully via ${workingMethod}(): ${JSON.stringify(resolvedValue)}`, "success");
+  } else {
+    log("✗ No read method returned a usable Source Text value.", "warn");
+  }
+
+  return { paramShape, valueGetterAttempts: attempts, getValueAtTimeAttempts, workingMethod, resolvedValue };
 }
 
 /**
@@ -331,11 +475,25 @@ export async function runSourceTextRoundTrip({
 }) {
   log(`[stage] testing Source Text round trip (component ${componentIndex}, param ${paramIndex})…`, "info");
 
-  log("[stage] reading Source Text with valid TickTime arguments…", "info");
-  const readAttempts = await readSourceTextAttempts(trackItem, param, ppro, log, budget);
+  const valueRead = await readSourceTextValueOnly(param, ppro, trackItem, log, budget);
 
-  log("[stage] testing non-mutating keyframe construction (createKeyframe, no sequence change)…", "info");
-  const keyframeCreation = await testKeyframeCreation(param, sentinel, log, budget);
+  // Never call createKeyframe when the param has told us keyframes aren't
+  // supported — confirmed real-host behavior: doing so anyway throws
+  // "Illegal Parameter type" instead of constructing anything. Only skip on
+  // a confirmed `false`; if the flag couldn't be read (null/undefined), still
+  // attempt it as before rather than assuming.
+  let keyframeCreation;
+  if (areKeyframesSupported === false) {
+    log(
+      '[stage] skipping createKeyframe — this param reports areKeyframesSupported:false, so constructing a keyframe for it is not applicable ' +
+        '(confirmed real-host: throws "Illegal Parameter type" instead).',
+      "warn"
+    );
+    keyframeCreation = { ok: false, skipped: true, reason: "areKeyframesSupported is false" };
+  } else {
+    log("[stage] testing non-mutating keyframe construction (createKeyframe, no sequence change)…", "info");
+    keyframeCreation = await testKeyframeCreation(param, sentinel, log, budget);
+  }
 
   let actionCreation = { attempted: false, ok: false };
   let transaction = { attempted: false, ok: false };
@@ -358,7 +516,7 @@ export async function runSourceTextRoundTrip({
     } else {
       log(`✗ Source Text write action could not be created: ${actionCreation.error ?? "unknown error"}`, "warn");
     }
-  } else {
+  } else if (!keyframeCreation.skipped) {
     log(`✗ createKeyframe(sentinel) failed — skipping action/transaction/read-back: ${keyframeCreation.error ?? "unknown error"}`, "warn");
   }
 
@@ -372,7 +530,7 @@ export async function runSourceTextRoundTrip({
     displayName,
     isTimeVarying,
     areKeyframesSupported,
-    readAttempts,
+    valueRead,
     keyframeCreation: keyframeCreationSafe,
     actionCreation: actionCreationSafe,
     transaction,
@@ -568,5 +726,169 @@ export async function testSourceTextRoundTrip(opts) {
     };
   } finally {
     if (activeCancelToken === cancelToken) activeCancelToken = null;
+  }
+}
+
+// Separate cancel-token slot from the full round trip's, since this is a
+// distinct operation that can run independently (and the UI can only ever
+// have one of the two running at a time, but they must not share state).
+let activeReadOnlyCancelToken = null;
+
+export function cancelActiveReadSourceTextOnly() {
+  if (activeReadOnlyCancelToken) {
+    activeReadOnlyCancelToken.cancelled = true;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Dedicated READ-ONLY entry point, run BEFORE ever attempting a write (see
+ * testSourceTextRoundTrip for the full read+write round trip): insert a
+ * temporary clip, wait for its component chain to stabilize, locate Source
+ * Text, read it via readSourceTextValueOnly() (never createKeyframe or
+ * anything else that could mutate the sequence), clean up the temporary
+ * clip (always, whether any step above threw, failed, timed out, or was
+ * cancelled), and return a JSON-safe report.
+ *
+ * @param {Object} opts
+ * @param {string} opts.mogrtPath
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {number} [opts.scanBudgetMs]
+ */
+export async function testReadSourceTextOnly(opts) {
+  const { mogrtPath, log, scanBudgetMs = DEFAULT_ROUND_TRIP_BUDGET_MS } = opts;
+
+  log("════ Read Source Text Only — start ════", "info");
+
+  if (!mogrtPath) {
+    log("✗ No .mogrt selected.", "error");
+    return { ok: false, step: "mogrt-path" };
+  }
+
+  const cancelToken = { cancelled: false };
+  activeReadOnlyCancelToken = cancelToken;
+
+  try {
+    let project, sequence;
+    try {
+      ({ project, sequence } = await requireActiveProjectAndSequence());
+    } catch (err) {
+      log(`✗ No active project/sequence: ${err.message || err}`, "error");
+      return { ok: false, step: "sequence" };
+    }
+
+    const tracksResult = await safeAsync(() => listVideoTracks(sequence));
+    if (!tracksResult.ok || tracksResult.value.length === 0) {
+      log(
+        tracksResult.ok
+          ? "✗ No video track available to insert a temporary inspection clip onto."
+          : `✗ listVideoTracks() threw: ${tracksResult.error.message || tracksResult.error}`,
+        "error"
+      );
+      return { ok: false, step: "track" };
+    }
+    const videoTrackIndex = tracksResult.value[tracksResult.value.length - 1].index;
+
+    const rangeResult = await safeAsync(() => getSelectedRangeSeconds(sequence));
+    const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
+
+    log(`[stage] inserting clip from: ${mogrtPath}`, "info");
+    const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
+    if (!insertResult.ok) {
+      log(`✗ Couldn't insert this .mogrt: ${insertResult.error.message || insertResult.error}`, "error");
+      return { ok: false, step: "insert" };
+    }
+    const trackItem = insertResult.value;
+    log(`✓ Inserted at ${startSec.toFixed(3)}s on track index ${videoTrackIndex} (temporary, will be removed).`, "success");
+
+    const { report: scanReport, scanError, cleanupResult } = await runScanWithGuaranteedCleanup(
+      async () => {
+        log("[stage] waiting for MOGRT components to finish initializing…", "info");
+        const stabilization = await stabilizeComponentChain(trackItem, log, { cancelToken });
+        const textInfo = stabilization.discovery.components.find((c) => c.classification === "text-editing");
+
+        if (!textInfo) {
+          log(`${MOGRT_INIT_TIMEOUT_MESSAGE} No AE.ADBE Text component found — cannot test Source Text this run.`, "warn");
+          return { found: false, reason: "no-text-component", componentDiscoveryTimeline: stabilization.timeline };
+        }
+
+        log(`[stage] AE.ADBE Text found at index ${textInfo.componentIndex} — locating Source Text by displayName…`, "info");
+        const located = await locateSourceTextParam(textInfo.component, textInfo.componentIndex, log);
+        if (!located) {
+          log('✗ No param with displayName exactly "Source Text" was found on the AE.ADBE Text component.', "error");
+          return {
+            found: false,
+            reason: "no-source-text-param",
+            componentDiscoveryTimeline: stabilization.timeline,
+            componentIndex: textInfo.componentIndex,
+          };
+        }
+
+        const isTimeVaryingResult =
+          typeof located.param.isTimeVarying === "function"
+            ? await safeResolve(() => located.param.isTimeVarying(), { log, label: "sourceText.isTimeVarying()" })
+            : { ok: false };
+        const areKeyframesSupportedResult =
+          typeof located.param.areKeyframesSupported === "function"
+            ? await safeResolve(() => located.param.areKeyframesSupported(), { log, label: "sourceText.areKeyframesSupported()" })
+            : { ok: false };
+
+        const probeBudget = createScanBudget({ totalMs: scanBudgetMs, cancelToken });
+        const valueRead = await readSourceTextValueOnly(located.param, getPpro(), trackItem, log, probeBudget);
+
+        return {
+          found: true,
+          componentIndex: textInfo.componentIndex,
+          paramIndex: located.paramIndex,
+          displayName: located.displayName,
+          isTimeVarying: isTimeVaryingResult.ok ? isTimeVaryingResult.value : null,
+          areKeyframesSupported: areKeyframesSupportedResult.ok ? areKeyframesSupportedResult.value : null,
+          valueRead,
+          componentDiscoveryTimeline: stabilization.timeline,
+        };
+      },
+      () => {
+        log("[stage] cleaning up (removing temporary inspection clip)…", "info");
+        return safeAsync(() => removeTrackItem(project, sequence, trackItem));
+      },
+      log
+    );
+
+    const cleanupOk = cleanupResult.ok && cleanupResult.value === true;
+    if (cleanupResult.ok && cleanupResult.value) {
+      log("Removed temporary inspection clip.", "info");
+    } else {
+      log(
+        `Couldn't remove the temporary inspection clip (${
+          cleanupResult.ok ? "transaction reported failure" : cleanupResult.error.message || cleanupResult.error
+        }) — you may need to delete it from the timeline by hand.`,
+        "warn"
+      );
+    }
+
+    if (scanError) {
+      log("════ Read Source Text Only — finished with errors (cleanup still ran) ════", "error");
+      return { ok: false, step: "scan", error: String(scanError.message || scanError), cleanupOk, componentDiscoveryTimeline: [] };
+    }
+
+    const report = scanReport ?? { found: false, reason: "crash", componentDiscoveryTimeline: [] };
+
+    if (!report.found) {
+      log("════ Read Source Text Only — finished (Source Text not found this run) ════", "warn");
+      return { ok: true, found: false, reason: report.reason, componentDiscoveryTimeline: report.componentDiscoveryTimeline, cleanupOk };
+    }
+
+    const success = Boolean(report.valueRead?.resolvedValue !== null && report.valueRead?.resolvedValue !== undefined);
+    log(
+      success
+        ? `════ Read Source Text Only — finished: SUCCESS via ${report.valueRead.workingMethod}() ════`
+        : "════ Read Source Text Only — finished (no read method returned a value — see valueRead for details) ════",
+      success ? "success" : "warn"
+    );
+
+    return { ok: true, found: true, ...report, cleanupOk };
+  } finally {
+    if (activeReadOnlyCancelToken === cancelToken) activeReadOnlyCancelToken = null;
   }
 }

@@ -6,12 +6,14 @@ import {
   locateSourceTextParam,
   computeMidpointTickTime,
   readSourceTextAttempts,
+  readSourceTextValueOnly,
   testKeyframeCreation,
   testActionCreation,
   runTransaction,
   readBackSourceText,
   runSourceTextRoundTrip,
   cancelActiveSourceTextRoundTrip,
+  cancelActiveReadSourceTextOnly,
   DEFAULT_SENTINEL,
 } from "../src/ppro/sourceTextProbe.js";
 
@@ -37,7 +39,9 @@ function fakePpro() {
 
 // Mirrors test/diagnostics.test.js's fakeParam, extended with the
 // Source-Text-round-trip-specific methods (createKeyframe,
-// createSetValueAction, getValueAtTime) this module actually exercises.
+// createSetValueAction, getValueAtTime) this module actually exercises,
+// plus the non-keyframed value-getter surface (getValue, .value, and any
+// arbitrary extra methods) readSourceTextValueOnly() probes.
 function fakeSourceTextParam({
   displayName = "Source Text",
   isTimeVarying,
@@ -45,6 +49,9 @@ function fakeSourceTextParam({
   getValueAtTime,
   createKeyframe,
   createSetValueAction,
+  getValue,
+  value,
+  extraMethods = {},
 } = {}) {
   return {
     displayName,
@@ -53,6 +60,9 @@ function fakeSourceTextParam({
     ...(getValueAtTime ? { getValueAtTime } : {}),
     ...(createKeyframe ? { createKeyframe } : {}),
     ...(createSetValueAction ? { createSetValueAction } : {}),
+    ...(getValue ? { getValue } : {}),
+    ...(value !== undefined ? { value } : {}),
+    ...extraMethods,
   };
 }
 
@@ -392,7 +402,12 @@ test("runSourceTextRoundTrip runs the full success path: read, keyframe, action,
     param: freshParam,
     displayName: "Source Text",
     isTimeVarying: false,
-    areKeyframesSupported: false,
+    // Deliberately `true` here (not the real confirmed Source Text value of
+    // `false`) — this test exercises the write-path chain itself
+    // (keyframe -> action -> transaction -> read-back), which is now gated
+    // OFF entirely when areKeyframesSupported is false (see the dedicated
+    // gating tests below). A real Source Text run never reaches this path.
+    areKeyframesSupported: true,
     sentinel: DEFAULT_SENTINEL,
     log: noopLog,
     budget: undefined,
@@ -421,7 +436,7 @@ test("runSourceTextRoundTrip skips action/transaction/read-back entirely when cr
     param,
     displayName: "Source Text",
     isTimeVarying: false,
-    areKeyframesSupported: false,
+    areKeyframesSupported: true, // see the success-path test above for why this is `true`, not the real Source Text value.
     sentinel: DEFAULT_SENTINEL,
     log: noopLog,
     budget: undefined,
@@ -447,7 +462,7 @@ test("runSourceTextRoundTrip skips transaction/read-back when action creation fa
     param,
     displayName: "Source Text",
     isTimeVarying: false,
-    areKeyframesSupported: false,
+    areKeyframesSupported: true, // see the success-path test above for why this is `true`, not the real Source Text value.
     sentinel: DEFAULT_SENTINEL,
     log: noopLog,
     budget: undefined,
@@ -474,7 +489,7 @@ test("runSourceTextRoundTrip skips read-back when the transaction itself fails",
     param,
     displayName: "Source Text",
     isTimeVarying: false,
-    areKeyframesSupported: false,
+    areKeyframesSupported: true, // see the success-path test above for why this is `true`, not the real Source Text value.
     sentinel: DEFAULT_SENTINEL,
     log: noopLog,
     budget: undefined,
@@ -490,4 +505,214 @@ test("runSourceTextRoundTrip skips read-back when the transaction itself fails",
 
 test("cancelActiveSourceTextRoundTrip returns false when nothing is running", () => {
   assert.equal(cancelActiveSourceTextRoundTrip(), false);
+});
+
+test("cancelActiveReadSourceTextOnly returns false when nothing is running", () => {
+  assert.equal(cancelActiveReadSourceTextOnly(), false);
+});
+
+// --- readSourceTextValueOnly ---
+//
+// Regression coverage for the confirmed real-host finding: Source Text
+// reports isTimeVarying:false and areKeyframesSupported:false, and the old
+// keyframe-first/getValueAtTime-first read strategy failed outright
+// (createKeyframe threw "Illegal Parameter type"). These tests exercise
+// the non-keyframed value-getter strategy this function now uses instead.
+
+test("readSourceTextValueOnly reads a non-time-varying Source Text value via getValue() — the documented current-value getter", async () => {
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    getValue: () => "Hello Caption",
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, "getValue");
+  assert.equal(result.resolvedValue, "Hello Caption");
+  const getValueAttempt = result.valueGetterAttempts.find((a) => a.name === "getValue");
+  assert.equal(getValueAttempt.ok, true);
+  assert.equal(getValueAttempt.kind, "method");
+  assert.equal(getValueAttempt.typeofMember, "function");
+});
+
+test("readSourceTextValueOnly never calls createKeyframe (keyframes unsupported) — only non-keyframed getters are tried", async () => {
+  let createKeyframeCalled = false;
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    getValue: () => "Hello Caption",
+    createKeyframe: () => {
+      createKeyframeCalled = true;
+      throw new Error("Illegal Parameter type");
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+  assert.equal(createKeyframeCalled, false, "readSourceTextValueOnly must never call createKeyframe");
+});
+
+test("readSourceTextValueOnly resolves getValue() when it returns a Promise, and records isPromise:true", async () => {
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    getValue: () => Promise.resolve("Async Caption Text"),
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, "getValue");
+  assert.equal(result.resolvedValue, "Async Caption Text");
+  const getValueAttempt = result.valueGetterAttempts.find((a) => a.name === "getValue");
+  assert.equal(getValueAttempt.isPromise, true);
+});
+
+test("readSourceTextValueOnly deeply unwraps a wrapped text value object (Keyframe-shaped { value: X }) returned by a value getter", async () => {
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    getValue: () => ({ value: "Wrapped Text" }),
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, "getValue");
+  assert.equal(result.resolvedValue, "Wrapped Text");
+  const getValueAttempt = result.valueGetterAttempts.find((a) => a.name === "getValue");
+  assert.ok(getValueAttempt.wrapperShape, "a wrapper object result should carry its own probed shape, not just a summary");
+  assert.equal(getValueAttempt.wrapperShape.exists, true);
+});
+
+test("readSourceTextValueOnly falls back to a plain \".value\" property when there's no getValue() method", async () => {
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    value: "Direct Property Text",
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, "value");
+  assert.equal(result.resolvedValue, "Direct Property Text");
+  const valueAttempt = result.valueGetterAttempts.find((a) => a.name === "value");
+  assert.equal(valueAttempt.kind, "property");
+});
+
+test("readSourceTextValueOnly discovers and tries other *value*-named getters beyond the hardcoded candidates", async () => {
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    extraMethods: { getCurrentValue: () => "Discovered Method Text" },
+  });
+  const trackItem = fakeTrackItem({});
+  const result = await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, "getCurrentValue");
+  assert.equal(result.resolvedValue, "Discovered Method Text");
+});
+
+test("readSourceTextValueOnly never invokes a discovered method that looks like a keyframe/AtTime/create/set/find call, even if its name contains \"value\"", async () => {
+  let setValueCalled = false;
+  let createValueCalled = false;
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    getValue: () => "Hello Caption",
+    extraMethods: {
+      setValue: () => { setValueCalled = true; throw new Error("must never be called — mutating method"); },
+      createValueKeyframe: () => { createValueCalled = true; throw new Error("must never be called — keyframe method"); },
+    },
+  });
+  const trackItem = fakeTrackItem({});
+  await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+  assert.equal(setValueCalled, false);
+  assert.equal(createValueCalled, false);
+});
+
+test("readSourceTextValueOnly reports no working method (not a crash) when every getter is absent or returns null", async () => {
+  const param = fakeSourceTextParam({ isTimeVarying: false, areKeyframesSupported: false });
+  const trackItem = fakeTrackItem({});
+  const result = await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, null);
+  assert.equal(result.resolvedValue, null);
+});
+
+test("readSourceTextValueOnly still tries getValueAtTime(TickTime) as a fallback alongside the non-keyframed getters", async () => {
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    getValueAtTime: () => "value-from-time-based-read",
+  });
+  const trackItem = fakeTrackItem({ inPoint: fakeTickTime(0), startTime: fakeTickTime(0), duration: fakeTickTime(0) });
+  const result = await readSourceTextValueOnly(param, fakePpro(), trackItem, noopLog, undefined);
+
+  assert.equal(result.workingMethod, "getValueAtTime");
+  assert.equal(result.resolvedValue, "value-from-time-based-read");
+  assert.ok(result.getValueAtTimeAttempts.length > 0);
+});
+
+// --- runSourceTextRoundTrip: createKeyframe gating on areKeyframesSupported ---
+
+test("runSourceTextRoundTrip skips createKeyframe entirely when areKeyframesSupported is false — the confirmed real-host Source Text case", async () => {
+  let createKeyframeCalled = false;
+  const param = fakeSourceTextParam({
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    getValue: () => "Hello Caption",
+    createKeyframe: () => {
+      createKeyframeCalled = true;
+      throw new Error("Illegal Parameter type");
+    },
+  });
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: () => { throw new Error("must not be called"); }, executeTransaction: () => { throw new Error("must not be called"); } };
+
+  const report = await runSourceTextRoundTrip({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param,
+    displayName: "Source Text",
+    isTimeVarying: false,
+    areKeyframesSupported: false,
+    sentinel: DEFAULT_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(createKeyframeCalled, false, "createKeyframe must never be called when areKeyframesSupported is false");
+  assert.equal(report.keyframeCreation.ok, false);
+  assert.equal(report.keyframeCreation.skipped, true);
+  assert.equal(report.actionCreation.attempted, false);
+  assert.equal(report.transaction.attempted, false);
+  assert.equal(report.readBack.attempted, false);
+  assert.equal(report.valueRead.workingMethod, "getValue");
+  assert.equal(report.valueRead.resolvedValue, "Hello Caption");
+});
+
+test("runSourceTextRoundTrip still attempts createKeyframe when areKeyframesSupported is null/unknown (not confirmed false)", async () => {
+  const param = fakeWritableParam();
+  const trackItem = fakeTrackItem({ chain: fakeChain([]) });
+  const project = { lockedAccess: (fn) => fn(), executeTransaction: (build) => { build({ addAction: () => {} }); return true; } };
+
+  const report = await runSourceTextRoundTrip({
+    project,
+    trackItem,
+    componentIndex: 3,
+    paramIndex: 0,
+    param,
+    displayName: "Source Text",
+    isTimeVarying: null,
+    areKeyframesSupported: null,
+    sentinel: DEFAULT_SENTINEL,
+    log: noopLog,
+    budget: undefined,
+    ppro: fakePpro(),
+  });
+
+  assert.equal(report.keyframeCreation.ok, true);
+  assert.equal(report.keyframeCreation.skipped, undefined);
 });

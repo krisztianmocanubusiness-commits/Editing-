@@ -4,7 +4,7 @@ import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
 import { inspectMogrt } from "../ppro/templateInspector.js";
 import { diagnoseMogrt, cancelActiveDiagnostic } from "../ppro/diagnostics.js";
-import { testSourceTextRoundTrip, cancelActiveSourceTextRoundTrip } from "../ppro/sourceTextProbe.js";
+import { testSourceTextRoundTrip, cancelActiveSourceTextRoundTrip, testReadSourceTextOnly, cancelActiveReadSourceTextOnly } from "../ppro/sourceTextProbe.js";
 import { saveActiveTemplate } from "../state/settings.js";
 import { KERIS_CAPTION_V1_PPRO, getContract } from "../presets/contracts/index.js";
 import { describeCompatibilityLabel } from "../presets/contractValidation.js";
@@ -197,6 +197,57 @@ function cancelSourceTextRoundTrip() {
   );
 }
 
+async function runReadSourceTextOnlyTest() {
+  const { mogrtPath } = store.getState().templateInspector;
+  if (!mogrtPath) {
+    log("Choose a .mogrt to inspect first.", "error");
+    return;
+  }
+  patchInspector({ readSourceTextOnlyRunning: true, lastReadSourceTextOnly: null });
+  try {
+    const result = await testReadSourceTextOnly({ mogrtPath, log });
+    // TEMPORARY: also dump the full result to console.error() (not just the
+    // panel log/UI), same reasoning as the round trip below — retrievable
+    // via the UXP Developer Tool's Console tab even if the panel UI breaks.
+    console.error("[Caption Graphics Studio] Read Source Text Only result:", JSON.stringify(result, null, 2));
+    patchInspector({ lastReadSourceTextOnly: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] Read Source Text Only crashed:", err);
+    log(`Read Source Text Only crashed unexpectedly: ${err.message || err}`, "error");
+    patchInspector({ lastReadSourceTextOnly: { ok: false, step: "crash" } });
+  } finally {
+    patchInspector({ readSourceTextOnlyRunning: false });
+  }
+}
+
+function cancelReadSourceTextOnly() {
+  const cancelled = cancelActiveReadSourceTextOnly();
+  log(
+    cancelled
+      ? "Cancel requested — the read will stop at its next checkpoint and still clean up the temporary clip."
+      : "Nothing to cancel — no Read Source Text Only diagnostic is currently running.",
+    cancelled ? "warn" : "info"
+  );
+}
+
+async function saveReadSourceTextOnlyJson() {
+  const { lastReadSourceTextOnly } = store.getState().templateInspector;
+  if (!lastReadSourceTextOnly || !lastReadSourceTextOnly.ok || !lastReadSourceTextOnly.found) {
+    log("Run Read Source Text Only successfully (with Source Text found) before saving its output.", "error");
+    return;
+  }
+  try {
+    const uxp = getUxp();
+    // @ts-ignore
+    const file = await uxp.storage.localFileSystem.getFileForSaving("mogrt-source-text-read.json", { types: ["json"] });
+    if (!file) return;
+    await file.write(JSON.stringify(lastReadSourceTextOnly, null, 2));
+    log(`Source Text read diagnostic saved to ${file.nativePath}.`, "success");
+  } catch (err) {
+    log(`Saving Source Text read JSON failed: ${err.message || err}`, "error");
+  }
+}
+
 function diagnosticSummaryBlock(result, diagnosing) {
   if (diagnosing) {
     return el("div", { class: "inspector-results" }, [
@@ -296,18 +347,17 @@ function diagnosticSummaryBlock(result, diagnosing) {
 // a failed write action, which beats a successful plain read, which beats
 // "found but null" — see docs/MOGRT_DIAGNOSTIC.md.
 function sourceTextOutcomeMessage(probe) {
-  const { readAttempts, actionCreation, readBack } = probe;
+  const { valueRead, actionCreation, readBack } = probe;
   if (readBack?.ok && readBack?.matched) {
     return { text: "Source Text write/read-back succeeded.", cls: "log-success" };
   }
   if (actionCreation?.attempted && !actionCreation?.ok) {
     return { text: `Source Text write action could not be created: ${actionCreation.error ?? "unknown error"}`, cls: "log-error" };
   }
-  const successfulRead = (readAttempts ?? []).find((r) => r.ok && r.resolvedValue !== null && r.resolvedValue !== undefined);
-  if (successfulRead) {
-    return { text: `Source Text read successfully: ${JSON.stringify(successfulRead.resolvedValue)}`, cls: "log-info" };
+  if (valueRead?.workingMethod && valueRead.resolvedValue !== null && valueRead.resolvedValue !== undefined) {
+    return { text: `Source Text read successfully via ${valueRead.workingMethod}(): ${JSON.stringify(valueRead.resolvedValue)}`, cls: "log-info" };
   }
-  const anyOkRead = (readAttempts ?? []).some((r) => r.ok);
+  const anyOkRead = (valueRead?.valueGetterAttempts ?? []).some((r) => r.ok) || (valueRead?.getValueAtTimeAttempts ?? []).some((r) => r.ok);
   if (anyOkRead) {
     return { text: "Source Text parameter was found, but Premiere returned null when reading it.", cls: "log-warn" };
   }
@@ -352,10 +402,80 @@ function sourceTextRoundTripBlock(result, running) {
     el("div", { class: `status-line ${outcome.cls}`, text: `${outcome.text}` }),
     el("div", {
       class: "status-line",
-      text: `createKeyframe: ${probe.keyframeCreation.ok ? "✓ succeeded" + (probe.keyframeCreation.sentinelPreserved ? " (sentinel preserved)" : "") : "✗ " + (probe.keyframeCreation.error ?? "failed")}` +
+      text: `createKeyframe: ${
+        probe.keyframeCreation.ok
+          ? "✓ succeeded" + (probe.keyframeCreation.sentinelPreserved ? " (sentinel preserved)" : "")
+          : probe.keyframeCreation.skipped
+          ? `— skipped (${probe.keyframeCreation.reason ?? "areKeyframesSupported is false"})`
+          : "✗ " + (probe.keyframeCreation.error ?? "failed")
+      }` +
         (probe.actionCreation.attempted ? ` — createSetValueAction: ${probe.actionCreation.ok ? "✓ succeeded" : "✗ " + (probe.actionCreation.error ?? "failed")}` : "") +
         (probe.transaction.attempted ? ` — executeTransaction: ${probe.transaction.ok ? "✓ succeeded" : "✗ " + (probe.transaction.error ?? "failed")}` : ""),
     }),
+    el("div", { class: "status-line", text: `Temporary clip removed: ${result.cleanupOk ? "yes" : "NO — you may need to delete it from the timeline by hand"}.` }),
+  ]);
+}
+
+function readSourceTextOnlyOutcomeMessage(valueRead) {
+  if (valueRead?.workingMethod && valueRead.resolvedValue !== null && valueRead.resolvedValue !== undefined) {
+    return { text: `Source Text read successfully via ${valueRead.workingMethod}(): ${JSON.stringify(valueRead.resolvedValue)}`, cls: "log-success" };
+  }
+  const anyOkRead = (valueRead?.valueGetterAttempts ?? []).some((r) => r.ok) || (valueRead?.getValueAtTimeAttempts ?? []).some((r) => r.ok);
+  if (anyOkRead) {
+    return { text: "Source Text parameter was found, but every read method returned null.", cls: "log-warn" };
+  }
+  return { text: "Source Text parameter was found, but no read method succeeded — see Log for details.", cls: "log-warn" };
+}
+
+function readSourceTextOnlyBlock(result, running) {
+  if (running) {
+    return el("div", { class: "inspector-results" }, [
+      el("div", {
+        class: "status-line log-info",
+        text: "⏳ Reading Source Text only — inserting a temporary clip, waiting for it to stabilize, then trying every non-keyframed value " +
+          "getter (getValue(), .value, getStartValue(), any other discovered *value* method, and getValueAtTime(TickTime) as a fallback). " +
+          "createKeyframe is never called here. The temporary clip is always removed afterwards. See Log below for live progress, or click " +
+          "Cancel to stop early.",
+      }),
+    ]);
+  }
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Read Source Text Only failed${stepLabel}${result.error ? `: ${result.error}` : ""}. See Log below.` }),
+    ]);
+  }
+  if (!result.found) {
+    const reasonText =
+      result.reason === "no-source-text-param"
+        ? "AE.ADBE Text was found, but no param with displayName exactly \"Source Text\" was found on it."
+        : "MOGRT component chain did not fully initialise before timeout — AE.ADBE Text was not found within the wait window.";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-warn", text: `⚠ ${reasonText} Temporary clip removed either way. Try again, or check the Log for the discovery timeline.` }),
+    ]);
+  }
+  const outcome = readSourceTextOnlyOutcomeMessage(result.valueRead);
+  const methodLines = (result.valueRead?.valueGetterAttempts ?? []).map((a) =>
+    el("div", {
+      class: "status-line",
+      text: `  ${a.name} (${a.kind}, typeof=${a.typeofMember ?? "n/a"}): ${
+        a.skipped
+          ? `skipped (${a.reason})`
+          : a.ok
+          ? `✓ ${JSON.stringify(a.resolvedValue)}${a.isPromise ? " (was a Promise)" : ""}`
+          : `✗ ${a.error ?? "failed"}`
+      }`,
+    })
+  );
+  return el("div", { class: "inspector-results" }, [
+    el("div", {
+      class: "status-line",
+      text: `AE.ADBE Text found (component ${result.componentIndex}), Source Text param at index ${result.paramIndex} ` +
+        `(isTimeVarying: ${String(result.isTimeVarying)}, areKeyframesSupported: ${String(result.areKeyframesSupported)}).`,
+    }),
+    el("div", { class: `status-line ${outcome.cls}`, text: `${outcome.text}` }),
+    ...methodLines,
     el("div", { class: "status-line", text: `Temporary clip removed: ${result.cleanupOk ? "yes" : "NO — you may need to delete it from the timeline by hand"}.` }),
   ]);
 }
@@ -440,6 +560,28 @@ export function renderTemplateInspectorPanel(onChange) {
     onClick: () => cancelSourceTextRoundTrip(),
   });
 
+  const readSourceTextOnlyBtn = el("button", {
+    class: "btn",
+    text: ti.readSourceTextOnlyRunning ? "Reading…" : "Read Source Text Only",
+    disabled: !isHosted() || ti.readSourceTextOnlyRunning || !ti.mogrtPath || undefined,
+    onClick: async () => {
+      await runReadSourceTextOnlyTest();
+      onChange();
+    },
+  });
+  const cancelReadSourceTextOnlyBtn = el("button", {
+    class: "btn",
+    text: "Cancel",
+    disabled: !ti.readSourceTextOnlyRunning || undefined,
+    onClick: () => cancelReadSourceTextOnly(),
+  });
+  const saveReadSourceTextOnlyBtn = el("button", {
+    class: "btn",
+    text: "Save Source Text read JSON…",
+    disabled: !ti.lastReadSourceTextOnly || !ti.lastReadSourceTextOnly.ok || !ti.lastReadSourceTextOnly.found || undefined,
+    onClick: () => saveReadSourceTextOnlyJson(),
+  });
+
   return el("section", { class: "panel panel-template-inspector" }, [
     el("h2", { text: `1. Template Inspector — set your active ${KERIS_CAPTION_V1_PPRO.id} template` }),
     el(
@@ -484,6 +626,21 @@ export function renderTemplateInspectorPanel(onChange) {
     ),
     el("div", { class: "row" }, [diagnosticBtn, cancelDiagnosticBtn, saveDiagnosticBtn, saveRawProbeBtn]),
     diagnosticSummaryBlock(ti.lastDiagnostic, ti.diagnosing),
+    el("h3", { text: "Read Source Text Only (troubleshooting)" }),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Read-only, run this before Source Text Round Trip below: locates the AE.ADBE Text component's " +
+          "\"Source Text\" param and tries every plausible non-keyframed value getter — getValue(), a plain " +
+          "\".value\" property, getStartValue(), any other discovered method whose name contains \"value\", and " +
+          "getValueAtTime(TickTime) as a fallback (never called bare). Never calls createKeyframe or anything " +
+          "else that could mutate the sequence. Does not require re-running the full Diagnostic Inspector or " +
+          "Source Text Round Trip. The temporary clip is always removed afterwards. See docs/MOGRT_DIAGNOSTIC.md.",
+      ]
+    ),
+    el("div", { class: "row" }, [readSourceTextOnlyBtn, cancelReadSourceTextOnlyBtn, saveReadSourceTextOnlyBtn]),
+    readSourceTextOnlyBlock(ti.lastReadSourceTextOnly, ti.readSourceTextOnlyRunning),
     el("h3", { text: "Source Text Round Trip (troubleshooting)" }),
     el(
       "p",

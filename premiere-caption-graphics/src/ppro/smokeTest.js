@@ -243,7 +243,7 @@ export async function runSmokeTest(opts) {
 
   // 5. Insert.
   let trackItem;
-  const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex));
+  const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
   if (!insertResult.ok) {
     log(`✗ insertMogrtFromPath failed: ${insertResult.error.message || insertResult.error}`, "error");
     log("════ Smoke test aborted — insertion failed ════", "error");

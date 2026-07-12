@@ -1039,7 +1039,7 @@ export async function diagnoseMogrt(opts) {
     const startSec = rangeResult.ok ? rangeResult.value.startSec : 0;
 
     log(`[stage] inserting clip from: ${mogrtPath}`, "info");
-    const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex));
+    const insertResult = await safeAsync(() => insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log));
     if (!insertResult.ok) {
       log(`✗ Couldn't insert this .mogrt: ${insertResult.error.message || insertResult.error}`, "error");
       log("════ Diagnostic Inspector aborted — nothing to inspect ════", "error");

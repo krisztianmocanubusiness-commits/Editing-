@@ -1,34 +1,106 @@
 import { getPpro } from "./client.js";
 import { secToTick } from "./time.js";
+import { safe } from "./introspect.js";
 
 const MAX_COMPONENT_SCAN = 64;
 const MAX_PARAM_SCAN = 64;
+
+/**
+ * Resolves a real, in-range audio track index for `insertMogrtFromPath`'s
+ * 4th argument. CONFIRMED ROOT CAUSE of an "Invalid parameter" host error
+ * from `insertMogrtFromPath` (real host run, Premiere Pro 26.3): the old
+ * code blindly passed `videoTrackIndex` for BOTH the video track and audio
+ * track arguments. That's only valid by coincidence, when the resolved
+ * video track index also happens to be a real audio track index on the
+ * active sequence — true for a simple 1-video/1-audio-track sequence, false
+ * as soon as a sequence has more video tracks than audio tracks (extremely
+ * common — every caller here picks the *topmost* video track index, which
+ * climbs with each additional video track regardless of audio track
+ * count). Every current caller (Host Smoke Test, Template Inspector,
+ * Diagnostic Inspector, the Source Text Round Trip, and the real timeline
+ * apply flow) shares this one function, so fixing it here fixes all of
+ * them at once — no caller needs to change what it passes in.
+ *
+ * @param {import("@adobe/premierepro").Sequence} sequence
+ * @param {number} videoTrackIndex
+ * @param {(message: string, level?: string) => void} [log]
+ */
+export async function resolveAudioTrackIndex(sequence, videoTrackIndex, log) {
+  if (!sequence || typeof sequence.getAudioTrackCount !== "function") {
+    if (log) log(`[insertMogrtAt] sequence.getAudioTrackCount() unavailable — falling back to audioTrackIndex=videoTrackIndex (${videoTrackIndex}).`, "warn");
+    return videoTrackIndex;
+  }
+  try {
+    const audioTrackCount = await sequence.getAudioTrackCount();
+    if (!audioTrackCount || audioTrackCount <= 0) {
+      if (log) log(`[insertMogrtAt] sequence reports 0 audio tracks — using audioTrackIndex=0 (best effort).`, "warn");
+      return 0;
+    }
+    const resolved = Math.min(videoTrackIndex, audioTrackCount - 1);
+    if (resolved !== videoTrackIndex && log) {
+      log(
+        `[insertMogrtAt] videoTrackIndex=${videoTrackIndex} exceeds this sequence's audio track count (${audioTrackCount}) — ` +
+          `using audioTrackIndex=${resolved} instead of blindly reusing videoTrackIndex (the confirmed cause of "Invalid parameter" ` +
+          `from insertMogrtFromPath when a sequence has fewer audio tracks than video tracks).`,
+        "warn"
+      );
+    }
+    return resolved;
+  } catch (err) {
+    if (log) log(`[insertMogrtAt] couldn't read sequence.getAudioTrackCount(): ${err.message || err} — falling back to audioTrackIndex=videoTrackIndex (${videoTrackIndex}).`, "warn");
+    return videoTrackIndex;
+  }
+}
 
 /**
  * Insert a .mogrt at a given time on a video track, using the confirmed
  * `SequenceEditor.insertMogrtFromPath` API (see Adobe's sample
  * sequenceEditor.ts: `insertMogrt`). Returns the inserted TrackItem.
  *
+ * The ONE shared insertion path — Host Smoke Test, Template Inspector,
+ * Diagnostic Inspector, the Source Text Round Trip, and the real timeline
+ * apply flow (applyCaptions.js) all call this exact function; none of them
+ * maintain their own separate insertion logic.
+ *
  * @param {import("@adobe/premierepro").Project} project
  * @param {import("@adobe/premierepro").Sequence} sequence
  * @param {string} mogrtPath
  * @param {number} startSec
  * @param {number} videoTrackIndex
+ * @param {(message: string, level?: string) => void} [log] Optional — when given, every resolved
+ *   insertion argument is logged before the host call, and a host error (with its full stack) is
+ *   logged before being rethrown to the caller.
  */
-export async function insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex) {
+export async function insertMogrtAt(project, sequence, mogrtPath, startSec, videoTrackIndex, log) {
   const ppro = getPpro();
   const sequenceEditor = ppro.SequenceEditor.getEditor(sequence);
+  const time = secToTick(startSec);
+  const audioTrackIndex = await resolveAudioTrackIndex(sequence, videoTrackIndex, log);
+
+  if (log) {
+    const sequenceName = safe(() => sequence?.name).value ?? "(name unreadable)";
+    log("[insertMogrtAt] resolved insertion arguments:", "info");
+    log(`[insertMogrtAt]   path = ${mogrtPath}`, "info");
+    log(`[insertMogrtAt]   time = ${startSec}s (TickTime, .seconds=${safe(() => time.seconds).value ?? "?"})`, "info");
+    log(`[insertMogrtAt]   videoTrackIndex = ${videoTrackIndex}`, "info");
+    log(`[insertMogrtAt]   audioTrackIndex = ${audioTrackIndex}`, "info");
+    log(`[insertMogrtAt]   active sequence = "${sequenceName}", sequenceEditor acquired = ${Boolean(sequenceEditor)}`, "info");
+  }
+
   let mogrtItems = [];
-  project.lockedAccess(() => {
-    mogrtItems = sequenceEditor.insertMogrtFromPath(
-      mogrtPath,
-      secToTick(startSec),
-      videoTrackIndex,
-      videoTrackIndex
-    );
-  });
+  try {
+    project.lockedAccess(() => {
+      mogrtItems = sequenceEditor.insertMogrtFromPath(mogrtPath, time, videoTrackIndex, audioTrackIndex);
+    });
+  } catch (err) {
+    if (log) log(`[insertMogrtAt] insertMogrtFromPath threw: ${err.message || err}${err.stack ? `\n${err.stack}` : ""}`, "error");
+    throw err;
+  }
+
   if (!mogrtItems || mogrtItems.length === 0) {
-    throw new Error(`insertMogrtFromPath returned no track item for "${mogrtPath}".`);
+    const noItemsErr = new Error(`insertMogrtFromPath returned no track item for "${mogrtPath}".`);
+    if (log) log(`[insertMogrtAt] ${noItemsErr.message}`, "error");
+    throw noItemsErr;
   }
   return mogrtItems[0];
 }

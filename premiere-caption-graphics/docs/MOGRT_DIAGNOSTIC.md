@@ -549,3 +549,58 @@ fields, applied here too.
 per-param output generally (not just the Source Text round trip), so the
 classification report's saved JSON gets a direct value alongside the
 existing shape summary for every param, where one is derivable.
+
+## Sixth real host run: Source Text Round Trip failed insertion with "Invalid parameter"
+
+The Source Text Round Trip (previous section) failed immediately on
+insertion — `insertMogrtFromPath` threw `Invalid parameter` before Source
+Text discovery ever began — on the exact same `.mogrt` file that had
+already inserted successfully earlier in the same session via Host Smoke
+Test and the Diagnostic Inspector.
+
+**Root cause: `insertMogrtAt()` (`src/ppro/mogrt.js`) — the ONE insertion
+helper every feature already shares — passed `videoTrackIndex` for BOTH
+the video track argument and the audio track argument of
+`sequenceEditor.insertMogrtFromPath(path, time, videoTrackIndex,
+audioTrackIndex)`.** That's only valid by coincidence: every caller
+resolves `videoTrackIndex` as the *topmost existing video track*, which
+climbs every time another video track exists on the active sequence,
+completely independent of how many audio tracks exist. It happened to
+work earlier in the session (video/audio track counts still matched) and
+broke later once the active sequence had more video tracks than audio
+tracks — the resolved `videoTrackIndex` (e.g. `2`) was no longer a real
+audio track index on a sequence with only 1 audio track, and
+`insertMogrtFromPath` rejected it as an `Invalid parameter`.
+
+There was never a second, independently-maintained insertion
+implementation to reconcile — Host Smoke Test, Template Inspector, the
+Diagnostic Inspector, the Source Text Round Trip, and the real timeline
+apply flow (`applyCaptions.js`) all already called this one
+`insertMogrtAt()`. The bug lived inside the shared helper itself, so
+fixing it there fixes every caller at once with no call-site changes to
+their arguments:
+
+- `resolveAudioTrackIndex(sequence, videoTrackIndex, log)` (new, exported,
+  unit-tested): queries `sequence.getAudioTrackCount()` and clamps to
+  `min(videoTrackIndex, audioTrackCount - 1)`, falling back to `0` if the
+  sequence reports no audio tracks and to the old
+  `audioTrackIndex = videoTrackIndex` behavior if `getAudioTrackCount()`
+  isn't available on a given host version or throws — never a crash.
+- `insertMogrtAt()` gained an optional trailing `log` parameter. When
+  passed, it logs every resolved insertion argument (path, the `TickTime`
+  value/seconds, `videoTrackIndex`, the now-corrected `audioTrackIndex`,
+  and the active sequence's name + whether `SequenceEditor.getEditor()`
+  actually returned an editor) immediately before the host call, and logs
+  the full error **and stack** (not just `.message`) if
+  `insertMogrtFromPath` throws, before rethrowing unchanged so existing
+  caller-side error handling is unaffected. Host Smoke Test, Template
+  Inspector, the Diagnostic Inspector, and the Source Text Round Trip all
+  now pass their `log` through; `applyCaptions.js`'s real timeline-apply
+  call doesn't have a `log` callback in scope and was left unchanged — it
+  still gets the `audioTrackIndex` fix for free, just without the extra
+  logging.
+- `test/mogrt.test.js` (new): unit tests for `resolveAudioTrackIndex`'s
+  clamping/fallback behavior, plus a static regression guard asserting
+  `sourceTextProbe.js`'s `insertMogrtAt(...)` call has the exact same
+  argument shape as `diagnostics.js`'s, and that no caller invokes
+  `insertMogrtFromPath` directly (only `insertMogrtAt()` may).

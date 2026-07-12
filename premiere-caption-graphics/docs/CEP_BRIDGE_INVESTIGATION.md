@@ -252,3 +252,85 @@ native Premiere MOGRT Source Text is very likely not writable through either
 currently-documented Adobe scripting surface, on this specific MOGRT/param,
 and that needs to be reported plainly rather than routed around with more
 probing.
+
+## Part 7: first real-host run — `importMGT()` multi-video-track detection bug
+
+**Confirmed real-host bug report:** on a sequence with 13+ video tracks,
+the POC reported `"importMGT() did not appear to add a clip to video track
+0 (clip count unchanged: 17)"`. `createTextGraphic()`'s original
+implementation hard-coded `videoTrackIndex` to `0` whenever the UXP payload
+didn't explicitly set one (`src/ppro/cepBridge.js`'s `testCepWriteProof`
+also independently hard-coded its own default to `0`, so `0` is what always
+got sent), and only ever checked *that one track's* clip count before/after
+the call to decide whether insertion succeeded. Track 0 already had 17
+clips before the call and 17 after — true, but uninformative: `importMGT()`
+did not throw, and the clip may well have landed on any of the sequence's
+other 12+ video tracks. The old check never looked anywhere else.
+
+**Fix (`cep-bridge/jsx/hostscript.jsx`):**
+- `videoTrackIndex` resolution never falls back to a literal `0` anymore.
+  If the caller's requested index is missing or out of range, it falls back
+  to the **topmost** video track (`videoTrackCount - 1`) — matching the
+  convention the UXP MOGRT-insertion path already uses
+  (`src/ppro/timelineRange.js`'s `listVideoTracks()` callers).
+- `audioTrackIndex` is resolved and validated independently against
+  `audioTrackCount` — never assumed equal to `videoTrackIndex` (the same
+  class of bug already fixed on the UXP side; see `src/ppro/mogrt.js`'s
+  `resolveAudioTrackIndex()`).
+- Every video track is snapshotted (clip count + each clip's name/start/end)
+  both **before** and **after** `importMGT()` runs, via
+  `snapshotAllVideoTracks()`.
+- The inserted clip is located via a three-tier cascade, each tier checking
+  every video track, never a single fixed index:
+  1. `importMGT()`'s own return value, if it looks like a `TrackItem`
+     (`looksLikeTrackItem()`).
+  2. `findNewClipAcrossTracks()` — diff every track's clips before vs.
+     after by `(name, start)`; the first clip present after but absent
+     before, on *any* track.
+  3. `findClipByTimeAndName()` — last resort: a clip within 1s of the
+     requested insertion time whose name contains the MOGRT's base
+     filename, again across every track.
+- Insertion is only reported as a failure once **all three tiers** have
+  been checked and none found a clip; the failure response includes
+  `beforeClipCounts`/`afterClipCounts` (one entry per video track) so the
+  full picture is visible, not just track 0's.
+- `result.diagnostics` (an ordered array of log lines) now always
+  accompanies the response — active sequence name, video/audio track
+  counts, resolved track indexes and why, requested insertion time in both
+  seconds and ticks, before/after per-track clip counts as JSON,
+  `importMGT()`'s return type + a shallow safe description of its value,
+  and the detection tier + track index that found the clip. On success the
+  response also carries `detectedTrackIndex`, `detectionMethod`,
+  `importReturnType`, `requestedVideoTrackIndex`, and
+  `requestedAudioTrackIndex` directly on `result` for quick inspection
+  without opening `diagnostics`.
+- `src/ppro/cepBridge.js`'s `testCepWriteProof()` no longer hard-codes
+  `videoTrackIndex: 0` either. It now resolves the real topmost video track
+  on the UXP side first (`resolveTopVideoTrackIndexForCep()`, using the
+  same `requireActiveProjectAndSequence()` + `listVideoTracks()` helpers
+  every other UXP diagnostic in this project already uses) and only
+  includes `videoTrackIndex` in the payload if that resolves to a real
+  number — otherwise the field is omitted entirely and the ExtendScript
+  side's own independent topmost-track fallback takes over. Neither side
+  can silently default to `0` anymore.
+- `src/ui/cepBridgePanel.js` now renders `result.diagnostics` in a
+  collapsible `<details>` block, plus the detected-track/detection-method/
+  import-return-type/requested-track summary line, on both the success and
+  failure paths (including `beforeClipCounts`/`afterClipCounts` on
+  failure).
+- `test/cepHostScript.test.js` adds static regression checks (source-text
+  assertions, following `test/entrypoint.test.js`/`test/mogrt.test.js`'s
+  established pattern — `hostscript.jsx` can't run under Node, only
+  ExtendScript, so these check the file's source rather than executing it)
+  that specifically prevent the hard-coded-track-0 pattern from
+  reappearing, and confirm the multi-tier detection helpers are present and
+  genuinely iterate `sequence.videoTracks.numTracks`.
+
+**What is still unverified:** all of the above is grounded in the exact bug
+report and the same evidence-based discipline as every other fix in this
+project, but it has not yet been re-run against a live Premiere host by
+this agent (no host access in this environment). The next live run's
+`result.diagnostics` / `detectedTrackIndex` / `detectionMethod` will show
+definitively which track `importMGT()` actually used and whether
+`ComponentParam.setValue()` on Source Text succeeded — that is the
+information this fix was built to surface, not assume.

@@ -41,17 +41,46 @@ async function runWriteProof() {
   }
 }
 
+function diagnosticsBlock(diagnostics) {
+  if (!Array.isArray(diagnostics) || !diagnostics.length) return null;
+  return el("details", { class: "status-line" }, [
+    el("summary", { text: `Diagnostics (${diagnostics.length} step${diagnostics.length === 1 ? "" : "s"})` }),
+    el(
+      "pre",
+      { class: "diagnostics-log" },
+      [diagnostics.join("\n")]
+    ),
+  ]);
+}
+
 function resultBlock(result) {
   if (!result) return null;
   if (!result.ok) {
     const stepLabel = result.step ? ` (step: ${result.step})` : "";
-    return el("div", { class: "inspector-results" }, [
+    const lines = [
       el("div", { class: "status-line log-error", text: `✗ CEP Bridge Write Proof failed${stepLabel}${result.error ? `: ${result.error}` : ""}` }),
-    ]);
+    ];
+    if (Array.isArray(result.beforeClipCounts) || Array.isArray(result.afterClipCounts)) {
+      lines.push(
+        el("div", {
+          class: "status-line",
+          text: `Clip counts per video track — before: [${(result.beforeClipCounts ?? []).join(", ")}], after: [${(result.afterClipCounts ?? []).join(", ")}].`,
+        })
+      );
+    }
+    const diag = diagnosticsBlock(result.diagnostics);
+    if (diag) lines.push(diag);
+    return el("div", { class: "inspector-results" }, lines);
   }
   const r = result.result ?? {};
   const lines = [
     el("div", { class: "status-line log-success", text: `✓ Clip created: "${r.trackItemName ?? "n/a"}" at ${typeof r.start === "number" ? r.start.toFixed(3) : "n/a"}s.` }),
+    el("div", {
+      class: "status-line",
+      text:
+        `Detected on video track ${r.detectedTrackIndex ?? "unknown"} via "${r.detectionMethod ?? "n/a"}" ` +
+        `(importMGT() returned type: ${r.importReturnType ?? "n/a"}; requested video=${r.requestedVideoTrackIndex ?? "n/a"}, audio=${r.requestedAudioTrackIndex ?? "n/a"}).`,
+    }),
     el("div", {
       class: `status-line ${r.durationSetOk ? "log-success" : "log-warn"}`,
       text: r.durationSetOk
@@ -86,6 +115,8 @@ function resultBlock(result) {
       text: "This clip was NOT auto-removed — check the Premiere timeline directly to visually confirm, then delete it by hand. See cep-bridge/README.md.",
     })
   );
+  const diag = diagnosticsBlock(r.diagnostics);
+  if (diag) lines.push(diag);
   return el("div", { class: "inspector-results" }, lines);
 }
 

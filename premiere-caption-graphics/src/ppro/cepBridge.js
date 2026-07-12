@@ -20,11 +20,44 @@
  * codebase.
  */
 
+import { requireActiveProjectAndSequence, listVideoTracks } from "./timelineRange.js";
+
 const CEP_BRIDGE_BASE_URL = "http://localhost:3010";
 const DEFAULT_TIMEOUT_MS = 8000;
 const HEALTH_CHECK_TIMEOUT_MS = 2000;
 
 export const CEP_WRITE_PROOF_SENTINEL = "__KERIS_CEP_TEST__";
+
+/**
+ * Resolve the topmost video track index on the UXP side, matching the
+ * convention "the UXP insertion code previously targeted the top video
+ * track" — this is the SAME topmost-track convention, just resolved here
+ * instead of left hard-coded to 0. Returns `undefined` (not 0, not a
+ * guess) when it can't be determined — no active project/sequence, no
+ * video tracks, or a thrown error — so the payload simply omits
+ * videoTrackIndex and the CEP/ExtendScript side's own independent
+ * topmost-track fallback (see cep-bridge/jsx/hostscript.jsx) takes over.
+ * Never returns a hard-coded 0.
+ *
+ * @param {(message: string, level?: string) => void} [log]
+ * @returns {Promise<number | undefined>}
+ */
+export async function resolveTopVideoTrackIndexForCep(log) {
+  try {
+    const { sequence } = await requireActiveProjectAndSequence();
+    const tracks = await listVideoTracks(sequence);
+    if (!tracks.length) {
+      if (log) log("[cepBridge] No video tracks found on the active sequence — leaving videoTrackIndex unset.", "warn");
+      return undefined;
+    }
+    const topIndex = tracks.length - 1;
+    if (log) log(`[cepBridge] Resolved topmost video track for CEP payload → index ${topIndex} (of ${tracks.length}).`, "info");
+    return topIndex;
+  } catch (err) {
+    if (log) log(`[cepBridge] Could not resolve topmost video track: ${err.message || err} — leaving videoTrackIndex unset.`, "warn");
+    return undefined;
+  }
+}
 
 function makeRequestId() {
   return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -138,7 +171,7 @@ export async function testCepWriteProof(opts) {
     log,
     sentinel = CEP_WRITE_PROOF_SENTINEL,
     durationSec = 2,
-    videoTrackIndex = 0,
+    videoTrackIndex,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   } = opts;
 
@@ -160,7 +193,20 @@ export async function testCepWriteProof(opts) {
   }
   log("✓ CEP bridge is reachable.", "success");
 
-  const result = await callCepBridge("createTextGraphic", { mogrtPath, text: sentinel, durationSec, videoTrackIndex }, { timeoutMs, log });
+  // Never hard-code videoTrackIndex to 0 — on a sequence with many video
+  // tracks that's very unlikely to be where the editor wants the caption
+  // graphic. Resolve the real topmost video track (the same convention the
+  // UXP MOGRT-insertion path already uses) unless the caller passed an
+  // explicit index. If resolution fails, omit the field entirely rather
+  // than guessing — the ExtendScript side has its own independent
+  // topmost-track fallback (see cep-bridge/jsx/hostscript.jsx).
+  const resolvedVideoTrackIndex =
+    typeof videoTrackIndex === "number" ? videoTrackIndex : await resolveTopVideoTrackIndexForCep(log);
+
+  const payload = { mogrtPath, text: sentinel, durationSec };
+  if (typeof resolvedVideoTrackIndex === "number") payload.videoTrackIndex = resolvedVideoTrackIndex;
+
+  const result = await callCepBridge("createTextGraphic", payload, { timeoutMs, log });
 
   log(result.ok ? "════ CEP Bridge Write Proof — finished ════" : "════ CEP Bridge Write Proof — finished with errors ════", result.ok ? "success" : "error");
   return result;

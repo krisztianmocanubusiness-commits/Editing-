@@ -176,7 +176,7 @@ test("testCepWriteProof returns step:bridge-unavailable and never calls /command
   assert.deepEqual(calledUrls, ["http://localhost:3010/health"]);
 });
 
-test("testCepWriteProof calls createTextGraphic with the sentinel/duration/track defaults and forwards the result", async () => {
+test("testCepWriteProof calls createTextGraphic with the sentinel/duration defaults and forwards the result; videoTrackIndex is omitted (not hard-coded to 0) when it can't be resolved outside a hosted UXP runtime", async () => {
   const calledUrls = [];
   let capturedPayload = null;
   await withFetch(
@@ -193,5 +193,24 @@ test("testCepWriteProof calls createTextGraphic with the sentinel/duration/track
     }
   );
   assert.deepEqual(calledUrls, ["http://localhost:3010/health", "http://localhost:3010/command"]);
-  assert.deepEqual(capturedPayload, { mogrtPath: "/x.mogrt", text: CEP_WRITE_PROOF_SENTINEL, durationSec: 2, videoTrackIndex: 0 });
+  // Outside a hosted UXP runtime (as in this test), resolveTopVideoTrackIndexForCep()
+  // can't reach a real project/sequence and returns undefined — the payload must
+  // omit videoTrackIndex rather than fabricate a 0, per the fix for the
+  // "importMGT() did not appear to add a clip to video track 0" bug.
+  assert.deepEqual(capturedPayload, { mogrtPath: "/x.mogrt", text: CEP_WRITE_PROOF_SENTINEL, durationSec: 2 });
+});
+
+test("testCepWriteProof forwards an explicit videoTrackIndex verbatim without trying to resolve one", async () => {
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      capturedPayload = JSON.parse(init.body).payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: {} });
+    },
+    async () => {
+      await testCepWriteProof({ mogrtPath: "/x.mogrt", log: noopLog, videoTrackIndex: 12 });
+    }
+  );
+  assert.equal(capturedPayload.videoTrackIndex, 12);
 });

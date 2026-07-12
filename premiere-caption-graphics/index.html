@@ -6,21 +6,32 @@
     <link rel="stylesheet" href="src/style.css" />
   </head>
   <body>
-    <header class="app-header">
-      <h1>Caption Graphics Studio</h1>
-      <p class="subtitle">Transcript &rarr; timed caption chunks &rarr; styled graphics on the timeline</p>
-    </header>
+    <!--
+      panel-scroll is the ONE scrollable region for the whole panel — header
+      (sticky), every section 0-6 (#app, re-rendered by src/ui/render.js),
+      and the Log section all live inside it. Deliberately a dedicated div,
+      not body/html directly: making body itself the scroll container hits
+      a legacy CSS quirk (an html/body with no other wrapper propagates
+      body's overflow up to the viewport), which made the sticky header
+      above unreliable. See src/style.css for the height/overflow rules.
+    -->
+    <div id="panel-scroll" class="panel-scroll">
+      <header class="app-header">
+        <h1>Caption Graphics Studio</h1>
+        <p class="subtitle">Transcript &rarr; timed caption chunks &rarr; styled graphics on the timeline</p>
+      </header>
 
-    <div id="app"></div>
+      <div id="app"></div>
 
-    <section class="panel panel-log">
-      <h2>Log</h2>
-      <div class="row">
-        <button id="copy-log-btn" class="btn" type="button">Copy Log</button>
-        <button id="clear-log-btn" class="btn" type="button">Clear Log</button>
-      </div>
-      <div id="log-body" class="log-body"></div>
-    </section>
+      <section class="panel panel-log">
+        <h2>Log</h2>
+        <div class="row">
+          <button id="copy-log-btn" class="btn" type="button">Copy Log</button>
+          <button id="clear-log-btn" class="btn" type="button">Clear Log</button>
+        </div>
+        <div id="log-body" class="log-body"></div>
+      </section>
+    </div>
 
     <!--
       Plain classic script — do NOT change this to type="module". UXP's

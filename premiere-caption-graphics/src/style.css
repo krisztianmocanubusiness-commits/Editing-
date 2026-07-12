@@ -15,14 +15,61 @@
 
 * { box-sizing: border-box; }
 
-body {
+/*
+ * Panel-level scroll fix (distinct from the Log box's own internal
+ * scroll region below). Confirmed real-host bug: with no explicit
+ * height on html/body/the app wrapper, Premiere's UXP docked-panel
+ * webview did not let the page scroll at all once sections 0-6 plus the
+ * Log panel exceeded the docked panel's visible height — content below
+ * the fold (most often the Log section, right at the bottom) was simply
+ * unreachable, with no way to scroll down to it.
+ *
+ * html and body both need an explicit height (100%, i.e. "fill exactly
+ * the panel's viewport, no more/no less") for a descendant's
+ * overflow-y:auto to actually produce a working scroll region in this
+ * host. #panel-scroll (wrapping the header + #app + the Log section — see
+ * index.html) is the ONE designated scrollable container, deliberately
+ * NOT body/html directly: making body itself scrollable hits a legacy
+ * CSS quirk where a plain html>body with no other wrapper propagates
+ * body's overflow up to the viewport, which breaks position:sticky on
+ * children (confirmed while testing the header below — it silently
+ * failed to stick when body was the scroll container, worked correctly
+ * with this separate wrapper). overflow must stay `auto`, never
+ * `hidden`, on html, body, and #panel-scroll/#app, or the whole page
+ * (not just the log box) goes back to being clipped instead of
+ * scrolling.
+ */
+html, body {
+  height: 100%;
   margin: 0;
+  overflow: visible;
+}
+
+body {
   background: var(--bg);
   color: var(--text);
   font-size: 12px;
 }
 
-.app-header { padding: 12px 14px 4px; }
+.panel-scroll {
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/*
+ * Sticky, not just top-of-page: stays visible while everything below it
+ * (including the Log section at the very bottom) scrolls underneath, so
+ * the panel title/subtitle remain a stable anchor at any scroll position
+ * instead of scrolling out of view along with the rest of the content.
+ */
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  padding: 12px 14px 4px;
+}
 .app-header h1 { font-size: 15px; margin: 0 0 2px; }
 .subtitle { margin: 0; color: var(--text-dim); font-size: 11px; }
 

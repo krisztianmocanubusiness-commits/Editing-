@@ -90,4 +90,14 @@ export const store = createStore({
     valueShapesProbeRunning: false,
     lastValueShapesProbe: null, // full testProbeSourceTextValueShapes() return value, or null — see src/ppro/sourceTextProbe.js
   },
+
+  // Experimental CEP/ExtendScript write bridge — see ../ppro/cepBridge.js,
+  // ../../cep-bridge/, and docs/CEP_BRIDGE_INVESTIGATION.md. Fully
+  // separate from templateInspector's state; this section can be removed
+  // without touching any of the UXP-only diagnostics above.
+  cepBridge: {
+    mogrtPath: "",
+    running: false,
+    lastResult: null, // full testCepWriteProof() return value, or null — see src/ppro/cepBridge.js
+  },
 });

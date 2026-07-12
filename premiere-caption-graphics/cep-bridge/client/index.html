@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Caption Studio CEP Bridge</title>
+    <style>
+      body { margin: 0; padding: 10px; background: #1e1e1e; color: #e6e6e6; font: 12px "Segoe UI", sans-serif; }
+      h1 { font-size: 13px; margin: 0 0 6px; }
+      #status { margin: 6px 0; padding: 6px 8px; border-radius: 4px; background: #262626; border: 1px solid #3a3a3a; }
+      #log { margin-top: 8px; height: 120px; overflow-y: auto; background: #161616; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 10.5px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Caption Studio CEP Bridge (experimental)</h1>
+    <div id="status">Starting…</div>
+    <div id="log"></div>
+
+    <!-- Adobe's official CSInterface library — copied verbatim, do not edit. -->
+    <script src="./CSInterface.js"></script>
+    <!--
+      Plain classic script, not type="module" — same reasoning as the UXP
+      panel's dist/main.js (see src/main.js's header comment in the UXP
+      extension): keep the execution model as plain and predictable as
+      possible for a CEP panel too, and this file is small enough not to
+      need bundling.
+    -->
+    <script src="./main.js"></script>
+  </body>
+</html>

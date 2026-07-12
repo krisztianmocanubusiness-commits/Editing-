@@ -191,6 +191,17 @@ step-by-step instructions and how to read the output:
   `src/ppro/*` scripting layer cannot be unit-tested outside a live host —
   that's what the smoke test panel, Template Inspector, and their docs
   are for.
+- `cep-bridge/` — a separate, **experimental** CEP/ExtendScript extension,
+  not part of the normal UXP panel above. UXP's `createSetValueAction()`
+  cannot write native Premiere MOGRT `Source Text` (nine rounds of
+  investigation — see `docs/MOGRT_DIAGNOSTIC.md`); this is a proof of
+  concept testing whether ExtendScript's `ComponentParam.setValue()` can,
+  through a small local HTTP bridge (`src/ppro/cepBridge.js` on the UXP
+  side, `cep-bridge/client/main.js` + `cep-bridge/jsx/hostscript.jsx` on the
+  CEP side). See `docs/CEP_BRIDGE_INVESTIGATION.md` for the full research
+  and architecture writeup, and `cep-bridge/README.md` for setup/install.
+  Windows-only for now (Premiere disallows plain `http://` on macOS).
+  Installing/removing it does not affect the UXP extension at all.
 
 ## Running the tests
 

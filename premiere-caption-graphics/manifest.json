@@ -11,7 +11,10 @@
   "manifestVersion": 5,
   "requiredPermissions": {
     "localFileSystem": "request",
-    "clipboard": "readAndWrite"
+    "clipboard": "readAndWrite",
+    "network": {
+      "domains": ["http://localhost:3010"]
+    }
   },
   "entrypoints": [
     {

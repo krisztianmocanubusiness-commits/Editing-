@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Experimental CEP/ExtendScript write-side proof of concept for Caption
+  Graphics Studio. Completely separate from the UXP extension one directory
+  up (../manifest.json, ../src/, ../dist/) — installing or removing this
+  extension does not affect that one.
+
+  Format grounded in Adobe's own PProPanel sample manifest
+  (github.com/Adobe-CEP/Samples/blob/master/PProPanel/CSXS/manifest.xml),
+  extended with the Node.js integration flags documented for running a
+  Node server inside a CEP panel (enable-nodejs, mixed-context CEFCommandLine
+  parameters below — see docs/CEP_BRIDGE_INVESTIGATION.md Part 4).
+  NOTE: XML comments must never contain a literal double-hyphen, which is
+  why the flag names above are written without their leading dashes.
+-->
+<ExtensionManifest Version="8.0" ExtensionBundleId="com.captionstudio.cepbridge" ExtensionBundleVersion="0.1.0"
+  ExtensionBundleName="Caption Graphics Studio CEP Bridge (experimental)"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExtensionList>
+    <Extension Id="com.captionstudio.cepbridge.panel" Version="0.1.0" />
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList>
+      <Host Name="PPRO" Version="[22.0,99.0]" />
+    </HostList>
+    <LocaleList>
+      <Locale Code="All" />
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="9.0" />
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.captionstudio.cepbridge.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./client/index.html</MainPath>
+          <ScriptPath>./jsx/hostscript.jsx</ScriptPath>
+          <CEFCommandLine>
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+            <Parameter>--allow-file-access</Parameter>
+            <Parameter>--allow-file-access-from-files</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>Caption Studio CEP Bridge (experimental)</Menu>
+          <Geometry>
+            <Size>
+              <Height>220</Height>
+              <Width>360</Width>
+            </Size>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

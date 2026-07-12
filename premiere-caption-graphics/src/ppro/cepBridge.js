@@ -1,0 +1,167 @@
+/**
+ * UXP-side client for the experimental CEP/ExtendScript write bridge (see
+ * ../../cep-bridge/ and ../../docs/CEP_BRIDGE_INVESTIGATION.md). UXP
+ * cannot host a server — only act as a network client — so this is
+ * deliberately the client half of the pair: the CEP panel
+ * (cep-bridge/client/main.js) hosts a small local HTTP server, and this
+ * module talks to it via `fetch()`.
+ *
+ * CONFIRMED PLATFORM LIMITATION (Adobe's own docs): "Premiere disallows
+ * http:// URLs on macOS" — this bridge, as built, only works on Windows
+ * until the CEP side adds a self-signed HTTPS listener (not yet
+ * implemented — see docs/CEP_BRIDGE_INVESTIGATION.md's limitations
+ * section). On macOS, every call here will fail with a network error; that
+ * failure is reported clearly, not silently swallowed.
+ *
+ * Every function here returns the same {ok, ...} shape the rest of this
+ * project's src/ppro/*.js diagnostics use, and every network call is
+ * timeout-guarded via AbortController — the same "never hang, always
+ * report exactly what happened" discipline as everywhere else in this
+ * codebase.
+ */
+
+const CEP_BRIDGE_BASE_URL = "http://localhost:3010";
+const DEFAULT_TIMEOUT_MS = 8000;
+const HEALTH_CHECK_TIMEOUT_MS = 2000;
+
+export const CEP_WRITE_PROOF_SENTINEL = "__KERIS_CEP_TEST__";
+
+function makeRequestId() {
+  return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * POSTs one command to the CEP bridge's /command endpoint and returns its
+ * JSON response verbatim (already {ok, requestId, result|error} shaped by
+ * the CEP side). Network-level failures (bridge not running, timeout, bad
+ * JSON) are normalized into that same shape here, so every caller has one
+ * shape to check regardless of what went wrong or where.
+ *
+ * @param {string} command
+ * @param {Object} payload
+ * @param {{ timeoutMs?: number, log?: (message: string, level?: string) => void }} [opts]
+ */
+export async function callCepBridge(command, payload, opts = {}) {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, log } = opts;
+  const requestId = makeRequestId();
+
+  if (log) log(`[cepBridge] → ${command} (requestId=${requestId})`, "info");
+
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
+  try {
+    response = await fetch(`${CEP_BRIDGE_BASE_URL}/command`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, payload, requestId }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeoutHandle);
+    if (err && err.name === "AbortError") {
+      if (log) log(`[cepBridge] ✗ ${command} timed out after ${timeoutMs}ms.`, "error");
+      return { ok: false, requestId, step: "timeout", error: `CEP bridge did not respond within ${timeoutMs}ms.` };
+    }
+    const error =
+      `CEP bridge unavailable at ${CEP_BRIDGE_BASE_URL} — is the "Caption Studio CEP Bridge" panel open in Premiere ` +
+      `(Window > Extensions)? On macOS this also fails if the bridge hasn't been upgraded to HTTPS yet — see ` +
+      `docs/CEP_BRIDGE_INVESTIGATION.md. (${err.message || err})`;
+    if (log) log(`[cepBridge] ✗ ${command}: ${error}`, "error");
+    return { ok: false, requestId, step: "unreachable", error };
+  }
+  clearTimeout(timeoutHandle);
+
+  if (!response.ok) {
+    const error = `CEP bridge returned HTTP ${response.status}.`;
+    if (log) log(`[cepBridge] ✗ ${command}: ${error}`, "error");
+    return { ok: false, requestId, step: "http", error };
+  }
+
+  let json;
+  try {
+    json = await response.json();
+  } catch (err) {
+    const error = `CEP bridge returned a non-JSON response: ${err.message || err}`;
+    if (log) log(`[cepBridge] ✗ ${command}: ${error}`, "error");
+    return { ok: false, requestId, step: "parse", error };
+  }
+
+  if (log) log(json.ok ? `[cepBridge] ✓ ${command} succeeded` : `[cepBridge] ✗ ${command} failed: ${json.error ?? "unknown error"}`, json.ok ? "success" : "error");
+  return json;
+}
+
+/**
+ * Quick GET /health check — used before a real command so the UI can
+ * distinguish "the bridge panel isn't open" from "the command itself
+ * failed", with a short timeout since this is meant to be a fast,
+ * frequent-ish check.
+ */
+export async function checkCepBridgeHealth() {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${CEP_BRIDGE_BASE_URL}/health`, { signal: controller.signal });
+    clearTimeout(timeoutHandle);
+    if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
+    const json = await response.json();
+    return { ok: true, ...json };
+  } catch (err) {
+    clearTimeout(timeoutHandle);
+    return { ok: false, error: err && err.name === "AbortError" ? "timed out" : String(err.message || err) };
+  }
+}
+
+/**
+ * The full proof-of-concept entry point: checks the bridge is reachable,
+ * then asks it to import the given .mogrt at the playhead, set its
+ * duration, and attempt ComponentParam.setValue() on its Source Text
+ * param — the direct ExtendScript equivalent of the UXP
+ * createSetValueAction() call that threw "Illegal Parameter type". See
+ * cep-bridge/jsx/hostscript.jsx for exactly what runs host-side.
+ *
+ * Deliberately does NOT clean up the created clip — see
+ * cep-bridge/README.md for why.
+ *
+ * @param {Object} opts
+ * @param {string} opts.mogrtPath
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {string} [opts.sentinel]
+ * @param {number} [opts.durationSec]
+ * @param {number} [opts.videoTrackIndex]
+ * @param {number} [opts.timeoutMs]
+ */
+export async function testCepWriteProof(opts) {
+  const {
+    mogrtPath,
+    log,
+    sentinel = CEP_WRITE_PROOF_SENTINEL,
+    durationSec = 2,
+    videoTrackIndex = 0,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+  } = opts;
+
+  log("════ CEP Bridge Write Proof — start ════", "info");
+
+  if (!mogrtPath) {
+    log("✗ No .mogrt selected.", "error");
+    return { ok: false, step: "mogrt-path" };
+  }
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const result = await callCepBridge("createTextGraphic", { mogrtPath, text: sentinel, durationSec, videoTrackIndex }, { timeoutMs, log });
+
+  log(result.ok ? "════ CEP Bridge Write Proof — finished ════" : "════ CEP Bridge Write Proof — finished with errors ════", result.ok ? "success" : "error");
+  return result;
+}

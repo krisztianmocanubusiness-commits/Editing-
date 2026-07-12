@@ -7,6 +7,7 @@ import { renderRangePanel } from "./rangePanel.js";
 import { renderChunkListPanel } from "./chunkListPanel.js";
 import { renderPresetPanel } from "./presetPanel.js";
 import { renderApplyPanel } from "./applyPanel.js";
+import { renderCepBridgePanel } from "./cepBridgePanel.js";
 import { isHosted } from "../ppro/client.js";
 import { log } from "../util/log.js";
 
@@ -50,6 +51,7 @@ function renderAll() {
   mountSection(root, "4. Split into timed caption chunks", renderChunkListPanel);
   mountSection(root, "5. Style preset", renderPresetPanel);
   mountSection(root, "6. Approve & apply", renderApplyPanel);
+  mountSection(root, "7. CEP Bridge (experimental)", renderCepBridgePanel);
 
   firstRenderDone = true;
 }

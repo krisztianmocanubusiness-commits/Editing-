@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Enables the Chrome DevTools remote debugger for this unsigned, in-development
+     CEP extension. Open http://localhost:7778 in a Chromium-based browser while
+     Premiere Pro is running with this extension loaded. See README.md. -->
+<ExtensionList>
+    <Extension Id="com.captionstudio.cepbridge.panel">
+        <HostList>
+            <Host Name="PPRO" Port="7778"/>
+        </HostList>
+    </Extension>
+</ExtensionList>

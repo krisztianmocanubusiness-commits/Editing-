@@ -9,6 +9,8 @@
       #status { margin: 6px 0; padding: 6px 8px; border-radius: 4px; background: #262626; border: 1px solid #3a3a3a; }
       #last-eval-label { margin-top: 8px; font-size: 10.5px; color: #999; }
       #last-eval-script { margin: 2px 0 0; background: #161616; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 10.5px; white-space: pre-wrap; word-break: break-all; max-height: 80px; overflow-y: auto; }
+      #startup-diagnostics-label { margin-top: 8px; font-size: 10.5px; color: #999; }
+      #startup-diagnostics { margin: 2px 0 0; background: #161616; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 10.5px; white-space: pre-wrap; word-break: break-all; max-height: 140px; overflow-y: auto; }
       #log { margin-top: 8px; height: 120px; overflow-y: auto; background: #161616; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 10.5px; white-space: pre-wrap; }
     </style>
   </head>
@@ -24,6 +26,16 @@
     -->
     <div id="last-eval-label">Last evalScript() source sent:</div>
     <pre id="last-eval-script">(none yet)</pre>
+    <!--
+      Explicit hostscript loader (docs/CEP_BRIDGE_INVESTIGATION.md Part
+      16): resolved extension root, resolved hostscript.jsx path, the
+      exact $.evalFile() source string, its raw callback, and
+      typeof $._captionStudioBridge after loading — kept visible here
+      (not just scrolled into the log) since these run once at startup,
+      before any command is attempted.
+    -->
+    <div id="startup-diagnostics-label">Startup diagnostics (extension root, hostscript path, $.evalFile() load):</div>
+    <pre id="startup-diagnostics">(none yet)</pre>
     <div id="log"></div>
 
     <!-- Adobe's official CSInterface library — copied verbatim, do not edit. -->

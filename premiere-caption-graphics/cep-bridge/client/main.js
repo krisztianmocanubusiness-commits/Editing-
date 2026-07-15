@@ -91,6 +91,7 @@ try {
 
   const logEl = document.getElementById("log");
   const lastEvalScriptEl = document.getElementById("last-eval-script");
+  const startupDiagnosticsEl = document.getElementById("startup-diagnostics");
 
   function log(message, level) {
     const time = new Date().toLocaleTimeString();
@@ -114,6 +115,24 @@ try {
   // before the call is made.
   function showLastEvalScript(script) {
     if (lastEvalScriptEl) lastEvalScriptEl.textContent = script;
+  }
+
+  // Task 4: logs a startup diagnostic line to BOTH the scrolling log and a
+  // separate, persistent, always-visible element — so the extension root,
+  // hostscript path, evalFile script/callback, and namespace check all
+  // stay on screen at once rather than scrolling away in the log.
+  let startupDiagnosticsCleared = false;
+  function logStartupDiagnostic(message) {
+    log(message, "info");
+    if (startupDiagnosticsEl) {
+      if (!startupDiagnosticsCleared) {
+        startupDiagnosticsEl.textContent = "";
+        startupDiagnosticsCleared = true;
+      }
+      const line = document.createElement("div");
+      line.textContent = message;
+      startupDiagnosticsEl.appendChild(line);
+    }
   }
 
   setStatus("Loading classifier…", true); // stage 2 (task 2)
@@ -426,11 +445,59 @@ try {
   });
 
   /**
-   * Task 6: proves — automatically, on every panel load, with no user
+   * Tasks 1-5: real-host result that redirects this investigation again —
+   * even `JSON.stringify({ok:true})` (a pure literal, zero dependency on
+   * anything this project defines) was reported failing via /raw-eval,
+   * over a CEP bridge already confirmed reachable at the HTTP layer. That
+   * narrows the problem to CSInterface.evalScript() itself or to
+   * hostscript.jsx not actually being loaded into the ExtendScript engine
+   * — so before attempting "ping" or any other dispatch command, this
+   * explicitly loads hostscript.jsx via `$.evalFile()` (rather than
+   * relying solely on the manifest's ScriptPath mechanism — see
+   * docs/CEP_BRIDGE_INVESTIGATION.md Part 16) and logs every step
+   * visibly, both to the scrolling log and the persistent
+   * #startup-diagnostics element: the resolved extension root
+   * (`CSInterface.getSystemPath(SystemPath.EXTENSION)`), the resolved
+   * absolute path to jsx/hostscript.jsx, the exact `$.evalFile(...)`
+   * source string, the raw evalFile callback (via the same
+   * classifyRawEvalResult()-backed runRawEvalScript() every other bypass
+   * test uses — never JSON.parsed), and `typeof $._captionStudioBridge`
+   * immediately afterward, so it's directly checkable whether the
+   * namespace exists post-load, before "ping" is ever attempted.
+   */
+  async function runExplicitHostscriptLoad() {
+    setStatus("Resolving extension root…", true);
+    // eslint-disable-next-line no-undef
+    const extensionRoot = csInterface.getSystemPath(SystemPath.EXTENSION);
+    logStartupDiagnostic(`Extension root: ${extensionRoot}`);
+
+    const hostscriptPath = `${extensionRoot}/jsx/hostscript.jsx`;
+    logStartupDiagnostic(`Hostscript path: ${hostscriptPath}`);
+
+    setStatus("Loading hostscript.jsx via $.evalFile()…", true);
+    // Escape backslashes (Windows paths) and double quotes before
+    // embedding the path as a JS string literal argument to $.evalFile().
+    const escapedPath = hostscriptPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const evalFileScript = `$.evalFile("${escapedPath}")`;
+    logStartupDiagnostic(`evalFile script: ${evalFileScript}`);
+
+    const evalFileResult = await runRawEvalScript(evalFileScript);
+    logStartupDiagnostic(
+      `evalFile raw callback: ${JSON.stringify(evalFileResult.rawResult)} (isEvalScriptError=${evalFileResult.isEvalScriptError}` +
+        `${evalFileResult.transportError ? `, transportError=${evalFileResult.transportError}` : ""})`
+    );
+
+    setStatus("Checking $._captionStudioBridge namespace…", true);
+    const typeofResult = await runRawEvalScript("typeof $._captionStudioBridge");
+    logStartupDiagnostic(`typeof $._captionStudioBridge after loading: ${JSON.stringify(typeofResult.rawResult)}`);
+  }
+
+  /**
+   * Task 4: proves — automatically, on every panel load, with no user
    * action required — whether the ExtendScript engine that's actually
    * running has this session's latest hostscript.jsx loaded, or a stale
    * earlier build. Calls "ping" (the oldest, least-likely-to-be-stale
-   * command) immediately after the HTTP server starts, and shows the
+   * command) after runExplicitHostscriptLoad() above, and shows the
    * returned hostscriptBuildId/supportedCommands directly in the panel's
    * status line — if this reads an OLD build ID or is missing the newest
    * commands, that alone proves the engine needs Premiere restarted (or the
@@ -440,6 +507,7 @@ try {
   async function runStartupBuildCheck() {
     log("Checking loaded hostscript.jsx build (startup ping)…", "info");
     const result = await runExtendScriptCommand("ping", {}, "startup-ping");
+    logStartupDiagnostic(`ping result after loading: ${JSON.stringify(result)}`);
     if (!result.ok) {
       setStatus(`Bridge is up, but the startup ping to ExtendScript failed: ${result.error ?? "unknown error"}`, false);
       log(`✗ Startup ping failed: ${result.error ?? "unknown error"}`, "error");
@@ -451,11 +519,16 @@ try {
     log(`✓ Loaded hostscript.jsx build: ${buildId ?? "unknown"}. Supported commands: ${commands.join(", ") || "(none reported — pre-build-ID version)"}`, "success");
   }
 
+  async function runStartupSequence() {
+    await runExplicitHostscriptLoad();
+    await runStartupBuildCheck();
+  }
+
   server.listen(PORT, HOST, () => {
-    setStatus(`Listening on http://${HOST}:${PORT} — checking hostscript.jsx build…`, true); // stage 4 (task 2)
+    setStatus(`Listening on http://${HOST}:${PORT} — loading hostscript.jsx…`, true); // stage 4 (task 2)
     log(`✓ Bridge server started on http://${HOST}:${PORT}`, "success");
-    runStartupBuildCheck().catch((err) => {
-      log(`✗ Startup build check crashed: ${err.message || err}`, "error");
+    runStartupSequence().catch((err) => {
+      log(`✗ Startup sequence crashed: ${err.message || err}`, "error");
     });
   });
 } catch (err) {

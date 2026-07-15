@@ -191,3 +191,84 @@ test("the server routes POST /raw-eval to handleRawEval, distinct from POST /com
   assert.match(source, /req\.method === "POST" && req\.url === "\/raw-eval"/);
   assert.match(source, /handleRawEval\(req, res\)/);
 });
+
+// --- Explicit hostscript loader (Part 16): even JSON.stringify({ok:true})
+// — a pure literal with zero dependency on anything this project defines
+// — was reported failing over a CEP bridge already confirmed reachable at
+// the HTTP layer, narrowing the problem to CSInterface.evalScript()
+// itself or to hostscript.jsx not actually being loaded. These checks
+// guard the explicit $.evalFile() loader added to answer that.
+
+function extractFnBody(source, signaturePattern, label) {
+  const match = source.match(signaturePattern);
+  assert.ok(match, `expected to find ${label}`);
+  return match[0];
+}
+
+test("task 1: runExplicitHostscriptLoad() resolves the extension root via CSInterface.getSystemPath(SystemPath.EXTENSION)", () => {
+  const source = readMainJs();
+  const fnSource = extractFnBody(source, /async function runExplicitHostscriptLoad\(\)\s*\{[\s\S]*?\n {2}\}/, "runExplicitHostscriptLoad()'s body");
+  assert.match(fnSource, /csInterface\.getSystemPath\(SystemPath\.EXTENSION\)/);
+});
+
+test("task 2: runExplicitHostscriptLoad() builds an absolute path to jsx/hostscript.jsx from the resolved extension root", () => {
+  const source = readMainJs();
+  const fnSource = extractFnBody(source, /async function runExplicitHostscriptLoad\(\)\s*\{[\s\S]*?\n {2}\}/, "runExplicitHostscriptLoad()'s body");
+  assert.match(fnSource, /jsx\/hostscript\.jsx/);
+});
+
+test("task 3: runExplicitHostscriptLoad() calls $.evalFile() explicitly, via runRawEvalScript() (evalScript), before runStartupBuildCheck()/ping ever runs", () => {
+  const source = readMainJs();
+  const fnSource = extractFnBody(source, /async function runExplicitHostscriptLoad\(\)\s*\{[\s\S]*?\n {2}\}/, "runExplicitHostscriptLoad()'s body");
+  assert.match(fnSource, /\$\.evalFile\(/);
+  assert.match(fnSource, /runRawEvalScript\(evalFileScript\)/);
+
+  // Ordering: runExplicitHostscriptLoad() must be awaited before
+  // runStartupBuildCheck() (which calls "ping") inside runStartupSequence().
+  const sequenceFnSource = extractFnBody(source, /async function runStartupSequence\(\)\s*\{[\s\S]*?\n {2}\}/, "runStartupSequence()'s body");
+  const loadIndex = sequenceFnSource.indexOf("runExplicitHostscriptLoad()");
+  const pingIndex = sequenceFnSource.indexOf("runStartupBuildCheck()");
+  assert.ok(loadIndex !== -1 && pingIndex !== -1);
+  assert.ok(loadIndex < pingIndex, "runExplicitHostscriptLoad() must run before runStartupBuildCheck() (ping)");
+});
+
+test("task 4: runExplicitHostscriptLoad() logs the resolved extension root, hostscript path, evalFile script, and raw evalFile callback; runStartupBuildCheck() logs the ping result", () => {
+  const source = readMainJs();
+  const loadFnSource = extractFnBody(source, /async function runExplicitHostscriptLoad\(\)\s*\{[\s\S]*?\n {2}\}/, "runExplicitHostscriptLoad()'s body");
+  assert.match(loadFnSource, /Extension root:/);
+  assert.match(loadFnSource, /Hostscript path:/);
+  assert.match(loadFnSource, /evalFile script:/);
+  assert.match(loadFnSource, /evalFile raw callback:/);
+  assert.match(loadFnSource, /typeof \$\._captionStudioBridge after loading:/);
+
+  const pingFnSource = extractFnBody(source, /async function runStartupBuildCheck\(\)\s*\{[\s\S]*?\n {2}\}/, "runStartupBuildCheck()'s body");
+  assert.match(pingFnSource, /ping result after loading:/);
+});
+
+test("task 4: startup diagnostics are shown in a persistent panel element (#startup-diagnostics), not just the scrolling log", () => {
+  const source = readMainJs();
+  assert.match(source, /getElementById\("startup-diagnostics"\)/);
+  assert.match(source, /function logStartupDiagnostic\(message\)/);
+});
+
+test("index.html declares the #startup-diagnostics persistent element", () => {
+  const htmlPath = path.join(ROOT, "cep-bridge", "client", "index.html");
+  const html = fs.readFileSync(htmlPath, "utf8");
+  assert.match(html, /id="startup-diagnostics"/);
+});
+
+test("the evalFile path is escaped (backslashes and double quotes) before being embedded in the evalScript source string", () => {
+  const source = readMainJs();
+  const fnSource = extractFnBody(source, /async function runExplicitHostscriptLoad\(\)\s*\{[\s\S]*?\n {2}\}/, "runExplicitHostscriptLoad()'s body");
+  // String.raw keeps every backslash/quote below exactly as typed, so these
+  // are plain substring checks against the literal source text on disk —
+  // no nested regex-escaping-of-escaping to get wrong.
+  assert.ok(
+    fnSource.includes(String.raw`replace(/\\/g, "\\\\")`),
+    "expected backslash-escaping (replace(/\\/g, \"\\\\\")) of the hostscript path before embedding it in a JS string literal"
+  );
+  assert.ok(
+    fnSource.includes(String.raw`replace(/"/g, '\\"')`),
+    "expected double-quote-escaping (replace(/\"/g, '\\\"')) of the hostscript path before embedding it in a JS string literal"
+  );
+});

@@ -600,11 +600,20 @@ test("echoPayload defaults to a {hello: 'world'} payload when none is given", as
 
 // --- runRawEvalScript / BYPASS_TEST_SCRIPTS ---
 
-test("BYPASS_TEST_SCRIPTS defines all six bypass scripts required by the investigation", () => {
+test("BYPASS_TEST_SCRIPTS defines all eight bypass scripts required by the investigation", () => {
   const keys = Object.keys(BYPASS_TEST_SCRIPTS);
   assert.deepEqual(
     keys.sort(),
-    ["BARE_DISPATCH_EXPECTED_FAIL", "BARE_GLOBAL_HELPER", "BARE_GLOBAL_NEW", "QUALIFIED_DISPATCH_ECHO", "QUALIFIED_DISPATCH_PING", "RAW_LITERAL"].sort()
+    [
+      "BARE_DISPATCH_EXPECTED_FAIL",
+      "BARE_GLOBAL_HELPER",
+      "BARE_GLOBAL_NEW",
+      "QUALIFIED_DISPATCH_ECHO",
+      "QUALIFIED_DISPATCH_PING",
+      "RAW_LITERAL",
+      "NAMESPACE_TYPEOF",
+      "APP_NAME",
+    ].sort()
   );
   for (const key of keys) {
     assert.equal(typeof BYPASS_TEST_SCRIPTS[key].label, "string");

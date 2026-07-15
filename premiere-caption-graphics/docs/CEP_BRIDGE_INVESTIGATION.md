@@ -1234,3 +1234,123 @@ direct, first-hand read of exactly what changed between "last known
 working" and "now stuck," but confirming the panel reaches "Listening on
 http://127.0.0.1:3010 — hostscript.jsx build: …" again requires the next
 real-host run.
+
+## Part 16: ninth real-host run — every bypass test still fails, including the pure literal; explicit `$.evalFile()` loading
+
+**Confirmed real-host result:** after Part 15's startup fix, the bridge
+server itself is reachable again — but the raw bypass tests *still* all
+fail, including test #1, the pure literal `JSON.stringify({ok:true})`.
+This is a stronger signal than Part 14's version of the same symptom: this
+time the transport/classification bug from Part 14 is already fixed and
+verified (`test/cepRawEvalClassify.test.js`, `test/cepClientMain.test.js`
+both green), and the HTTP layer is confirmed working (the bridge answers
+at all). A script with zero dependency on anything this project defines —
+no `$._captionStudioBridge`, no `dispatch`, no custom helper — failing
+`CSInterface.evalScript()` itself means one of exactly two things:
+
+1. `CSInterface.evalScript()` cannot reach a working ExtendScript engine
+   for this panel at all, or
+2. `hostscript.jsx` never actually finished loading into that engine —
+   and, critically, **an ExtendScript syntax/load error partway through
+   one file can leave the *entire* engine session unable to evaluate even
+   unrelated later scripts**, not just the broken file's own definitions.
+   (This is consistent with every previous symptom in this investigation:
+   `ping`/`createTextGraphic`/`probeSourceTextDeep` worked *before* later
+   commands were appended to the same file; once bisection/dispatch
+   diagnostics were added, *everything* — including a bare literal —
+   started failing. A load-time fault in `hostscript.jsx` that only
+   manifests once enough new code is appended would explain that pattern
+   better than a per-command dispatch bug ever did.)
+
+Up to now, `hostscript.jsx` has only ever been loaded the way CEP loads it
+automatically: once, at extension-panel-open time, via
+`<ScriptPath>./jsx/hostscript.jsx</ScriptPath>` in `CSXS/manifest.xml`
+(confirmed by direct read in Part 13 — there was no explicit
+`$.evalFile()` call anywhere in this project before this part). If that
+one automatic load silently failed or partially failed, there was no way
+to see it — CEP does not surface `ScriptPath` load errors in the panel,
+and nothing was re-attempting or re-verifying the load afterward.
+
+### The fix: an explicit, self-verifying `$.evalFile()` loader
+
+`cep-bridge/client/main.js` now performs its own explicit load of
+`hostscript.jsx`, on every panel startup, before attempting `ping` or any
+other command:
+
+1. **Resolve the extension root** via
+   `csInterface.getSystemPath(SystemPath.EXTENSION)` — `SystemPath` is a
+   bare global provided by `CSInterface.js` (`SystemPath.EXTENSION =
+   "extension"`); `getSystemPath()` returns a platform-native absolute
+   path with no trailing slash (confirmed by reading `CSInterface.js`
+   directly in Part 13).
+2. **Build the absolute hostscript path**: `` `${extensionRoot}/jsx/hostscript.jsx` ``.
+3. **Escape it** (backslashes, then double quotes) before embedding it in
+   an ExtendScript string literal, so a Windows path like
+   `C:\Users\...\jsx\hostscript.jsx` doesn't corrupt the generated
+   `$.evalFile("...")` call.
+4. **Call `$.evalFile(...)` through the existing `/raw-eval` bypass path**
+   (`runRawEvalScript()`, unchanged from Part 14/15) rather than through
+   the normal command dispatcher — deliberately, so this load attempt
+   itself doesn't depend on `dispatch()` or the namespace it's trying to
+   load.
+5. **Immediately check `typeof $._captionStudioBridge`**, also via the
+   raw bypass path, right after the `evalFile()` call — this is the
+   direct proof of whether the namespace actually exists in the live
+   engine, independent of whether any *command* inside it works.
+6. **Only then** run the existing startup `ping` check.
+
+Every step logs its result to **both** the scrolling log and a new
+persistent, always-visible panel element (`#startup-diagnostics`, added to
+`cep-bridge/client/index.html`) — so on the next real-host run, the
+resolved extension root, the resolved hostscript path, the exact
+`$.evalFile(...)` source string, its raw callback, and
+`typeof $._captionStudioBridge` are all visible on screen at once without
+scrolling or opening DevTools.
+
+Two new entries were added to `BYPASS_TEST_SCRIPTS`
+(`src/ppro/cepBridge.js`) so these same two checks are also available as
+one-click tests from the panel's existing bypass-test UI, independent of
+the automatic startup sequence: `NAMESPACE_TYPEOF`
+(`typeof $._captionStudioBridge`) and `APP_NAME` (`app.name` — a
+built-in Premiere ExtendScript global with zero dependency on anything
+this project defines; per task 6, if even this fails after explicit
+`evalFile()` loading, the problem is `CSInterface.evalScript()`/the
+ExtendScript engine itself, not `hostscript.jsx`).
+
+**Verification:** `test/cepClientMain.test.js` adds regression checks
+that `runExplicitHostscriptLoad()` resolves the extension root via
+`csInterface.getSystemPath(SystemPath.EXTENSION)`, builds the
+`jsx/hostscript.jsx` path, calls `$.evalFile()` via `runRawEvalScript()`
+strictly before the startup `ping` check runs, logs all five required
+diagnostic lines, and escapes both backslashes and double quotes in the
+path before embedding it in the generated script string.
+`test/cepBridge.test.js`'s `BYPASS_TEST_SCRIPTS` shape test is updated
+from six to eight required entries.
+
+### An open hypothesis: full Premiere restarts may no longer be needed
+
+Every previous round of this investigation asked for a full Premiere
+restart to rule out engine-side caching of a stale `hostscript.jsx` (Part
+13 disproved *that specific* caching theory, but the underlying question —
+does this panel ever reliably pick up on-disk changes to `hostscript.jsx`
+without a full restart? — was never directly answered). Now that
+`main.js` explicitly `$.evalFile()`s the current on-disk `hostscript.jsx`
+on every panel startup, simply **closing and reopening the CEP Bridge
+panel** (which re-runs `main.js` from scratch) should be enough to
+re-load the current file — a full Premiere restart may no longer be
+strictly necessary to pick up `hostscript.jsx` changes going forward.
+
+This is stated as a hypothesis, not a confirmed fact — it follows from
+what the new code does, not from a live-host observation, since this
+agent has no live Premiere/CEP access in this environment. Recommended
+verification order: reopen just the panel first; only fall back to a full
+Premiere restart if the panel-only reopen doesn't pick up the change.
+
+### What this run cannot answer without live-host access
+
+The three concrete facts task 8 asks for — the actual resolved extension
+root, whether `$.evalFile()` succeeded, and whether
+`$._captionStudioBridge` appeared afterward — cannot be produced from
+this environment; there is no live Premiere/CEP host here to run against.
+The new logging is designed to surface exactly those three facts, in the
+panel itself, on the *next* real-host run.

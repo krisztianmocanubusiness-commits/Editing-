@@ -800,12 +800,14 @@ export function renderCepBridgePanel(onChange) {
       "p",
       { class: "hint" },
       [
-        'A full Premiere restart did NOT fix it — the engine-caching hypothesis is disproven. These six tests ' +
+        'A full Premiere restart did NOT fix it — the engine-caching hypothesis is disproven. These eight tests ' +
           "bypass hostscript.jsx's dispatch() entirely, running literal ExtendScript source directly via " +
           "evalScript(), to isolate exactly which invocation layer breaks: a pure literal, a bare-global " +
           "already-working helper, a bare-global brand-new function, a deliberately-wrong bare reference to " +
-          '"dispatch" (expected to fail), and two hand-escaped calls to the correctly-scoped dispatch() — one for ' +
-          "a known-working command, one for a known-failing one. See docs/CEP_BRIDGE_INVESTIGATION.md Part 13.",
+          '"dispatch" (expected to fail), two hand-escaped calls to the correctly-scoped dispatch() — one for a ' +
+          "known-working command, one for a known-failing one — plus typeof $._captionStudioBridge and a built-in " +
+          "ExtendScript global (app.name), to check whether the namespace loaded and whether evalScript() works " +
+          "at all. See docs/CEP_BRIDGE_INVESTIGATION.md Parts 13 and 16.",
       ]
     ),
     ...bypassRows,

@@ -538,6 +538,23 @@ export const BYPASS_TEST_SCRIPTS = {
     label: "6. Hand-escaped $._captionStudioBridge.dispatch(...) calling the known-failing \"echoPayload\"",
     script: '$._captionStudioBridge.dispatch("{\\"command\\":\\"echoPayload\\",\\"payload\\":{},\\"requestId\\":\\"raw-test-echo\\"}")',
   },
+  // Real-host result that redirects this investigation again: the CEP
+  // bridge is confirmed reachable at the HTTP transport layer, but ALL SIX
+  // tests above — including #1, a pure literal with zero dependency on
+  // anything this project defines — still fail. That narrows the problem
+  // to CSInterface.evalScript() itself or to hostscript.jsx not actually
+  // being loaded into the ExtendScript engine. See
+  // cep-bridge/client/main.js's runExplicitHostscriptLoad() (which now
+  // runs $.evalFile() explicitly on every panel startup, before any
+  // command is attempted) and docs/CEP_BRIDGE_INVESTIGATION.md Part 16.
+  NAMESPACE_TYPEOF: {
+    label: "7. typeof $._captionStudioBridge (task 5 — confirms whether the namespace exists in the live engine right now)",
+    script: "typeof $._captionStudioBridge",
+  },
+  APP_NAME: {
+    label: "8. app.name — a built-in Premiere ExtendScript global (task 6 — if even this fails, no evalScript works at all, unrelated to anything this project defines)",
+    script: "app.name",
+  },
 };
 
 /**

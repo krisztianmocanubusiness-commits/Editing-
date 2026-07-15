@@ -114,5 +114,7 @@ export const store = createStore({
     echoTestValue: "hello-from-uxp",
     echoRunning: false,
     lastEchoResult: null, // full echoPayload() return value, or null — see src/ppro/cepBridge.js
+    bypassRunning: {}, // { [BYPASS_TEST_SCRIPTS key]: boolean } — see src/ppro/cepBridge.js
+    lastBypassResults: {}, // { [BYPASS_TEST_SCRIPTS key]: full runRawEvalScript() return value } — see src/ppro/cepBridge.js
   },
 });

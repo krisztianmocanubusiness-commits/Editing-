@@ -10,6 +10,8 @@ import {
   bisectHostScript,
   getAvailableCommands,
   echoPayload,
+  runRawEvalScript,
+  BYPASS_TEST_SCRIPTS,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../ppro/cepBridge.js";
@@ -48,6 +50,26 @@ async function runEchoPayload() {
     patchCepBridge({ lastEchoResult: { ok: false, step: "crash" } });
   } finally {
     patchCepBridge({ echoRunning: false });
+  }
+}
+
+async function runBypassTest(key) {
+  const scriptEntry = BYPASS_TEST_SCRIPTS[key];
+  if (!scriptEntry) return;
+  patchCepBridge({
+    bypassRunning: { ...store.getState().cepBridge.bypassRunning, [key]: true },
+    lastBypassResults: { ...store.getState().cepBridge.lastBypassResults, [key]: null },
+  });
+  try {
+    const result = await runRawEvalScript({ script: scriptEntry.script, log });
+    console.error(`[Caption Graphics Studio] CEP bypass test "${key}" result:`, JSON.stringify(result, null, 2));
+    patchCepBridge({ lastBypassResults: { ...store.getState().cepBridge.lastBypassResults, [key]: result } });
+  } catch (err) {
+    console.error(`[Caption Graphics Studio] CEP bypass test "${key}" crashed:`, err);
+    log(`CEP bypass test "${key}" crashed unexpectedly: ${err.message || err}`, "error");
+    patchCepBridge({ lastBypassResults: { ...store.getState().cepBridge.lastBypassResults, [key]: { ok: false, step: "crash" } } });
+  } finally {
+    patchCepBridge({ bypassRunning: { ...store.getState().cepBridge.bypassRunning, [key]: false } });
   }
 }
 
@@ -602,6 +624,31 @@ function echoResultBlock(result) {
   ]);
 }
 
+function bypassResultBlock(result) {
+  if (!result) return null;
+  if (!result.ok) {
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Bypass call failed at the bridge layer: ${result.error ?? "unknown error"}` }),
+    ]);
+  }
+  const lines = [
+    el("div", { class: "status-line", text: `evalScript source: ${result.script ?? "n/a"}` }),
+    el("div", { class: "status-line", text: `Raw callback: length=${result.rawResultLength ?? "n/a"}, JSON.stringify=${result.rawResultJsonStringify ?? "n/a"}` }),
+    el("div", {
+      class: `status-line ${result.rawResult === "EvalScript error." ? "log-error" : "log-success"}`,
+      text:
+        result.rawResult === "EvalScript error."
+          ? '✗ Raw callback IS the literal "EvalScript error." string — this exact layer is where it breaks.'
+          : "✓ Raw callback is NOT the literal \"EvalScript error.\" string — this layer succeeded (or failed differently).",
+    }),
+    el("div", {
+      class: `status-line ${result.parsedOk ? "log-success" : ""}`,
+      text: result.parsedOk ? `JSON.parse succeeded: ${JSON.stringify(result.parsedValue)}` : `JSON.parse did not succeed (${result.parseError ?? "n/a"}) — may be expected for this script.`,
+    }),
+  ];
+  return el("div", { class: "inspector-results" }, lines);
+}
+
 export function renderCepBridgePanel(onChange) {
   const state = store.getState();
   const cb = state.cepBridge;
@@ -629,6 +676,25 @@ export function renderCepBridgePanel(onChange) {
       await runEchoPayload();
       onChange();
     },
+  });
+
+  const bypassRows = Object.keys(BYPASS_TEST_SCRIPTS).map((key) => {
+    const entry = BYPASS_TEST_SCRIPTS[key];
+    const running = Boolean(cb.bypassRunning[key]);
+    const btn = el("button", {
+      class: "btn",
+      text: running ? "Running…" : `Run: ${entry.label}`,
+      disabled: !isHosted() || running || undefined,
+      onClick: async () => {
+        await runBypassTest(key);
+        onChange();
+      },
+    });
+    return el("div", { class: "bypass-test-row" }, [
+      el("div", { class: "row" }, [btn]),
+      el("div", { class: "status-line", text: `Script: ${entry.script}` }),
+      bypassResultBlock(cb.lastBypassResults[key]),
+    ]);
   });
 
   const pickBtn = el("button", { class: "btn", text: "Choose .mogrt…", onClick: () => pickMogrt().then(onChange) });
@@ -727,6 +793,19 @@ export function renderCepBridgePanel(onChange) {
     buildCheckResultBlock(cb.lastBuildCheckResult),
     el("div", { class: "row" }, [el("label", { class: "field-inline" }, ["Echo test value: ", echoInput]), echoBtn]),
     echoResultBlock(cb.lastEchoResult),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        'A full Premiere restart did NOT fix it — the engine-caching hypothesis is disproven. These six tests ' +
+          "bypass hostscript.jsx's dispatch() entirely, running literal ExtendScript source directly via " +
+          "evalScript(), to isolate exactly which invocation layer breaks: a pure literal, a bare-global " +
+          "already-working helper, a bare-global brand-new function, a deliberately-wrong bare reference to " +
+          '"dispatch" (expected to fail), and two hand-escaped calls to the correctly-scoped dispatch() — one for ' +
+          "a known-working command, one for a known-failing one. See docs/CEP_BRIDGE_INVESTIGATION.md Part 13.",
+      ]
+    ),
+    ...bypassRows,
     el(
       "p",
       { class: "hint" },

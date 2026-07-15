@@ -499,3 +499,104 @@ export async function echoPayload(opts) {
   log(result.ok ? "════ CEP echoPayload — finished ════" : "════ CEP echoPayload — finished with errors ════", result.ok ? "success" : "error");
   return result;
 }
+
+// --- Bypass-the-dispatcher tests (tasks 4/6) ---
+//
+// A full Premiere restart did NOT fix getAvailableCommands/echoPayload/
+// bisectHostScript (disproving the Part 12 engine-caching hypothesis), so
+// this isolates the invocation layer itself: does evalScript() work at
+// all right now (RAW_LITERAL)? Does a bare-global, already-indirectly-
+// proven-working helper function work when called directly, bypassing
+// dispatch() entirely (BARE_GLOBAL_HELPER)? Does a brand-new bare-global
+// function, added purely for this test, work (BARE_GLOBAL_NEW)? Does a
+// bare (incorrectly-scoped) reference to `dispatch` behave as predicted —
+// i.e. fail, since `dispatch` only exists as `$._captionStudioBridge.
+// dispatch`, never as a bare global (BARE_DISPATCH_EXPECTED_FAIL)? And
+// finally, does a hand-written, pre-escaped call to the CORRECTLY-scoped
+// `$._captionStudioBridge.dispatch(...)` — bypassing
+// runExtendScriptCommand()'s JS string-building entirely — succeed for a
+// known-working command (QUALIFIED_DISPATCH_PING) and/or a known-failing
+// one (QUALIFIED_DISPATCH_ECHO)? See cep-bridge/jsx/hostscript.jsx's
+// echoPayloadDirect()/basenameNoExt() and
+// docs/CEP_BRIDGE_INVESTIGATION.md Part 13.
+export const BYPASS_TEST_SCRIPTS = {
+  RAW_LITERAL: { label: "1. Pure literal (no project code at all)", script: "JSON.stringify({ok:true})" },
+  BARE_GLOBAL_HELPER: {
+    label: "2. Bare-global already-working helper (basenameNoExt, used indirectly by probeSourceTextDeep)",
+    script: 'basenameNoExt("/a/b/c.mogrt")',
+  },
+  BARE_GLOBAL_NEW: { label: "3. Bare-global brand-new function (echoPayloadDirect)", script: 'echoPayloadDirect("{}")' },
+  BARE_DISPATCH_EXPECTED_FAIL: {
+    label: "4. Bare unscoped dispatch(...) — expected to fail, confirms it's not globally bound this way",
+    script: 'dispatch("{}")',
+  },
+  QUALIFIED_DISPATCH_PING: {
+    label: "5. Hand-escaped $._captionStudioBridge.dispatch(...) calling the known-working \"ping\"",
+    script: '$._captionStudioBridge.dispatch("{\\"command\\":\\"ping\\",\\"payload\\":{},\\"requestId\\":\\"raw-test-ping\\"}")',
+  },
+  QUALIFIED_DISPATCH_ECHO: {
+    label: "6. Hand-escaped $._captionStudioBridge.dispatch(...) calling the known-failing \"echoPayload\"",
+    script: '$._captionStudioBridge.dispatch("{\\"command\\":\\"echoPayload\\",\\"payload\\":{},\\"requestId\\":\\"raw-test-echo\\"}")',
+  },
+};
+
+/**
+ * POSTs a literal ExtendScript source string directly to the CEP bridge's
+ * /raw-eval endpoint — bypassing callCepBridge()/the /command JSON-RPC
+ * envelope, hostscript.jsx's dispatch() function, and
+ * runExtendScriptCommand()'s own script-building entirely. Returns the
+ * raw callback result exactly as cep-bridge/client/main.js's
+ * runRawEvalScript() captured it (task 7): rawResult, rawResultLength,
+ * rawResultJsonStringify, and a best-effort parsedOk/parsedValue/
+ * parseError (many of the bypass scripts above don't return JSON at all,
+ * so a parse failure there is expected and informative, not itself an
+ * error).
+ *
+ * @param {Object} opts
+ * @param {string} opts.script — literal ExtendScript source, e.g. one of BYPASS_TEST_SCRIPTS[...].script.
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {number} [opts.timeoutMs]
+ */
+export async function runRawEvalScript(opts) {
+  const { script, log, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+
+  log(`════ CEP raw bypass eval — start ════ script: ${script}`, "info");
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+  let result;
+  try {
+    const response = await fetch(`${CEP_BRIDGE_BASE_URL}/raw-eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ script }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutHandle);
+    if (!response.ok) {
+      result = { ok: false, error: `CEP bridge returned HTTP ${response.status}.` };
+    } else {
+      result = await response.json();
+    }
+  } catch (err) {
+    clearTimeout(timeoutHandle);
+    result = {
+      ok: false,
+      error: err && err.name === "AbortError" ? `CEP bridge did not respond within ${timeoutMs}ms.` : `CEP bridge unavailable: ${err.message || err}`,
+    };
+  }
+
+  log(result.ok ? "════ CEP raw bypass eval — finished ════" : "════ CEP raw bypass eval — finished with errors ════", result.ok ? "success" : "error");
+  return result;
+}

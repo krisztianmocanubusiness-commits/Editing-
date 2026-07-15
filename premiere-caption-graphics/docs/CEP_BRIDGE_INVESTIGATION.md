@@ -903,3 +903,135 @@ this round is grounded in Adobe's documented CEP/ExtendScript engine
 lifecycle and in ruling out every code-level explanation this
 investigation could statically check; whether it's the actual, complete
 root cause is what the verification procedure above will show.
+
+## Part 13: seventh real-host run — a full restart didn't fix it either; isolating the invocation layer itself
+
+**Confirmed real-host result that disproves Part 12's leading hypothesis:**
+a full Premiere Pro restart — quit and relaunch, per Part 12's exact
+verification procedure — did **not** fix `getAvailableCommands`,
+`echoPayload`, or `bisectHostScript` step 0. All three still fail with the
+same non-JSON `"EvalScript error."` The CEP/ExtendScript engine-caching
+theory is ruled out: a fresh engine session, evaluating `hostscript.jsx`
+for the first time in that Premiere process, still can't reach these
+commands.
+
+**Stop investigating JavaScript compatibility and engine-caching theories
+— isolate the invocation layer itself**, per the user's explicit
+instruction. This round builds no more hypothesis-driven diagnostics;
+instead it adds the minimum tooling needed to answer, empirically, which
+exact layer breaks: a pure literal with zero project code, a bare-global
+function, or the dispatcher.
+
+### Tasks 1–3: capture, display, and compare the exact evalScript strings
+
+`cep-bridge/client/main.js`'s `runExtendScriptCommand()` now:
+- Logs the exact `script` string to both the console and the on-panel
+  scrolling log (already true since Part 12), **and**
+- Writes it to a new, persistent (non-scrolling) `<pre id="last-eval-script">`
+  element in the CEP panel itself (`client/index.html`) — visible without
+  opening DevTools, and it stays put after the log scrolls past it.
+- Attaches the exact string as `_evalScriptSource` on every resolved
+  result object, so the UXP-side panel receives it too, not just the CEP
+  panel.
+
+Because every command — working or failing — goes through the exact same
+template (`` `$._captionStudioBridge.dispatch(${JSON.stringify(requestJson)})` ``),
+the byte-for-byte comparison (task 3) is structural, not something that
+varies by command: function/dispatcher name is always
+`$._captionStudioBridge.dispatch`, quoting/escaping is always produced by
+the same two `JSON.stringify()` calls, payload encoding is always
+`{command, payload, requestId}`, parentheses/semicolons are from the same
+template literal, and command-string casing is exactly what's passed in
+(`"probeSourceTextDeep"`, `"echoPayload"`, `"getAvailableCommands"`,
+`"bisectHostScript"` — all correctly camelCased, matching `dispatch()`'s
+`command === "..."` checks exactly; confirmed by static comparison, no
+typo or casing mismatch found anywhere in this pairing). **The call
+construction is not the variable.**
+
+### Task 4/6/7: bypass the dispatcher entirely
+
+New `POST /raw-eval` endpoint (`cep-bridge/client/main.js`) and
+`runRawEvalScript()` UXP-side client
+(`src/ppro/cepBridge.js`/`src/ui/cepBridgePanel.js`, six preset buttons)
+run a **literal** ExtendScript source string directly via
+`csInterface.evalScript()`, bypassing `runExtendScriptCommand()`'s
+JSON envelope and `dispatch()` completely, and return the **raw callback
+result before any JSON parsing** (task 7: exact string, `.length`, and
+`JSON.stringify()` of it):
+
+| # | Script | Tests |
+| --- | --- | --- |
+| 1 | `JSON.stringify({ok:true})` | Pure literal — zero reference to any project code. Does `evalScript()` work AT ALL right now? |
+| 2 | `basenameNoExt("/a/b/c.mogrt")` | A bare-global helper function, already exercised indirectly by the confirmed-working `probeSourceTextDeep` — direct invocation, bypassing `dispatch()` entirely. |
+| 3 | `echoPayloadDirect("{}")` | A **brand-new**, bare-global (not `$._captionStudioBridge`-scoped) function added purely for this test — see below. |
+| 4 | `dispatch("{}")` | A bare, unscoped reference to `dispatch` — `dispatch` only exists as `$._captionStudioBridge.dispatch`, never as a bare global, so this is *expected* to fail (a `ReferenceError`) — confirms the registration model is understood correctly. |
+| 5 | `$._captionStudioBridge.dispatch("{\"command\":\"ping\",...}")` | The correctly-scoped call, hand-escaped rather than built by `runExtendScriptCommand()`'s JS, targeting the known-working `"ping"`. |
+| 6 | `$._captionStudioBridge.dispatch("{\"command\":\"echoPayload\",...}")` | Same hand-escaped construction, targeting the known-failing `"echoPayload"`. |
+
+`echoPayloadDirect(payloadString)` (`cep-bridge/jsx/hostscript.jsx`) is a
+bare top-level `function` declaration — deliberately **not** a
+`$._captionStudioBridge` property, and deliberately named differently
+from the existing namespaced `$._captionStudioBridge.echoPayload` (same
+file, ~20 lines away) to avoid any ambiguity about which one a given call
+is exercising. It takes one string, returns a JSON string directly (since
+calling it bypasses `dispatch()`'s own `JSON.stringify()`), and calls
+nothing else — no Premiere APIs, no other helpers.
+
+### Task 5: confirmed — ScriptPath, not `evalFile()`
+
+`cep-bridge/CSXS/manifest.xml` line 38: `<ScriptPath>./jsx/hostscript.jsx</ScriptPath>`.
+`client/main.js` contains no `$.evalFile()` call anywhere — the file is
+loaded purely via the manifest's `ScriptPath` mechanism, confirmed by
+direct inspection, not inference. "If ScriptPath only loads one
+namespace/entry function" — tests #2 and #3 above answer this directly:
+if a bare-global function (not part of `$._captionStudioBridge`) is
+reachable, `ScriptPath` loads the whole file's top-level scope, not just
+one namespace.
+
+### What this round deliberately does NOT do
+
+Per the user's explicit instruction, no new hypothesis-driven diagnostics
+were added — no new string/JSON logic, no new stage-tracking, no new
+`.mogrt`/Source Text code. Every addition this round exists solely to
+narrow down *which layer* fails: a literal, a bare function, or the
+dispatcher.
+
+### An install-location risk worth checking directly, independent of everything above
+
+`cep-bridge/README.md`'s setup instructions have the extension loaded from
+a **separate, fixed OS folder** (`~/Library/Application Support/Adobe/CEP/extensions/`
+on macOS, `%APPDATA%\Adobe\CEP\extensions\` on Windows) — either a symlink
+(recommended, keeps edits live) or a **plain copy** of this `cep-bridge/`
+folder. If the actual installed copy is a plain copy rather than a working
+symlink, every `git pull` + `npm run build` in this repo would leave the
+**installed** `hostscript.jsx`/`client/main.js` completely unchanged,
+regardless of how many commits land here or how many times Premiere is
+restarted — this would independently explain "the restart didn't fix it,"
+with no ExtendScript-engine mechanism involved at all. This is not
+something this agent can verify without host access, but it costs nothing
+to rule out: **confirm the extensions-folder copy is a symlink pointing at
+this git checkout (not a stale copy) before drawing conclusions from
+any of the tests below.** (macOS: `ls -la` the extensions folder and check
+for an `->` symlink target. Windows: `dir` shows `<SYMLINKD>` for a real
+symlink vs. a plain directory for a copy — `mklink /D` requires
+Administrator privileges or Developer Mode, which the original setup
+instructions didn't call out explicitly for Windows; a plain
+drag-and-drop copy would look identical in Explorer but never update.)
+
+### What this run cannot answer without live-host access
+
+Which of the six bypass tests is the first to return the literal
+`"EvalScript error."` string as `rawResult`. That result — combined with
+the install-location check above — should be decisive: if test #1 (pure
+literal) already fails, `evalScript()` itself is broken for this
+panel/session, unrelated to any of this project's code. If #1 succeeds
+but #2/#3 (bare-global functions) fail, `ScriptPath` is not making the
+file's top-level scope reachable the way documented CEP/ExtendScript
+behavior predicts. If #2/#3 succeed but #5 (hand-escaped, correctly-scoped
+dispatch calling a known-working command) fails, the issue is specific to
+`$._captionStudioBridge.dispatch` itself. If #5 succeeds but #6
+(hand-escaped dispatch calling the known-failing `echoPayload`) also
+fails, the issue is specific to that one command's registration —
+independent of how the call was constructed, which would point back at
+the file actually loaded not containing `echoPayload` at all (the
+install-location risk above, restated in a directly falsifiable way).

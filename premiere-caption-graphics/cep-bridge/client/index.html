@@ -7,12 +7,23 @@
       body { margin: 0; padding: 10px; background: #1e1e1e; color: #e6e6e6; font: 12px "Segoe UI", sans-serif; }
       h1 { font-size: 13px; margin: 0 0 6px; }
       #status { margin: 6px 0; padding: 6px 8px; border-radius: 4px; background: #262626; border: 1px solid #3a3a3a; }
+      #last-eval-label { margin-top: 8px; font-size: 10.5px; color: #999; }
+      #last-eval-script { margin: 2px 0 0; background: #161616; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 10.5px; white-space: pre-wrap; word-break: break-all; max-height: 80px; overflow-y: auto; }
       #log { margin-top: 8px; height: 120px; overflow-y: auto; background: #161616; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 10.5px; white-space: pre-wrap; }
     </style>
   </head>
   <body>
     <h1>Caption Studio CEP Bridge (experimental)</h1>
     <div id="status">Starting…</div>
+    <!--
+      Task 2: a persistent (not just scrolled-into-the-log) display of the
+      exact evalScript() source string most recently sent — updated by
+      main.js immediately before every evalScript() call, so it's visible
+      in the panel itself without opening DevTools, and stays put even
+      after the log has scrolled past it.
+    -->
+    <div id="last-eval-label">Last evalScript() source sent:</div>
+    <pre id="last-eval-script">(none yet)</pre>
     <div id="log"></div>
 
     <!-- Adobe's official CSInterface library — copied verbatim, do not edit. -->

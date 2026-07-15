@@ -28,6 +28,7 @@ const csInterface = new CSInterface();
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
+const lastEvalScriptEl = document.getElementById("last-eval-script");
 
 function log(message, level) {
   const time = new Date().toLocaleTimeString();
@@ -46,6 +47,13 @@ function setStatus(text, ok) {
   statusEl.style.borderColor = ok ? "#57c26a" : "#e05f5f";
 }
 
+// Task 2: shows the exact evalScript() source string in a persistent,
+// always-visible panel element (not just the scrolling log) immediately
+// before the call is made.
+function showLastEvalScript(script) {
+  if (lastEvalScriptEl) lastEvalScriptEl.textContent = script;
+}
+
 /**
  * Runs one command in ExtendScript via evalScript, with its own timeout so
  * a stuck host script can't hang the HTTP response forever. The .jsx side
@@ -60,7 +68,7 @@ function runExtendScriptCommand(command, payload, requestId) {
     const timeoutHandle = setTimeout(() => {
       if (settled) return;
       settled = true;
-      resolve({ ok: false, requestId, error: `ExtendScript did not respond within ${EVALSCRIPT_TIMEOUT_MS}ms.` });
+      resolve({ ok: false, requestId, error: `ExtendScript did not respond within ${EVALSCRIPT_TIMEOUT_MS}ms.`, _evalScriptSource: script });
     }, EVALSCRIPT_TIMEOUT_MS);
 
     const requestJson = JSON.stringify({ command, payload, requestId });
@@ -70,37 +78,134 @@ function runExtendScriptCommand(command, payload, requestId) {
     // single string argument and does its own JSON.parse().
     const script = `$._captionStudioBridge.dispatch(${JSON.stringify(requestJson)})`;
 
-    // Task 2: log the exact evalScript source string immediately before
-    // calling evalScript() — lets a byte-for-byte comparison between a
+    // Task 1/2: log AND display (persistently, not just scrolled into the
+    // log) the exact evalScript source string immediately before calling
+    // evalScript() — lets a byte-for-byte comparison between a
     // known-working command's call (e.g. probeSourceTextDeep) and a
     // failing one's (e.g. bisectHostScript/echoPayload) rule in or out any
     // difference in how the call itself is constructed, independent of
-    // what's actually loaded in the ExtendScript engine.
+    // what's actually loaded in the ExtendScript engine. Also attached to
+    // every resolved result as `_evalScriptSource` so the UXP-side panel
+    // can display/compare it too, not just this CEP panel.
     log(`evalScript source for "${command}": ${script}`, "info");
+    showLastEvalScript(script);
 
     try {
       csInterface.evalScript(script, (resultString) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutHandle);
+        // Task 7: log the raw callback result exactly as received, before
+        // any JSON parsing is attempted — exact string, length, and a
+        // JSON.stringify() of it (reveals whether it's really the literal
+        // "EvalScript error." string or something subtly different).
+        log(
+          `raw evalScript() callback for "${command}": length=${resultString === undefined ? "n/a" : String(resultString).length}, ` +
+            `JSON.stringify=${JSON.stringify(resultString)}`,
+          "info"
+        );
         if (resultString === undefined || resultString === null || resultString === "") {
-          resolve({ ok: false, requestId, error: "evalScript returned an empty result." });
+          resolve({ ok: false, requestId, error: "evalScript returned an empty result.", _evalScriptSource: script });
           return;
         }
         try {
           const parsed = JSON.parse(resultString);
+          parsed._evalScriptSource = script;
           resolve(parsed);
         } catch (err) {
           // evalScript itself surfaces host-side syntax/runtime errors as
           // a string starting with "EvalScript error" rather than JSON.
-          resolve({ ok: false, requestId, error: `Non-JSON response from ExtendScript: ${resultString}`, parseError: String(err.message || err) });
+          resolve({
+            ok: false,
+            requestId,
+            error: `Non-JSON response from ExtendScript: ${resultString}`,
+            parseError: String(err.message || err),
+            _evalScriptSource: script,
+            _rawResult: resultString,
+            _rawResultLength: String(resultString).length,
+            _rawResultJsonStringify: JSON.stringify(resultString),
+          });
         }
       });
     } catch (err) {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutHandle);
-      resolve({ ok: false, requestId, error: `evalScript threw synchronously: ${err.message || err}` });
+      resolve({ ok: false, requestId, error: `evalScript threw synchronously: ${err.message || err}`, _evalScriptSource: script });
+    }
+  });
+}
+
+/**
+ * Task 4/6/7: runs an arbitrary, literal ExtendScript source string
+ * directly via evalScript() — completely bypassing
+ * runExtendScriptCommand()'s `$._captionStudioBridge.dispatch(...)`
+ * wrapper, the JSON request envelope, and hostscript.jsx's dispatch()
+ * function entirely. Used to isolate exactly which invocation layer
+ * fails: a pure literal with zero references to this project's code, a
+ * bare-global already-existing helper function
+ * (e.g. `basenameNoExt(...)`, used indirectly by the confirmed-working
+ * probeSourceTextDeep), a bare-global brand-new minimal function
+ * (`echoPayloadDirect(...)`), a bare (incorrectly-scoped, expected to
+ * fail) reference to `dispatch(...)`, or a hand-written, pre-escaped call
+ * to the correctly-scoped `$._captionStudioBridge.dispatch(...)` for both
+ * a known-working and a known-failing command. Returns the RAW callback
+ * result before any JSON parsing is attempted (task 7): the exact string,
+ * its length, a JSON.stringify() of it, and a best-effort JSON.parse()
+ * attempt (informative only — many of the literals above are not meant to
+ * return JSON at all).
+ */
+function runRawEvalScript(script) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, error: `evalScript did not respond within ${EVALSCRIPT_TIMEOUT_MS}ms.`, script });
+    }, EVALSCRIPT_TIMEOUT_MS);
+
+    log(`raw bypass evalScript source: ${script}`, "info");
+    showLastEvalScript(script);
+
+    try {
+      csInterface.evalScript(script, (resultString) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+
+        const rawResult = resultString === undefined ? null : resultString;
+        const rawResultLength = rawResult === null ? 0 : String(rawResult).length;
+        const rawResultJsonStringify = JSON.stringify(rawResult);
+        log(`raw bypass evalScript() callback: length=${rawResultLength}, JSON.stringify=${rawResultJsonStringify}`, "info");
+
+        let parsedOk = false;
+        let parsedValue;
+        let parseError = null;
+        if (rawResult !== null) {
+          try {
+            parsedValue = JSON.parse(rawResult);
+            parsedOk = true;
+          } catch (err) {
+            parseError = String(err.message || err);
+          }
+        }
+
+        resolve({
+          ok: true,
+          script,
+          rawResult,
+          rawResultLength,
+          rawResultJsonStringify,
+          parsedOk,
+          parsedValue: parsedOk ? parsedValue : undefined,
+          parseError,
+        });
+      });
+    } catch (err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
+      resolve({ ok: false, error: `evalScript threw synchronously: ${err.message || err}`, script });
     }
   });
 }
@@ -153,6 +258,32 @@ async function handleCommand(req, res) {
   sendJson(res, 200, result);
 }
 
+/**
+ * Task 4/6: POST /raw-eval { script } -> runs `script` directly via
+ * evalScript(), bypassing dispatch()/the JSON request envelope entirely.
+ * Body must be `{ "script": "<literal ExtendScript source>" }`.
+ */
+async function handleRawEval(req, res) {
+  let parsedBody;
+  try {
+    const raw = await readRequestBody(req);
+    parsedBody = JSON.parse(raw);
+  } catch (err) {
+    log(`✗ /raw-eval: couldn't parse request body: ${err.message || err}`, "error");
+    sendJson(res, 200, { ok: false, error: `Invalid JSON request body: ${err.message || err}` });
+    return;
+  }
+
+  const { script } = parsedBody || {};
+  if (!script || typeof script !== "string") {
+    sendJson(res, 200, { ok: false, error: "Request body must include a string `script` field." });
+    return;
+  }
+
+  const result = await runRawEvalScript(script);
+  sendJson(res, 200, result);
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") {
     sendJson(res, 200, { ok: true });
@@ -165,6 +296,13 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && req.url === "/command") {
     handleCommand(req, res).catch((err) => {
       log(`✗ /command handler threw: ${err.message || err}`, "error");
+      sendJson(res, 200, { ok: false, error: `Bridge handler crashed: ${err.message || err}` });
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/raw-eval") {
+    handleRawEval(req, res).catch((err) => {
+      log(`✗ /raw-eval handler threw: ${err.message || err}`, "error");
       sendJson(res, 200, { ok: false, error: `Bridge handler crashed: ${err.message || err}` });
     });
     return;

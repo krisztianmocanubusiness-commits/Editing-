@@ -39,7 +39,7 @@ if (typeof $._captionStudioBridge === "undefined") {
 // "getAvailableCommands" and compare the returned build ID/command list
 // against what's actually in this file on disk. Bump HOSTSCRIPT_BUILD_ID
 // on every change to this file that should be verifiable after a reload.
-var HOSTSCRIPT_BUILD_ID = "2026-07-15-bisect-r2";
+var HOSTSCRIPT_BUILD_ID = "2026-07-15-bypass-r3";
 var SUPPORTED_COMMANDS = [
   "ping",
   "getAvailableCommands",
@@ -141,6 +141,31 @@ $._captionStudioBridge.getAvailableCommands = function (payload, requestId) {
 $._captionStudioBridge.echoPayload = function (payload, requestId) {
   return { ok: true, requestId: requestId, result: { received: payload, hostscriptBuildId: HOSTSCRIPT_BUILD_ID } };
 };
+
+/**
+ * Real-host result that redirects this investigation again: a full
+ * Premiere restart did NOT fix getAvailableCommands/echoPayload/
+ * bisectHostScript — disproving the engine-caching hypothesis Part 12 was
+ * built to test. This function exists purely to answer the next
+ * question: is a BARE GLOBAL function (declared with `function name() {}`
+ * at the top level of this file, callable directly by name from an
+ * evalScript() call — e.g. `evalScript('echoPayloadDirect("{}")')` —
+ * with NO reference to `$._captionStudioBridge` and NO involvement of
+ * `dispatch()` at all) reachable right now? Deliberately named
+ * differently from the namespaced `$._captionStudioBridge.echoPayload`
+ * above (same directory, same file, twenty lines away) to avoid any
+ * ambiguity about which one a given evalScript call is actually
+ * exercising. Takes and returns a plain string, matching what
+ * `evalScript()` itself can pass/return directly (no JSON.parse needed on
+ * the input, though the output IS a JSON string so the raw callback
+ * result can still be compared against dispatch()'s output shape). See
+ * docs/CEP_BRIDGE_INVESTIGATION.md Part 13 and
+ * cep-bridge/client/main.js's runRawEvalScript()/`/raw-eval` endpoint,
+ * which calls this directly, bypassing dispatch() entirely.
+ */
+function echoPayloadDirect(payloadString) {
+  return JSON.stringify({ ok: true, receivedRaw: payloadString, hostscriptBuildId: HOSTSCRIPT_BUILD_ID });
+}
 
 // --- Multi-track clip detection helpers ---
 //

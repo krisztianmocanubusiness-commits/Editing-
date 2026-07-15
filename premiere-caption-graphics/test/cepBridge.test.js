@@ -11,6 +11,8 @@ import {
   bisectHostScript,
   getAvailableCommands,
   echoPayload,
+  runRawEvalScript,
+  BYPASS_TEST_SCRIPTS,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../src/ppro/cepBridge.js";
@@ -594,4 +596,99 @@ test("echoPayload defaults to a {hello: 'world'} payload when none is given", as
     }
   );
   assert.deepEqual(capturedPayload, { hello: "world" });
+});
+
+// --- runRawEvalScript / BYPASS_TEST_SCRIPTS ---
+
+test("BYPASS_TEST_SCRIPTS defines all six bypass scripts required by the investigation", () => {
+  const keys = Object.keys(BYPASS_TEST_SCRIPTS);
+  assert.deepEqual(
+    keys.sort(),
+    ["BARE_DISPATCH_EXPECTED_FAIL", "BARE_GLOBAL_HELPER", "BARE_GLOBAL_NEW", "QUALIFIED_DISPATCH_ECHO", "QUALIFIED_DISPATCH_PING", "RAW_LITERAL"].sort()
+  );
+  for (const key of keys) {
+    assert.equal(typeof BYPASS_TEST_SCRIPTS[key].label, "string");
+    assert.equal(typeof BYPASS_TEST_SCRIPTS[key].script, "string");
+    assert.ok(BYPASS_TEST_SCRIPTS[key].script.length > 0);
+  }
+});
+
+test("BYPASS_TEST_SCRIPTS never routes through $._captionStudioBridge.dispatch(...) except the two QUALIFIED_DISPATCH_* entries, and never calls .setValue()", () => {
+  for (const [key, entry] of Object.entries(BYPASS_TEST_SCRIPTS)) {
+    if (key.startsWith("QUALIFIED_DISPATCH")) {
+      assert.match(entry.script, /\$\._captionStudioBridge\.dispatch\(/);
+    } else {
+      assert.doesNotMatch(entry.script, /\$\._captionStudioBridge\.dispatch\(/, `${key} should bypass dispatch() entirely`);
+    }
+    assert.doesNotMatch(entry.script, /\.setValue\s*\(/);
+  }
+});
+
+test("runRawEvalScript returns step:bridge-unavailable and never POSTs /raw-eval when the health check fails", async () => {
+  const calledUrls = [];
+  await withFetch(
+    async (url) => {
+      calledUrls.push(url);
+      throw new Error("connect ECONNREFUSED");
+    },
+    async () => {
+      const result = await runRawEvalScript({ script: "JSON.stringify({ok:true})", log: noopLog });
+      assert.equal(result.ok, false);
+      assert.equal(result.step, "bridge-unavailable");
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health"]);
+});
+
+test("runRawEvalScript POSTs { script } to /raw-eval (not /command — bypasses the dispatcher JSON-RPC envelope entirely) and forwards the raw result", async () => {
+  const calledUrls = [];
+  let capturedInit = null;
+  await withFetch(
+    async (url, init) => {
+      calledUrls.push(url);
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      capturedInit = init;
+      return fakeJsonResponse(200, {
+        ok: true,
+        script: "JSON.stringify({ok:true})",
+        rawResult: '{"ok":true}',
+        rawResultLength: 11,
+        rawResultJsonStringify: '"{\\"ok\\":true}"',
+        parsedOk: true,
+        parsedValue: { ok: true },
+        parseError: null,
+      });
+    },
+    async () => {
+      const result = await runRawEvalScript({ script: "JSON.stringify({ok:true})", log: noopLog });
+      assert.equal(result.ok, true);
+      assert.equal(result.rawResult, '{"ok":true}');
+      assert.equal(result.parsedOk, true);
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health", "http://localhost:3010/raw-eval"]);
+  assert.equal(capturedInit.method, "POST");
+  assert.deepEqual(JSON.parse(capturedInit.body), { script: "JSON.stringify({ok:true})" });
+});
+
+test("runRawEvalScript reports the literal EvalScript-error case distinctly (rawResult exactly equal to the literal string)", async () => {
+  await withFetch(
+    async (url) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      return fakeJsonResponse(200, {
+        ok: true,
+        script: 'dispatch("{}")',
+        rawResult: "EvalScript error.",
+        rawResultLength: 18,
+        rawResultJsonStringify: '"EvalScript error."',
+        parsedOk: false,
+        parseError: "Unexpected token E in JSON at position 0",
+      });
+    },
+    async () => {
+      const result = await runRawEvalScript({ script: BYPASS_TEST_SCRIPTS.BARE_DISPATCH_EXPECTED_FAIL.script, log: noopLog });
+      assert.equal(result.rawResult, "EvalScript error.");
+      assert.equal(result.parsedOk, false);
+    }
+  );
 });

@@ -517,3 +517,31 @@ test("echoPayload uses the exact same registration/return pattern as probeSource
   assert.ok(echoIndex !== -1 && bisectIndex !== -1);
   assert.ok(echoIndex < bisectIndex, "echoPayload should be defined well before bisectHostScript in the file, to test whether position-in-file matters");
 });
+
+// --- Part 13: a full Premiere restart did NOT fix
+// getAvailableCommands/echoPayload/bisectHostScript, disproving the Part
+// 12 engine-caching hypothesis. These checks guard the bypass-the-
+// dispatcher isolation tooling: a bare-global, brand-new, minimal
+// function (echoPayloadDirect) that a bypass evalScript call can invoke
+// directly, with zero involvement of $._captionStudioBridge or
+// dispatch(). See docs/CEP_BRIDGE_INVESTIGATION.md Part 13.
+
+test("echoPayloadDirect is declared as a bare top-level function (not a $._captionStudioBridge property), distinct from the namespaced echoPayload command, for direct bare-global evalScript invocation", () => {
+  const source = readHostScript();
+  assert.match(source, /^function echoPayloadDirect\(payloadString\)\s*\{/m, "expected a bare top-level `function echoPayloadDirect(payloadString) {` declaration");
+  assert.doesNotMatch(source, /\$\._captionStudioBridge\.echoPayloadDirect/, "echoPayloadDirect must NOT be attached to $._captionStudioBridge — it exists specifically to test bare-global invocation");
+});
+
+test("echoPayloadDirect takes one string argument, returns a JSON string directly (not a plain object — it bypasses dispatch()'s own JSON.stringify entirely), and calls no Premiere APIs or other helpers", () => {
+  const source = readHostScript();
+  const match = source.match(/function echoPayloadDirect\(payloadString\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(match, "expected to find echoPayloadDirect's body");
+  const fnSource = match[0];
+  assert.match(fnSource, /return\s+JSON\.stringify\(/, "expected echoPayloadDirect to pre-stringify its own return value, since it's called directly, not through dispatch()");
+  assert.doesNotMatch(fnSource, /app\.project|\.activeSequence|importMGT|\$\._captionStudioBridge/);
+});
+
+test("basenameNoExt (used indirectly by the confirmed-working probeSourceTextDeep) remains a bare top-level function, suitable as the known-working bare-global bypass target", () => {
+  const source = readHostScript();
+  assert.match(source, /^function basenameNoExt\(path\)\s*\{/m);
+});

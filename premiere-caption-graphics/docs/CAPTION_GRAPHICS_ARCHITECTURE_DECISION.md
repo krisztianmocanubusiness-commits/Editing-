@@ -1,8 +1,17 @@
-# Architecture decision: how to create editable Premiere text graphics, now that CEP ExtendScript is confirmed unavailable
+# Architecture decision: how to create editable Premiere text graphics
+
+**Status: revised after a strict capability audit of the official UXP
+26.3 API against the actual shipped type declarations.** The audit
+(`docs/CAPTIONTRACK_API_AUDIT.md`) eliminated Route D as a full solution —
+see "What changed in this revision" below. This document's conclusion is
+now: **no route currently has a documented, confirmed write path for the
+full product requirement.** The recommendation section reflects that
+honestly rather than picking a "best of four broken options" without
+saying so.
 
 ## Why this document exists
 
-Two independent write paths have now been tried and closed:
+Two independent write paths have been tried and closed:
 
 1. **UXP** (`docs/MOGRT_DIAGNOSTIC.md`, nine real-host rounds): can
    **locate** a MOGRT's `Source Text` `ComponentParam` reliably, but every
@@ -17,227 +26,212 @@ Two independent write paths have now been tried and closed:
    (Part 1) — this failure is consistent with, and may simply be an
    instance of, that shutdown.
 
-Both the UXP and CEP proof-of-concept code are preserved as-is (nothing
-deleted); this document is the requested comparison of what to try next,
-without implementing anything yet.
+A third candidate, Premiere's native Captions track (Route D below), has
+now also been audited and closed as a **full** solution — it has no
+creation or content-write API in the current public UXP surface at all
+(see `docs/CAPTIONTRACK_API_AUDIT.md` for the complete method-by-method
+inventory).
+
+All UXP and CEP proof-of-concept code, and the Adobe bug-report repro
+(`adobe-bug-report/`), are preserved as-is — nothing described in this
+document has been deleted.
 
 ## Product scope (unchanged)
 
-transcript → timed chunks → AI/manual style selection → editable text
-graphics automatically created and timed in Premiere.
+- timed text chunks
+- editable in Premiere afterward
+- multiple fonts, weights, sizes and colours
+- keyword-specific emphasis
+- backgrounds, shadows and graphics
+- entrance/exit animation
+- automatic placement on the timeline
+- no After Effects required in the normal user workflow
 
-Nothing below changes this scope. What's actually in question is narrower:
-**the mechanism Premiere accepts for programmatically creating/timing an
-editable text graphic**, given that the two mechanisms tried so far
-(UXP's `createSetValueAction`, ExtendScript's `evalScript`) are each
-blocked for a different reason.
+Nothing below changes this scope, and nothing below proposes copy/paste,
+markers, burned-in rendering, or After Effects as the everyday workflow —
+those are explicitly excluded, not silently substituted.
 
-## The four routes
+## What changed in this revision
 
-### A. Test an earlier Premiere Pro release where CEP `evalScript()` works
+Previously (this document's first version) Route D was described as
+"potentially yes, not yet confirmed" and recommended as the first thing to
+check, on the strength of a search-result summary. That was correctly
+flagged as unconfirmed at the time, and the audit now closes it: a direct
+read of `@adobe/premierepro@26.3.0`'s actual shipped TypeScript
+declarations (the exact version matching this project's target host,
+`npm pack`'d and read in full — see `docs/CAPTIONTRACK_API_AUDIT.md`)
+shows:
 
-Reinstall an older Premiere Pro version (Creative Cloud keeps prior
-releases installable) and re-point the existing, unmodified `cep-bridge/`
-code at it, starting with the same `app.name` bypass test used to confirm
-the current failure.
+- `CaptionTrackStatic = {}` — completely empty, no static creation method.
+- `CaptionTrack`'s only two write methods are `createSetNameAction(name)`
+  (rename the track) and `setMute(mute)` — neither touches caption
+  content.
+- `Sequence` exposes only `getCaptionTrackCount()` and
+  `getCaptionTrack(trackIndex)` — enumeration, not creation.
+- **No caption-item class exists anywhere in the API** — no
+  `CaptionTrackItem`, no `Caption`. `getTrackItems()` returns an untyped
+  `[]`. There is nothing to hold text, timing, or style even if a track
+  could be created.
+- **No styling class exists anywhere in the API** — a full scan for
+  `Title`, `Graphic`, `Style`, `Font`, `Shadow`, `Background`, `Align`, or
+  `Animat*` as type names returned zero matches, for captions or anything
+  else.
+- Cross-checked against the newest available prerelease
+  (`26.5.0-beta.61`, ahead of 26.3.0): identical capability, confirming
+  this isn't a stale snapshot about to be filled in.
 
-- **Can it create editable Premiere text graphics?** Unconfirmed either
-  way, and even a "yes" on `evalScript()` working doesn't answer the
-  original question this whole CEP side-channel exists to test: whether
-  ExtendScript's `ComponentParam.setValue()` can actually write `Source
-  Text`, which was never reached because `evalScript()` itself broke
-  first. Part 2 of the CEP investigation predicts (from API-surface
-  equivalence, not certainty) that `setValue()` likely hits the same
-  native rejection UXP's `createSetValueAction()` did — a working
-  `evalScript()` reopens the test, it doesn't guarantee the result.
+This also resolves a name collision worth recording: a `createCaptionTrack(projectItem,
+startAtTime, [captionFormat])` method genuinely exists, but only in the
+**legacy ExtendScript** API, not UXP — a search engine can conflate the
+two APIs under the same class names. This document is scoped to UXP,
+where no such method exists.
+
+Route C's write-up is also strengthened this round with a direct,
+non-speculative answer from Adobe developer support (surfaced via search,
+not independently fetchable this session — `developer.adobe.com` and
+`*.docsforadobe.dev` are blocked by this session's outbound network
+policy, confirmed via the proxy's own status endpoint): asked specifically
+about `PrSDKGraphic`/`PrSDKCaption`-style headers, the reply was that
+*neither header exists, across either the Premiere or After Effects C++
+SDK codebase.* The SDK's plugin types are importers, exporters,
+effects/transitions, and generators/synthetic importers — a
+titler-equivalent plugin is described as needing to use the
+dynamic-disk-media-creation variant of the *importer* API, i.e. render to
+a file, not author an editable native graphic. This was previously a
+structural inference from documented SDK *scope*; it is now a direct
+confirmation from Adobe.
+
+## The four routes, re-ranked
+
+### D. Native CaptionTrack API — **closed, not viable for the full requirement**
+
+See `docs/CAPTIONTRACK_API_AUDIT.md` for the full method inventory. Every
+row of the task checklist (create a track, create an item, set text, set
+start/end, set font/size/fill/background/shadow/alignment, style
+individual words, convert to editable graphics, animate) is **No** — not
+because of an empirical rejection like `Source Text`'s `Illegal Parameter
+type`, but because **the methods do not exist in the published API at
+all**. Per this round's explicit instruction, no proof of concept was
+built: there is no creation/write path to demonstrate.
+
+- **Can it create editable Premiere text graphics?** No, confirmed absent.
+- **After Effects required?** N/A — route is closed.
+- **Engineering complexity / Windows-macOS / deployment / long-term
+  support:** N/A — nothing to build against an API that isn't there.
+- **Estimated proof-of-concept effort:** N/A, per task instruction not to
+  manufacture one.
+
+This is downgraded from "recommended first check" to **closed** —
+correcting this document's own prior conclusion in light of direct
+evidence rather than a plausible-sounding but wrong-API search summary.
+
+### A. Older Premiere/CEP — **kept only as a narrow, temporary compatibility experiment**
+
+Not "does CEP work on an old version" for its own sake — CEP is
+deprecated regardless of the answer (Part 1). Its only remaining value is
+narrower and specific: **`ComponentParam.setValue(value, updateUI)`**,
+ExtendScript's legacy two-argument write call, is the **one Source-Text
+write path this project has never actually tested** — every real-host CEP
+run reached a broken `evalScript()` before ever attempting it (Parts
+10–17). UXP's `createSetValueAction()` and ExtendScript's `setValue()` are
+not proven identical; Part 2 flags a real, if unlikely, chance the legacy
+calling convention takes a different native code path.
+
+- **Can it create editable Premiere text graphics?** Unconfirmed — this is
+  exactly what route A would finally test. Not expected to succeed (Part
+  2's same-native-object-model argument), but the one genuinely open
+  question left in this entire investigation.
 - **After Effects required?** No.
-- **Engineering complexity:** Low. Zero new code — the entire
-  `cep-bridge/` proof of concept, its bypass tests, and its regression
-  suite already exist and are untouched.
-- **Windows/macOS:** CEP itself runs on both, but this project's bridge
-  currently only works on Windows (`src/ppro/cepBridge.js`'s header
-  comment: Premiere disallows plain `http://` on macOS; the bridge would
-  need a self-signed HTTPS listener to run there, not yet built).
-- **Deployment/signing complexity:** Moderate and already-solved for a
-  PoC — CEP extensions load unsigned in debug mode (`PlayerDebugMode`
-  registry/plist flag), which is exactly how this project's bridge has
-  been tested so far. Real distribution to end users would need ZXP
-  packaging and a signing certificate, and CEP's Adobe-side end-of-life
-  makes that investment questionable.
-- **Long-term support:** Poor, deliberately. This route is explicitly
-  "does an old, already-deprecated mechanism still work on an old,
-  unsupported host" — useful as a fast, cheap diagnostic to close out
-  Part 17's open question, but not a viable long-term architecture
-  regardless of its answer. CEP is a dead end on any currently-shipping or
-  future Premiere version.
-- **Estimated proof-of-concept effort:** Hours. Install one older Premiere
-  version, run the existing `app.name` bypass test unchanged. This is the
-  cheapest possible next step, but its ceiling is low: at best it confirms
-  a theory about a version this project won't ship against.
+- **Engineering complexity:** Low — `cep-bridge/`'s existing code needs no
+  changes; only an older Premiere install is required to re-run it.
+- **Windows/macOS:** Windows only, as today (`http://`-only bridge).
+- **Deployment/signing complexity:** Moderate, PoC-only (unsigned/debug
+  mode) — not worth solving for real distribution given CEP's end-of-life.
+- **Long-term support:** Poor, deliberately temporary — explicitly framed
+  as a compatibility experiment to close an open question, not a shipping
+  plan.
+- **Estimated proof-of-concept effort:** Hours: install one older Premiere
+  version, add one new CEP command that calls
+  `component.properties[i].setValue("test", true)` against `Source Text`,
+  run it. This is now the **smallest concrete next step in the whole
+  investigation** (see Recommendation).
 
-### B. UXP Hybrid Plugin with native C++
+### B. UXP Hybrid Plugin — unchanged, still speculative and not recommended
 
-Adobe's UXP Hybrid Plugin mechanism lets a UXP plugin bundle native code
-(C++) that JS can call into, primarily documented today for Photoshop and
-InDesign. The idea would be for native code to reach past whatever
-boundary is rejecting `Source Text` writes in both bindings tried so far.
+No new evidence this round changes this route's assessment. Still
+unconfirmed and speculative: Premiere-specific Hybrid Plugin documentation
+remains thin-to-nonexistent, and Part 2's "one native object model, no
+binding has a documented write path" finding gives no reason to expect a
+third, native binding — undocumented at any level — behaves differently.
+Complexity/platform/deployment/support assessment unchanged from this
+document's prior version: very high engineering complexity, separate
+native builds per platform, high signing/notarization complexity, unclear
+long-term support, weeks of PoC effort with a real chance of never
+reaching a working write.
 
-- **Can it create editable Premiere text graphics?** Unconfirmed and
-  speculative in a way the other three routes aren't. Part 2's finding —
-  that UXP's `premierepro` module and ExtendScript's DOM are two JS
-  bindings over the **same underlying native Component/ComponentParam
-  object model** — means a Hybrid Plugin's native code would still need
-  to go through, or around, that same native validation layer, which
-  Adobe has not published an API for at any level, including native.
-  There is no evidence a native binding exists for this at all; this
-  route assumes one might, without a documented API to target.
-- **After Effects required?** No.
-- **Engineering complexity:** Very high. Hybrid Plugin support for
-  Premiere specifically is thin-to-nonexistent in Adobe's current public
-  documentation (examples are Photoshop/InDesign-centric); building one
-  here starts from reverse-engineering undocumented Premiere internals,
-  not from a published API surface.
-- **Windows/macOS:** Requires separate native C++ builds per platform,
-  doubling the build/test matrix versus the pure-JS routes.
-- **Deployment/signing complexity:** High. Native binaries need
-  per-platform code signing (and macOS notarization), plus UXP manifest
-  permissions for native-module loading.
-- **Long-term support:** Unclear and high-risk. This is an early/limited
-  Adobe capability with sparse Premiere-specific precedent; betting a
-  shipping feature on it means betting on undocumented behavior staying
-  stable across Premiere updates.
-- **Estimated proof-of-concept effort:** Weeks, with a real chance the PoC
-  never reaches a working Source Text write regardless of time invested,
-  since success depends on undocumented internals Adobe has never
-  published for any binding.
+### C. Premiere C++ SDK — unchanged conclusion, now on direct confirmation instead of inference
 
-### C. Premiere C++ SDK / native plugin
-
-Build against Adobe's official, downloadable Premiere Pro SDK (plugin
-types: import/export, effects, generators) rather than either scripting
-binding.
-
-- **Can it create editable Premiere text graphics?** Very likely not, for
-  a structural reason rather than a bug: Adobe's public Premiere Pro SDK
-  documentation scopes plugins around media I/O and effects processing
-  (PiPL-style plugins), not around authoring/mutating Essential
-  Graphics/MOGRT scene data — there is no documented Source-Text-adjacent
-  API here either. This route would most likely hit the same "Adobe never
-  published this" wall the other three do, just from native C++ instead
-  of a scripting binding. The one genuinely different option this route
-  opens is **not mutating Source Text at all**: a custom generator/effect
-  plugin could render the caption text itself directly into a video
-  layer, sidestepping Essential Graphics entirely — but that is a
-  materially different feature (a burned-in render, not an editable
-  Premiere text graphic) and would need explicit product sign-off before
-  being treated as satisfying the current scope.
-- **After Effects required?** No (Premiere's SDK is separate from AE's),
-  though the same structural limitation is expected to hold for AE's C++
-  SDK too.
-- **Engineering complexity:** Very high. Native plugin host architecture
-  (host-side callback suites), a compiled binary registered with
-  Premiere, and an SDK that is versioned per Premiere release (plugins can
-  break across Premiere updates and need revalidation).
-- **Windows/macOS:** Separate native builds required, as in route B.
-- **Deployment/signing complexity:** High. Native binary installation,
-  per-platform signing/notarization, and SDK-version compatibility
-  tracking across Premiere releases.
-- **Long-term support:** Better than routes A/B in one specific sense —
-  Adobe does maintain real public documentation and a developer forum for
-  this SDK — but that durability doesn't help if the SDK simply doesn't
-  expose the capability needed, which is the likely outcome here.
-- **Estimated proof-of-concept effort:** Weeks to over a month for a
-  minimal "hello world" plugin using Adobe's sample SDK code — and that
-  PoC would still not answer whether Source Text mutation is possible,
-  because the documented SDK scope suggests it structurally isn't.
-
-### D. An official, current Premiere caption/graphics API that avoids Source Text mutation entirely
-
-Premiere Pro's native **Captions** feature (its own track type, Essential
-Graphics-adjacent but architecturally separate from generic MOGRT title
-graphics — SRT/VTT import, the Text-Based Editing panel, Caption Styles
-for font/color/position/background, and "burn in" to Open Captions) has
-never been investigated in either the UXP or CEP rounds of this project.
-If Premiere's public UXP scripting API (the `premierepro` module) exposes
-any way to create/populate a Captions track programmatically, that would
-be a **completely different data path from `ComponentParam`/`Source
-Text`** — the exact bottleneck both prior routes hit — while staying
-inside the already-built, already-working UXP extension.
-
-- **Can it create editable Premiere text graphics?** Potentially yes, and
-  for a fundamentally different reason than routes A–C: this wouldn't be
-  fighting the same `Source Text` write rejection at all, since native
-  Captions are not `ComponentParam`-based MOGRT text. This is **not yet
-  confirmed** — this project has never checked whether the current
-  `premierepro` UXP API publishes a caption-track creation/import method,
-  and that needs a fresh read of Adobe's current UXP API reference (it
-  changes per release) before any effort is committed. Native Captions
-  also come with real styling controls (Caption Styles: font, size,
-  color, position, background), which plausibly satisfies "AI/manual
-  style selection," though it is more constrained than a fully custom
-  MOGRT template with arbitrary animation.
-- **After Effects required?** No.
-- **Engineering complexity:** Low to moderate, *if* the API exists —
-  reuses the entire existing UXP extension (transcript ingestion,
-  chunking, keyword/emphasis logic, the approval workflow) unchanged; only
-  the final "create the graphic" step would be re-targeted from MOGRT
-  `Source Text` to a Captions-track call.
-- **Windows/macOS:** Same as the rest of the UXP extension today — both,
-  no separate native builds, no platform-specific HTTP/HTTPS bridge
-  concerns (this route needs no CEP bridge at all).
-- **Deployment/signing complexity:** Lowest of the four — identical to
-  this project's existing UXP distribution model (`manifest.json`,
-  `dist/main.js`), already solved.
-- **Long-term support:** Best of the four by a wide margin. Captions are a
-  growing first-party Premiere feature (unlike CEP, which Adobe has an
-  active, dated plan to remove), and UXP is Adobe's stated forward
-  direction for Premiere scripting — the opposite trajectory from CEP.
-- **Estimated proof-of-concept effort:** Small if the API exists (hours to
-  a day, reusing existing insertion/timing code against a new target
-  call) — but effort estimate is contingent on a first step this project
-  hasn't done yet: checking the current official UXP API reference for a
-  documented Captions-track method. That check itself is minutes, not
-  days.
+Previously "very likely not [possible], for a structural reason" — now
+confirmed directly: Adobe developer support states neither
+`PrSDKGraphic`- nor `PrSDKCaption`-style headers exist in the Premiere or
+After Effects C++ SDK, and the SDK's plugin types (importer, exporter,
+effect/transition, generator) have no authoring path for editable
+Essential Graphics/title/caption content — a titler-like plugin would need
+the dynamic-media-creation importer variant, which renders to a file
+(burned-in output), not an editable native graphic. That specific variant
+is explicitly excluded from this project's scope (task 8: no burned-in
+rendering as the everyday workflow), so Route C is closed for the stated
+requirement, not merely deprioritized. Complexity/platform/deployment
+assessment otherwise unchanged: very high engineering complexity, separate
+native builds, high signing complexity, real public documentation (better
+long-term support *as an SDK*) but that doesn't help since the capability
+itself isn't exposed.
 
 ## Recommendation
 
-**Route D first: check whether the official, current `premierepro` UXP
-API exposes a Captions-track creation/import method, before spending any
-engineering effort on A, B, or C.** This is the only route that avoids the
-exact bottleneck both prior investigations independently hit
-(`ComponentParam`/`Source Text` write rejection, in two unrelated
-bindings over the same native object model — Part 2's finding), stays
-entirely inside the UXP extension this project already has working and
-already knows how to ship, and is aligned with Adobe's actual direction
-(UXP growing, CEP being actively wound down on a dated timeline this
-investigation has now run into firsthand). The check itself costs minutes
-against Adobe's current documentation; committing further engineering
-should wait on that answer.
+**No route audited so far has a documented, confirmed write path that
+meets the full product requirement.** That is the honest conclusion this
+round's evidence supports, and it is worth stating plainly rather than
+picking a "winner" among four routes that each fail the requirement for a
+different reason:
 
-**Route A is worth a few hours only as a closing diagnostic**, not as a
-shipping architecture — it would answer whether Part 17's `evalScript()`
-failure is host-specific or a symptom of Adobe's broader ExtendScript
-wind-down, satisfying curiosity and possibly informing an Adobe support
-ticket, but a "yes" doesn't produce anything this project could ship: CEP
-is deprecated regardless of which specific host version still runs it.
+- UXP `ComponentParam.createSetValueAction()` — empirically rejected
+  (`Illegal Parameter type`).
+- CEP `CSInterface.evalScript()` — confirmed broken on this host, and
+  deprecated regardless.
+- Native `CaptionTrack` — confirmed absent creation/write/styling API.
+- UXP Hybrid Plugin / Premiere C++ SDK — no documented API surface at any
+  level (native headers confirmed not to exist for graphics/captions).
 
-**Routes B and C should not be pursued without a much stronger signal**
-than currently exists. Both require weeks of native-code investment
-against undocumented Premiere internals, with a real chance the effort
-concludes in the same wall UXP and CEP already hit — Part 2's core
-finding (one native object model, multiple JS bindings, no exposed
-Source-Text-write path in either public API) gives no reason to expect a
-third binding, published or not, behaves differently. If Route D turns
-out to be a dead end too, the next-cheapest remaining option is
-re-examining Route C's generator/effect-plugin variant (rendering text
-directly rather than mutating Source Text) — but that changes the
-feature's nature and needs explicit product sign-off first, not another
-open-ended engineering investigation.
+**The smallest next proof of concept is Route A's narrow form**: reinstall
+one older Premiere Pro version, add exactly one new CEP command to the
+existing, unmodified `cep-bridge/` proof of concept that calls
+ExtendScript's legacy `component.properties[i].setValue("test-value",
+true)` against a MOGRT's `Source Text` param, and run it. This is the
+**one Source-Text write attempt this entire investigation has never
+actually reached** — every previous CEP round broke at the `evalScript()`
+transport layer first. It costs hours, not weeks, reuses code that
+already exists, and directly answers Part 2's still-open prediction
+(same native object model, two bindings, does the legacy two-argument
+calling convention differ from the transaction-based one?) instead of
+leaving it as a theory.
+
+If that test also fails — which Part 2's reasoning suggests is the more
+likely outcome — this project is out of currently-documented options for
+in-place `Source Text` mutation, and the next decision point is a product
+one, not an engineering one: whether to invest weeks in Route B or C
+against undocumented internals with no confirmed API to target (not
+recommended without a much stronger signal than exists today), or to
+revisit the product requirement itself with stakeholders — which is
+explicitly out of scope for this document to decide unilaterally (task 8:
+preserve the full scope; that decision belongs to product, not to this
+audit).
 
 ## What was not done this round
 
-No new architecture was implemented — this document is a comparison and
-recommendation only, per this round's explicit instruction. The next step,
-if this recommendation is accepted, is a scoped, cheap investigation of
-Route D's premise (does the current UXP API publish a Captions-track
-method) — not a build.
+No new architecture was implemented and no CaptionTrack proof of concept
+was built, per this round's explicit instruction not to manufacture one
+where no documented creation/write path exists. The `.d.ts`-level audit
+(`docs/CAPTIONTRACK_API_AUDIT.md`) was judged sufficient on its own to
+reach a definitive negative conclusion for Route D, without needing a
+live-host run to confirm it.

@@ -524,6 +524,50 @@ try {
     await runStartupBuildCheck();
   }
 
+  /**
+   * docs/CAPTION_GRAPHICS_ARCHITECTURE_DECISION.md's smallest remaining
+   * proof of concept, wired directly into this CEP panel — no UXP
+   * extension needs to be running for this button to work (task 6). Calls
+   * runExtendScriptCommand() directly (the same function every other
+   * command in this file uses), so the exact evalScript() source string
+   * and raw callback are logged/shown the same way as every other
+   * command, then renders the full structured result (every stage's
+   * outcome) into #legacy-setvalue-result.
+   */
+  const legacySetValueBtn = document.getElementById("legacy-setvalue-btn");
+  const legacyMogrtPathInput = document.getElementById("legacy-mogrt-path");
+  const legacySetValueResultEl = document.getElementById("legacy-setvalue-result");
+  if (legacySetValueBtn && legacyMogrtPathInput && legacySetValueResultEl) {
+    legacySetValueBtn.addEventListener("click", async () => {
+      const mogrtPath = legacyMogrtPathInput.value.trim();
+      if (!mogrtPath) {
+        legacySetValueResultEl.textContent = 'Enter the full path to "Keris Master Caption.mogrt" first.';
+        return;
+      }
+      legacySetValueBtn.disabled = true;
+      legacySetValueBtn.textContent = "Running…";
+      legacySetValueResultEl.textContent = "Running…";
+      try {
+        const result = await runExtendScriptCommand("testLegacySourceTextSetValue", { mogrtPath }, `legacy-setvalue-${Date.now()}`);
+        legacySetValueResultEl.textContent = JSON.stringify(result, null, 2);
+        log(
+          result.ok
+            ? "✓ testLegacySourceTextSetValue: setValue() succeeded — check the panel for confirmation."
+            : `✗ testLegacySourceTextSetValue failed: ${result.error ?? "see result JSON above"}`,
+          result.ok ? "success" : "error"
+        );
+      } catch (err) {
+        legacySetValueResultEl.textContent = `Crashed: ${err.message || err}`;
+        log(`✗ testLegacySourceTextSetValue crashed: ${err.message || err}`, "error");
+      } finally {
+        legacySetValueBtn.disabled = false;
+        legacySetValueBtn.textContent = "Run testLegacySourceTextSetValue";
+      }
+    });
+  } else {
+    log("✗ Legacy setValue test UI elements not found in index.html — button not wired.", "error");
+  }
+
   server.listen(PORT, HOST, () => {
     setStatus(`Listening on http://${HOST}:${PORT} — loading hostscript.jsx…`, true); // stage 4 (task 2)
     log(`✓ Bridge server started on http://${HOST}:${PORT}`, "success");

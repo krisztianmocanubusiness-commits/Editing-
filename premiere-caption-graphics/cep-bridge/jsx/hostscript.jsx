@@ -39,7 +39,7 @@ if (typeof $._captionStudioBridge === "undefined") {
 // "getAvailableCommands" and compare the returned build ID/command list
 // against what's actually in this file on disk. Bump HOSTSCRIPT_BUILD_ID
 // on every change to this file that should be verifiable after a reload.
-var HOSTSCRIPT_BUILD_ID = "2026-07-15-bypass-r3";
+var HOSTSCRIPT_BUILD_ID = "2026-07-15-legacy-setvalue-r1";
 var SUPPORTED_COMMANDS = [
   "ping",
   "getAvailableCommands",
@@ -49,6 +49,7 @@ var SUPPORTED_COMMANDS = [
   "inspectSourceTextRawBytes",
   "testRawBytesHelpers",
   "bisectHostScript",
+  "testLegacySourceTextSetValue",
 ];
 
 /**
@@ -93,6 +94,8 @@ $._captionStudioBridge.dispatch = function (requestJsonString) {
       response = $._captionStudioBridge.testRawBytesHelpers(payload, requestId);
     } else if (command === "bisectHostScript") {
       response = $._captionStudioBridge.bisectHostScript(payload, requestId);
+    } else if (command === "testLegacySourceTextSetValue") {
+      response = $._captionStudioBridge.testLegacySourceTextSetValue(payload, requestId);
     } else {
       response = { ok: false, requestId: requestId, error: "Unknown command: " + command, hostscriptBuildId: HOSTSCRIPT_BUILD_ID };
     }
@@ -1899,4 +1902,281 @@ $._captionStudioBridge.bisectHostScript = function (payload, requestId) {
   } catch (fatalErr) {
     return buildFatalFailure(requestId, "bisect-step-" + step, [], fatalErr);
   }
+};
+
+/**
+ * docs/CAPTION_GRAPHICS_ARCHITECTURE_DECISION.md's smallest remaining
+ * proof of concept: the ONE Source-Text write attempt this whole
+ * investigation has never actually reached. Every real-host CEP round
+ * (Parts 10-17) broke at the evalScript() transport layer itself before
+ * ComponentParam.setValue() — ExtendScript's legacy, two-argument write
+ * call, a genuinely different code path from UXP's transaction-based
+ * createSetValueAction() per Part 2's prediction — was ever cleanly
+ * isolated and attempted against "Source Text" with nothing else in the
+ * request. This command exists to run exactly that one call, on an older
+ * Premiere host where evalScript() works, and report exactly what
+ * happens at every stage. Deliberately minimal per this round's explicit
+ * instructions:
+ *   - no alternative value shapes (one literal string, one call);
+ *   - no automatic removal of the inserted clip — left on the timeline
+ *     for visual confirmation;
+ *   - reuses the exact same multi-track clip-detection helpers as
+ *     createTextGraphic()/probeSourceTextDeep() (snapshotAllVideoTracks/
+ *     findNewClipAcrossTracks/findClipByTimeAndName/findTrackIndexForClip)
+ *     rather than duplicating that logic a third time.
+ *
+ * Every stage's outcome — pass or fail — is recorded independently in
+ * `stages`, so a failure partway through still returns a complete,
+ * honest, structured report of exactly what did and didn't happen.
+ *
+ * @param {{mogrtPath: string}} payload
+ */
+$._captionStudioBridge.testLegacySourceTextSetValue = function (payload, requestId) {
+  var stages = [];
+  function stage(name, ok, details) {
+    var entry = { name: name, ok: ok };
+    if (details) {
+      for (var key in details) {
+        if (details.hasOwnProperty(key)) entry[key] = details[key];
+      }
+    }
+    stages.push(entry);
+    return entry;
+  }
+
+  var mogrtPath = payload && payload.mogrtPath;
+  if (!mogrtPath) {
+    stage("validate-payload", false, { error: "payload.mogrtPath is required." });
+    return { ok: false, requestId: requestId, error: "payload.mogrtPath is required.", stages: stages };
+  }
+
+  // --- Stage: verify app.name works first ---
+  var appName;
+  try {
+    appName = app.name;
+    stage("app-name", true, { appName: appName });
+  } catch (errAppName) {
+    var appNameErr = errAppName && errAppName.message ? errAppName.message : String(errAppName);
+    stage("app-name", false, { error: appNameErr });
+    return { ok: false, requestId: requestId, error: "app.name threw: " + appNameErr, stages: stages };
+  }
+
+  // --- Stage: open the active sequence ---
+  var project = app.project;
+  if (!project) {
+    stage("open-active-sequence", false, { error: "No active Premiere project." });
+    return { ok: false, requestId: requestId, error: "No active Premiere project. Open a project first.", stages: stages };
+  }
+  var sequence = project.activeSequence;
+  if (!sequence) {
+    stage("open-active-sequence", false, { error: "No active sequence." });
+    return { ok: false, requestId: requestId, error: "No active sequence. Open a sequence first.", stages: stages };
+  }
+  stage("open-active-sequence", true, { sequenceName: sequence.name });
+
+  var videoTrackCount = sequence.videoTracks.numTracks;
+  var audioTrackCount = sequence.audioTracks.numTracks;
+  // Same never-hard-code-0 convention as createTextGraphic()/
+  // probeSourceTextDeep() (Part 7): topmost video track, audio track
+  // clamped to the audio track count.
+  var videoTrackIndex = videoTrackCount > 0 ? videoTrackCount - 1 : 0;
+  var audioTrackIndex = audioTrackCount > 0 ? Math.min(videoTrackIndex, audioTrackCount - 1) : 0;
+
+  var playheadTime;
+  try {
+    playheadTime = sequence.getPlayerPosition();
+  } catch (errPh) {
+    var phErr = errPh && errPh.message ? errPh.message : String(errPh);
+    stage("get-playhead-position", false, { error: phErr });
+    return { ok: false, requestId: requestId, error: "sequence.getPlayerPosition() threw: " + phErr, stages: stages };
+  }
+  stage("get-playhead-position", true, { seconds: playheadTime.seconds, ticks: playheadTime.ticks, videoTrackIndex: videoTrackIndex, audioTrackIndex: audioTrackIndex });
+
+  // --- Stage: import the mogrt at the playhead ---
+  var beforeSnapshot = snapshotAllVideoTracks(sequence);
+  var importReturnValue;
+  var importThrew = false;
+  var importError = null;
+  try {
+    importReturnValue = sequence.importMGT(mogrtPath, playheadTime.ticks, videoTrackIndex, audioTrackIndex);
+  } catch (errImport) {
+    importThrew = true;
+    importError = errImport && errImport.message ? errImport.message : String(errImport);
+  }
+  if (importThrew) {
+    stage("import-mogrt", false, { error: importError, mogrtPath: mogrtPath });
+    return { ok: false, requestId: requestId, error: "sequence.importMGT() threw: " + importError, stages: stages };
+  }
+  stage("import-mogrt", true, { mogrtPath: mogrtPath, importReturnType: typeof importReturnValue, importReturnValue: safeStringifyShallow(importReturnValue) });
+
+  var afterSnapshot = snapshotAllVideoTracks(sequence);
+
+  // --- Stage: identify the inserted TrackItem across all video tracks ---
+  var trackItem = null;
+  var detectionMethod = null;
+  var detectedTrackIndex = null;
+
+  if (looksLikeTrackItem(importReturnValue)) {
+    trackItem = importReturnValue;
+    detectionMethod = "importMGT return value";
+  }
+  if (!trackItem) {
+    var newClip = findNewClipAcrossTracks(beforeSnapshot, afterSnapshot);
+    if (newClip) {
+      trackItem = sequence.videoTracks[newClip.trackIndex].clips[newClip.clipIndex];
+      detectionMethod = "new clip diff across all tracks";
+      detectedTrackIndex = newClip.trackIndex;
+    }
+  }
+  if (!trackItem) {
+    var mogrtBaseName = basenameNoExt(mogrtPath);
+    var byTimeAndName = findClipByTimeAndName(afterSnapshot, playheadTime.seconds, mogrtBaseName, 1.0);
+    if (byTimeAndName) {
+      trackItem = sequence.videoTracks[byTimeAndName.trackIndex].clips[byTimeAndName.clipIndex];
+      detectionMethod = "time+name match";
+      detectedTrackIndex = byTimeAndName.trackIndex;
+    }
+  }
+  if (!trackItem) {
+    stage("identify-track-item", false, {
+      error: "importMGT() did not appear to add a clip to any video track.",
+      beforeClipCounts: mapClipCounts(beforeSnapshot),
+      afterClipCounts: mapClipCounts(afterSnapshot),
+    });
+    return {
+      ok: false,
+      requestId: requestId,
+      error: "Could not identify the inserted clip on any of the " + videoTrackCount + " video track(s).",
+      stages: stages,
+    };
+  }
+  if (detectedTrackIndex === null) {
+    detectedTrackIndex = findTrackIndexForClip(sequence, trackItem);
+  }
+  stage("identify-track-item", true, { trackItemName: trackItem.name, detectedTrackIndex: detectedTrackIndex, detectionMethod: detectionMethod });
+
+  // --- Stage: locate the "Text" / "AE.ADBE Text" component ---
+  var textComponent = null;
+  var componentDisplayName = null;
+  var componentMatchName = null;
+  var allComponentNamesSeen = [];
+  try {
+    for (var ci = 0; ci < trackItem.components.numItems; ci++) {
+      var component = trackItem.components[ci];
+      var compDisplayName = null;
+      var compMatchName = null;
+      try { compDisplayName = component.displayName; } catch (eCompDisp) {}
+      try { compMatchName = component.matchName; } catch (eCompMatch) {}
+      allComponentNamesSeen.push({ displayName: compDisplayName, matchName: compMatchName });
+      if (compMatchName === "AE.ADBE Text" || compDisplayName === "Text") {
+        textComponent = component;
+        componentDisplayName = compDisplayName;
+        componentMatchName = compMatchName;
+      }
+    }
+  } catch (errLocateComp) {
+    var locateCompErr = errLocateComp && errLocateComp.message ? errLocateComp.message : String(errLocateComp);
+    stage("locate-text-component", false, { error: locateCompErr, componentsSeen: allComponentNamesSeen });
+    return { ok: false, requestId: requestId, error: "Error while enumerating components: " + locateCompErr, stages: stages };
+  }
+  if (!textComponent) {
+    stage("locate-text-component", false, { error: 'No component with displayName "Text" or matchName "AE.ADBE Text" found.', componentsSeen: allComponentNamesSeen });
+    return { ok: false, requestId: requestId, error: 'No "Text" / "AE.ADBE Text" component found on the inserted clip.', stages: stages };
+  }
+  stage("locate-text-component", true, { componentDisplayName: componentDisplayName, componentMatchName: componentMatchName, componentsSeen: allComponentNamesSeen });
+
+  // --- Stage: locate the "Source Text" property ---
+  var sourceTextParam = null;
+  var allParamNamesSeen = [];
+  try {
+    for (var pi = 0; pi < textComponent.properties.numItems; pi++) {
+      var param = textComponent.properties[pi];
+      var pDisplayName = null;
+      try { pDisplayName = param.displayName; } catch (ePName) {}
+      allParamNamesSeen.push(pDisplayName);
+      if (pDisplayName === "Source Text") {
+        sourceTextParam = param;
+      }
+    }
+  } catch (errLocateParam) {
+    var locateParamErr = errLocateParam && errLocateParam.message ? errLocateParam.message : String(errLocateParam);
+    stage("locate-source-text-property", false, { error: locateParamErr, paramsSeen: allParamNamesSeen });
+    return { ok: false, requestId: requestId, error: "Error while enumerating properties: " + locateParamErr, stages: stages };
+  }
+  if (!sourceTextParam) {
+    stage("locate-source-text-property", false, { error: 'No property with displayName "Source Text" found.', paramsSeen: allParamNamesSeen });
+    return { ok: false, requestId: requestId, error: 'No "Source Text" property found on the "Text" component.', stages: stages };
+  }
+  stage("locate-source-text-property", true, { paramsSeen: allParamNamesSeen });
+
+  // --- Stage: getValue() BEFORE any write — record the raw result ---
+  var rawValueBefore;
+  var getValueThrew = false;
+  var getValueError = null;
+  try {
+    rawValueBefore = sourceTextParam.getValue();
+  } catch (errGet) {
+    getValueThrew = true;
+    getValueError = errGet && errGet.message ? errGet.message : String(errGet);
+  }
+  if (getValueThrew) {
+    stage("get-value-before", false, { error: getValueError });
+  } else {
+    stage("get-value-before", true, { typeofValue: typeof rawValueBefore, value: safeStringifyShallow(rawValueBefore) });
+  }
+
+  // --- Stage: THE test — setValue("__KERIS_LEGACY_TEST__", true), one direct call, no alternative shapes ---
+  var setValueReturn;
+  var setValueThrew = false;
+  var setValueError = null;
+  var setValueErrorStack = null;
+  try {
+    setValueReturn = sourceTextParam.setValue("__KERIS_LEGACY_TEST__", true);
+  } catch (errSet) {
+    setValueThrew = true;
+    setValueError = errSet && errSet.message ? errSet.message : String(errSet);
+    setValueErrorStack = errSet && errSet.stack ? String(errSet.stack) : null;
+  }
+  if (setValueThrew) {
+    stage("set-value", false, { error: setValueError, errorStack: setValueErrorStack });
+  } else {
+    stage("set-value", true, { typeofReturn: typeof setValueReturn, returnValue: safeStringifyShallow(setValueReturn) });
+  }
+
+  // --- Stage: getValue() again AFTER the write attempt — record the raw result ---
+  var rawValueAfter;
+  var getValueAfterThrew = false;
+  var getValueAfterError = null;
+  try {
+    rawValueAfter = sourceTextParam.getValue();
+  } catch (errGetAfter) {
+    getValueAfterThrew = true;
+    getValueAfterError = errGetAfter && errGetAfter.message ? errGetAfter.message : String(errGetAfter);
+  }
+  if (getValueAfterThrew) {
+    stage("get-value-after", false, { error: getValueAfterError });
+  } else {
+    stage("get-value-after", true, { typeofValue: typeof rawValueAfter, value: safeStringifyShallow(rawValueAfter) });
+  }
+
+  // Task: the clip is deliberately left on the timeline, always — no
+  // removal call anywhere in this function, on any code path — so the
+  // text change (or lack of one) can be visually confirmed in Premiere.
+  return {
+    ok: !setValueThrew,
+    requestId: requestId,
+    result: {
+      appName: appName,
+      trackItemName: trackItem.name,
+      detectedTrackIndex: detectedTrackIndex,
+      componentDisplayName: componentDisplayName,
+      componentMatchName: componentMatchName,
+      valueBeforeWrite: getValueThrew ? undefined : safeStringifyShallow(rawValueBefore),
+      setValueSucceeded: !setValueThrew,
+      setValueError: setValueThrew ? setValueError : undefined,
+      valueAfterWrite: getValueAfterThrew ? undefined : safeStringifyShallow(rawValueAfter),
+      clipLeftOnTimeline: true,
+    },
+    stages: stages,
+  };
 };

@@ -272,3 +272,32 @@ test("the evalFile path is escaped (backslashes and double quotes) before being 
     "expected double-quote-escaping (replace(/\"/g, '\\\"')) of the hostscript path before embedding it in a JS string literal"
   );
 });
+
+// --- testLegacySourceTextSetValue button (docs/CAPTION_GRAPHICS_ARCHITECTURE_DECISION.md's
+// smallest remaining proof of concept) — wired directly into this CEP
+// panel, calling runExtendScriptCommand() directly rather than requiring
+// the UXP extension to be running at all.
+
+test("the legacy setValue test button calls runExtendScriptCommand(\"testLegacySourceTextSetValue\", ...) directly, not through the UXP panel or /raw-eval", () => {
+  const source = readMainJs();
+  const clickHandlerMatch = source.match(/legacySetValueBtn\.addEventListener\("click",[\s\S]*?\n {4}\}\);/);
+  assert.ok(clickHandlerMatch, "expected to find the legacy setValue button's click handler");
+  const handlerSource = clickHandlerMatch[0];
+  assert.match(handlerSource, /runExtendScriptCommand\("testLegacySourceTextSetValue",\s*\{\s*mogrtPath\s*\}/);
+});
+
+test("the legacy setValue test button reads the mogrt path from its own #legacy-mogrt-path input, not from any UXP-side state", () => {
+  const source = readMainJs();
+  assert.match(source, /getElementById\("legacy-mogrt-path"\)/);
+  assert.match(source, /getElementById\("legacy-setvalue-btn"\)/);
+  assert.match(source, /getElementById\("legacy-setvalue-result"\)/);
+});
+
+test("index.html declares the legacy setValue test's input, button, and result elements", () => {
+  const htmlPath = path.join(ROOT, "cep-bridge", "client", "index.html");
+  const html = fs.readFileSync(htmlPath, "utf8");
+  assert.match(html, /id="legacy-mogrt-path"/);
+  assert.match(html, /id="legacy-setvalue-btn"/);
+  assert.match(html, /id="legacy-setvalue-result"/);
+  assert.match(html, />Run testLegacySourceTextSetValue</, "expected the exact button label \"Run testLegacySourceTextSetValue\"");
+});

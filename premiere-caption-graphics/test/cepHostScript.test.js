@@ -352,7 +352,12 @@ test('dispatch() routes the "bisectHostScript" command to $._captionStudioBridge
 
 function extractBisectFnSource() {
   const source = readHostScript();
-  const match = source.match(/\$\._captionStudioBridge\.bisectHostScript = function[\s\S]*$/);
+  // Non-greedy, bounded to the first top-level `\n};` after the start of
+  // the function — bisectHostScript is no longer the last function in the
+  // file (testLegacySourceTextSetValue follows it and legitimately
+  // touches app.project/.activeSequence/importMGT), so matching to end of
+  // file here would wrongly pull that function's body in too.
+  const match = source.match(/\$\._captionStudioBridge\.bisectHostScript = function[\s\S]*?\n};/);
   assert.ok(match, "expected to find the bisectHostScript function body");
   return match[0];
 }
@@ -544,4 +549,82 @@ test("echoPayloadDirect takes one string argument, returns a JSON string directl
 test("basenameNoExt (used indirectly by the confirmed-working probeSourceTextDeep) remains a bare top-level function, suitable as the known-working bare-global bypass target", () => {
   const source = readHostScript();
   assert.match(source, /^function basenameNoExt\(path\)\s*\{/m);
+});
+
+// --- testLegacySourceTextSetValue: docs/CAPTION_GRAPHICS_ARCHITECTURE_DECISION.md's
+// smallest remaining proof of concept — the one Source-Text write attempt
+// this investigation has never actually reached (every prior real-host CEP
+// round broke at the evalScript() transport layer first). Deliberately
+// minimal: one literal value, one setValue() call, no automatic removal of
+// the inserted clip.
+
+test("HOSTSCRIPT_BUILD_ID and SUPPORTED_COMMANDS list testLegacySourceTextSetValue, and dispatch() routes it to $._captionStudioBridge.testLegacySourceTextSetValue", () => {
+  const source = readHostScript();
+  assert.match(source, /var\s+HOSTSCRIPT_BUILD_ID\s*=\s*"2026-07-15-legacy-setvalue-r1"/);
+  const listMatch = source.match(/var\s+SUPPORTED_COMMANDS\s*=\s*\[([\s\S]*?)\];/);
+  assert.ok(listMatch, "expected to find the SUPPORTED_COMMANDS array literal");
+  assert.ok(listMatch[1].includes("testLegacySourceTextSetValue"));
+  assert.match(source, /command\s*===\s*["']testLegacySourceTextSetValue["']/);
+  assert.match(source, /\$\._captionStudioBridge\.testLegacySourceTextSetValue\s*=\s*function\s*\(/);
+});
+
+function extractLegacySetValueFnSource() {
+  const source = readHostScript();
+  const match = source.match(/\$\._captionStudioBridge\.testLegacySourceTextSetValue = function[\s\S]*$/);
+  assert.ok(match, "expected to find testLegacySourceTextSetValue's function body");
+  return match[0];
+}
+
+test("testLegacySourceTextSetValue verifies app.name before doing anything else", () => {
+  const fnSource = extractLegacySetValueFnSource();
+  const appNameIndex = fnSource.indexOf("appName = app.name");
+  const activeSequenceIndex = fnSource.indexOf(".activeSequence");
+  assert.ok(appNameIndex !== -1, "expected an app.name read");
+  assert.ok(activeSequenceIndex !== -1, "expected an .activeSequence read");
+  assert.ok(appNameIndex < activeSequenceIndex, "app.name must be verified before the active sequence is opened");
+});
+
+test("testLegacySourceTextSetValue reuses the existing multi-track clip-detection helpers rather than duplicating that logic", () => {
+  const fnSource = extractLegacySetValueFnSource();
+  assert.match(fnSource, /snapshotAllVideoTracks\(sequence\)/);
+  assert.match(fnSource, /findNewClipAcrossTracks\(/);
+  assert.match(fnSource, /findClipByTimeAndName\(/);
+  assert.match(fnSource, /findTrackIndexForClip\(/);
+  assert.match(fnSource, /looksLikeTrackItem\(/);
+});
+
+test("testLegacySourceTextSetValue locates the component by displayName \"Text\" or matchName \"AE.ADBE Text\", then the \"Source Text\" property on it", () => {
+  const fnSource = extractLegacySetValueFnSource();
+  assert.match(fnSource, /compMatchName === "AE\.ADBE Text" \|\| compDisplayName === "Text"/);
+  assert.match(fnSource, /pDisplayName === "Source Text"/);
+  const componentIndex = fnSource.indexOf('compMatchName === "AE.ADBE Text"');
+  const propertyIndex = fnSource.indexOf('pDisplayName === "Source Text"');
+  assert.ok(componentIndex < propertyIndex, "the Text/AE.ADBE Text component must be located before the Source Text property is searched for");
+});
+
+test("testLegacySourceTextSetValue calls getValue() before setValue(), then setValue() exactly once with a single literal value and updateUI=true, then getValue() again", () => {
+  const fnSource = extractLegacySetValueFnSource();
+  const getBeforeIndex = fnSource.indexOf("rawValueBefore = sourceTextParam.getValue()");
+  const setValueIndex = fnSource.indexOf('sourceTextParam.setValue("__KERIS_LEGACY_TEST__", true)');
+  const getAfterIndex = fnSource.indexOf("rawValueAfter = sourceTextParam.getValue()");
+  assert.ok(getBeforeIndex !== -1 && setValueIndex !== -1 && getAfterIndex !== -1);
+  assert.ok(getBeforeIndex < setValueIndex, "getValue() must be called before setValue()");
+  assert.ok(setValueIndex < getAfterIndex, "setValue() must be called before the read-back getValue()");
+  // Only one setValue() call anywhere in the function — no alternative value shapes.
+  const setValueCallCount = (fnSource.match(/\.setValue\(/g) || []).length;
+  assert.equal(setValueCallCount, 1, "testLegacySourceTextSetValue must attempt exactly one setValue() call — no alternative value shapes per this round's explicit instruction");
+});
+
+test("testLegacySourceTextSetValue never removes the inserted clip — no remove/delete call anywhere in the function", () => {
+  const fnSource = extractLegacySetValueFnSource();
+  assert.doesNotMatch(fnSource, /\.remove\(/);
+  assert.doesNotMatch(fnSource, /removeItem/i);
+  assert.match(fnSource, /clipLeftOnTimeline:\s*true/, "expected the response to explicitly report the clip was left on the timeline");
+});
+
+test("testLegacySourceTextSetValue returns a stages array recording every stage's outcome, and ok reflects exactly whether setValue() succeeded", () => {
+  const fnSource = extractLegacySetValueFnSource();
+  assert.match(fnSource, /function stage\(name,\s*ok,\s*details\)/);
+  assert.match(fnSource, /stages:\s*stages/);
+  assert.match(fnSource, /ok:\s*!setValueThrew/);
 });

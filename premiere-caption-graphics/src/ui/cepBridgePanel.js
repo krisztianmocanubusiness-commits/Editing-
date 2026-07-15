@@ -11,15 +11,44 @@ import {
   getAvailableCommands,
   echoPayload,
   runRawEvalScript,
+  checkCepBridgeHealth,
   BYPASS_TEST_SCRIPTS,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../ppro/cepBridge.js";
 
+// Confirmed on a live host (docs/CEP_BRIDGE_INVESTIGATION.md Part 17): even
+// `app.name` — a built-in ExtendScript global with zero dependency on this
+// project's own code, hostscript.jsx, or $._captionStudioBridge — returns
+// the literal "EvalScript error." via CSInterface.evalScript(). This is a
+// fixed, confirmed finding, not a live re-check: CEP ExtendScript execution
+// is unavailable in this Premiere host version. Do not turn this back into
+// a live probe — see Part 17 for why bisecting this further isn't useful.
+const CEP_EXTENDSCRIPT_UNAVAILABLE_MESSAGE = "Premiere's CEP ExtendScript engine is unavailable in this host version.";
+
 const BISECT_MAX_STEP = 11;
 
 function patchCepBridge(patch) {
   store.set((s) => ({ cepBridge: { ...s.cepBridge, ...patch } }));
+}
+
+// Reuses the existing GET /health plumbing (checkCepBridgeHealth(), already
+// used before every command) purely to report CEP-server reachability as a
+// status line — this is not a new diagnostic, and it never touches
+// ExtendScript/hostscript.jsx/Source Text.
+async function runHostCompatibilityCheck() {
+  patchCepBridge({ hostStatus: { ...store.getState().cepBridge.hostStatus, checking: true } });
+  try {
+    const health = await checkCepBridgeHealth();
+    patchCepBridge({
+      hostStatus: { checking: false, cepServerAvailable: health.ok === true, lastCheckedAt: Date.now() },
+    });
+  } catch (err) {
+    log(`Host compatibility check crashed unexpectedly: ${err.message || err}`, "error");
+    patchCepBridge({
+      hostStatus: { checking: false, cepServerAvailable: false, lastCheckedAt: Date.now() },
+    });
+  }
 }
 
 async function runBuildCheck() {
@@ -652,6 +681,45 @@ function bypassResultBlock(result) {
   return el("div", { class: "inspector-results" }, lines);
 }
 
+// docs/CEP_BRIDGE_INVESTIGATION.md Part 17: a permanent status banner, not a
+// diagnostic tool. UXP availability and CEP-server reachability are the only
+// two lines that reflect a live check (isHosted() / the existing /health
+// endpoint) — CEP ExtendScript is reported unavailable unconditionally,
+// since that is now a confirmed live-host finding, not something to keep
+// re-probing.
+function hostCompatibilityStatusBlock(cb, onChange) {
+  const uxpAvailable = isHosted();
+  const { checking, cepServerAvailable, lastCheckedAt } = cb.hostStatus;
+  const cepServerLabel = checking ? "checking…" : cepServerAvailable === true ? "available" : cepServerAvailable === false ? "unavailable" : "not checked yet";
+  const checkedSuffix = lastCheckedAt ? ` (last checked ${new Date(lastCheckedAt).toLocaleTimeString()})` : "";
+  const checkBtn = el("button", {
+    class: "btn",
+    text: checking ? "Checking…" : "Check CEP Server Reachability",
+    disabled: checking || undefined,
+    onClick: async () => {
+      await runHostCompatibilityCheck();
+      onChange();
+    },
+  });
+  return el("div", { class: "inspector-results host-compat-status" }, [
+    el("h3", { text: "Host Compatibility Status" }),
+    el("div", { class: `status-line ${uxpAvailable ? "log-success" : "log-error"}`, text: `${uxpAvailable ? "✓" : "✗"} UXP: ${uxpAvailable ? "available" : "not running inside a UXP host"}` }),
+    el("div", {
+      class: `status-line ${cepServerAvailable === true ? "log-success" : cepServerAvailable === false ? "log-error" : ""}`,
+      text: `${cepServerAvailable === true ? "✓" : cepServerAvailable === false ? "✗" : "•"} CEP server: ${cepServerLabel}${checkedSuffix}`,
+    }),
+    el("div", {
+      class: "status-line log-error",
+      text:
+        '✗ CEP ExtendScript: unavailable — confirmed on a live host. app.name (a built-in ExtendScript global, zero ' +
+        'dependency on this project\'s code) returns the literal "EvalScript error." via CSInterface.evalScript(). ' +
+        "See docs/CEP_BRIDGE_INVESTIGATION.md Part 17.",
+    }),
+    el("div", { class: "row" }, [checkBtn]),
+    el("p", { class: "hint" }, [CEP_EXTENDSCRIPT_UNAVAILABLE_MESSAGE]),
+  ]);
+}
+
 export function renderCepBridgePanel(onChange) {
   const state = store.getState();
   const cb = state.cepBridge;
@@ -780,6 +848,16 @@ export function renderCepBridgePanel(onChange) {
 
   return el("section", { class: "panel panel-cep-bridge" }, [
     el("h2", { text: "7. CEP Bridge (experimental)" }),
+    hostCompatibilityStatusBlock(cb, onChange),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Everything below is retained for reference only — CEP ExtendScript execution is confirmed unavailable on " +
+          "this host (see the status banner above and docs/CEP_BRIDGE_INVESTIGATION.md Part 17). None of these " +
+          "diagnostics can succeed until that changes; they are not being actively re-run.",
+      ]
+    ),
     el(
       "p",
       { class: "hint" },

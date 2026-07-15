@@ -116,5 +116,18 @@ export const store = createStore({
     lastEchoResult: null, // full echoPayload() return value, or null — see src/ppro/cepBridge.js
     bypassRunning: {}, // { [BYPASS_TEST_SCRIPTS key]: boolean } — see src/ppro/cepBridge.js
     lastBypassResults: {}, // { [BYPASS_TEST_SCRIPTS key]: full runRawEvalScript() return value } — see src/ppro/cepBridge.js
+
+    // Host compatibility status (docs/CEP_BRIDGE_INVESTIGATION.md Part 17):
+    // CEP ExtendScript execution is confirmed unavailable on the current
+    // live host (even app.name — zero dependency on this project's code —
+    // returns "EvalScript error." via CSInterface.evalScript()). Only the
+    // CEP *server* reachability half of this is still worth live-checking
+    // (existing /health plumbing, not a new diagnostic); ExtendScript
+    // availability itself is a fixed, confirmed finding, not re-probed.
+    hostStatus: {
+      checking: false,
+      cepServerAvailable: null, // true | false | null (not checked yet) — see checkCepBridgeHealth()
+      lastCheckedAt: null,
+    },
   },
 });

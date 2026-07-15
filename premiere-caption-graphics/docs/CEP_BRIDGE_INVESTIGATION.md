@@ -1354,3 +1354,83 @@ root, whether `$.evalFile()` succeeded, and whether
 this environment; there is no live Premiere/CEP host here to run against.
 The new logging is designed to surface exactly those three facts, in the
 panel itself, on the *next* real-host run.
+
+## Part 17: final real-host confirmation — CEP ExtendScript execution is unavailable in this host; investigation closed
+
+**Confirmed live-host result:** `CSInterface.evalScript("app.name", callback)`
+returns the literal `"EvalScript error."`. This is the simplest possible
+ExtendScript expression — a built-in global read, no function calls, no
+string concatenation — and it does not depend on `hostscript.jsx`,
+`$._captionStudioBridge`, MOGRT insertion, Source Text, or JSON payload
+encoding in any way. Part 16's explicit `$.evalFile()` loader ruled out
+`hostscript.jsx` never loading as the explanation; this result rules out
+everything else this investigation could plausibly still fix from
+JavaScript. What remains is `CSInterface.evalScript()` itself — i.e. the
+ExtendScript engine binding for this specific CEP panel, in this specific
+Premiere host — being unavailable. That is not something any code in this
+project's `cep-bridge/` directory can work around.
+
+**This finding is consistent with, and now confirms, Part 1's original
+warning**: Adobe's own posted deprecation timeline states ExtendScript
+integrations are supported only "through September 2026," with API work
+already frozen. This investigation is running within a handful of weeks of
+that boundary. Whether this specific host's `evalScript()` failure is an
+early/host-specific instance of that shutdown, a Premiere Pro 26.3-specific
+regression, or something else entirely cannot be determined without Adobe
+support access — but pursuing further JavaScript-side bisection against a
+deprecated, frozen API this close to its stated end-of-support date is not
+a productive use of further diagnostic rounds.
+
+**Per this round's instructions, all further CEP and Source Text
+diagnostics are stopped.** No more bypass tests, bisection steps, or
+transport theories will be added to `cep-bridge/`. The existing UXP and CEP
+experimental code is preserved as-is (nothing in `cep-bridge/`,
+`src/ppro/cepBridge.js`, or `src/ui/cepBridgePanel.js` beyond this part was
+deleted) — it remains available for reference, and for the (narrow, cheap)
+possibility described in the decision report below that an earlier
+Premiere release still has a working `evalScript()`.
+
+### What changed this round
+
+1. **A permanent, non-diagnostic "Host Compatibility Status" banner** was
+   added to the top of the CEP Bridge panel (`src/ui/cepBridgePanel.js`,
+   `src/state/store.js`), showing three fixed facts rather than another
+   live probe: UXP available (real-time, via the existing `isHosted()`
+   check), CEP server available (real-time, reusing the existing `/health`
+   endpoint — plain HTTP reachability, not ExtendScript), and CEP
+   ExtendScript unavailable (reported unconditionally — a confirmed
+   finding, not something the UI re-probes). The banner always shows:
+   *"Premiere's CEP ExtendScript engine is unavailable in this host
+   version."* All of the existing bypass/bisection/probe tooling below the
+   banner is left in place, now explicitly labeled as retained for
+   reference only.
+2. **A minimal Adobe bug-report reproduction folder** was created at
+   `adobe-bug-report/` — deliberately outside `cep-bridge/`, containing
+   only `CSXS/manifest.xml`, `index.html`, `CSInterface.js` (copied
+   verbatim from `cep-bridge/client/CSInterface.js`), and `main.js`. It
+   declares **no `ScriptPath`** at all — this extension loads no custom
+   ExtendScript file of its own — and its `main.js` does exactly one
+   thing: a button that calls `CSInterface.evalScript("app.name",
+   callback)` and prints the raw callback, its `typeof`, and whether it
+   equals the literal `"EvalScript error."` string, directly in the panel.
+   This isolates the failure down to the smallest possible surface for an
+   Adobe support ticket, with zero dependency on anything this project
+   built.
+3. **A technical decision report**,
+   `docs/CAPTION_GRAPHICS_ARCHITECTURE_DECISION.md`, comparing four
+   forward paths now that CEP ExtendScript is confirmed unavailable here:
+   testing an earlier Premiere release, a UXP Hybrid Plugin with native
+   C++, a Premiere C++ SDK plugin, and investigating Premiere's own native
+   Captions feature as an official API that never needs to mutate MOGRT
+   Source Text at all. See that document for the full comparison and
+   recommendation. No new architecture was implemented this round, per
+   the instruction to report and compare only.
+
+### What this round did not touch
+
+`hostscript.jsx` (zero diff), MOGRT insertion logic, and Source Text
+probing/reading/writing code are all unchanged. The product scope —
+transcript → timed chunks → AI/manual style selection → editable text
+graphics automatically created and timed in Premiere — is unchanged; only
+the *mechanism* for the last step is now an open question, addressed in
+the decision report.

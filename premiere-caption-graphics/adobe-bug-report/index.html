@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>EvalScript Repro</title>
+    <style>
+      body { margin: 0; padding: 12px; background: #1e1e1e; color: #e6e6e6; font: 13px "Segoe UI", sans-serif; }
+      button { font-size: 13px; padding: 6px 10px; }
+      pre { margin-top: 10px; background: #161616; border: 1px solid #3a3a3a; border-radius: 4px; padding: 8px; white-space: pre-wrap; word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <button id="run">Run: CSInterface.evalScript("app.name", callback)</button>
+    <pre id="output">(not run yet)</pre>
+
+    <!-- Adobe's official CSInterface library — copied verbatim, do not edit. -->
+    <script src="./CSInterface.js"></script>
+    <script src="./main.js"></script>
+  </body>
+</html>

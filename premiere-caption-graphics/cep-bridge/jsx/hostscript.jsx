@@ -45,6 +45,8 @@ $._captionStudioBridge.dispatch = function (requestJsonString) {
       response = $._captionStudioBridge.probeSourceTextDeep(payload, requestId);
     } else if (command === "inspectSourceTextRawBytes") {
       response = $._captionStudioBridge.inspectSourceTextRawBytes(payload, requestId);
+    } else if (command === "testRawBytesHelpers") {
+      response = $._captionStudioBridge.testRawBytesHelpers(payload, requestId);
     } else {
       response = { ok: false, requestId: requestId, error: "Unknown command: " + command };
     }
@@ -1199,302 +1201,467 @@ function saveDiagnosticJson(data, fileName) {
 }
 
 /**
+ * Builds the standardized fatal-failure envelope this command returns
+ * whenever ANYTHING inside its top-level try/catch throws -- always a
+ * plain JS object (never lets an exception escape dispatch()'s own
+ * JSON.stringify), always tagged with the pipeline `stage` it failed
+ * during (see STAGE_* constants below) so a real-host run pinpoints
+ * exactly where, without guessing.
+ */
+function buildFatalFailure(requestId, stage, diagnostics, err) {
+  var message = err && err.message ? err.message : String(err);
+  var line = err && typeof err.line !== "undefined" ? err.line : null;
+  var fileName = err && typeof err.fileName !== "undefined" ? err.fileName : null;
+  var stack = err && typeof err.stack !== "undefined" ? String(err.stack) : null;
+  diagnostics.push("FATAL at stage \"" + stage + "\": " + message + (line !== null ? " (line " + line + ")" : ""));
+  return {
+    ok: false,
+    requestId: requestId,
+    stage: stage,
+    error: message,
+    errorLine: line,
+    errorFileName: fileName,
+    errorStack: stack,
+    diagnostics: diagnostics,
+  };
+}
+
+var STAGE_ARGUMENT_PARSING = "argument-parsing";
+var STAGE_MOGRT_INSERTION = "mogrt-insertion";
+var STAGE_SOURCE_TEXT_LOOKUP = "source-text-lookup";
+var STAGE_RAW_STRING_INSPECTION = "raw-string-inspection";
+var STAGE_JSON_SERIALIZATION = "json-serialization";
+var STAGE_TEMP_FILE_WRITING = "temp-file-writing";
+
+/**
+ * Removes every null character (code point 0) from a string via a plain
+ * character-by-character loop -- deliberately NOT a regex or string
+ * escape-sequence literal. ExtendScript's older JS engine is the one
+ * thing in this whole file that has repeatedly proven unpredictable
+ * around escape-sequence handling during this project's own tooling, so
+ * this sidesteps that entire class of risk (matches the user's explicit
+ * "Unicode escape handling that ExtendScript may parse differently"
+ * concern) with a construct that has no escape sequences to misparse at
+ * all -- just charCodeAt(i) === 0.
+ */
+function stripNullChars(s) {
+  var out = "";
+  for (var i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) !== 0) out += s.charAt(i);
+  }
+  return out;
+}
+
+/**
  * Inserts the given .mogrt, locates its Source Text ComponentParam (same
  * track resolution + three-tier detection as createTextGraphic() /
- * probeSourceTextDeep() — insertion is a solved problem, this reuses it
- * as-is), calls getValue() ONCE, and does an exhaustive byte-level
- * inspection of the resulting string: exact length, JSON.stringify() of
- * the whole string, every character's code point + hex, the first/last 32
- * characters in isolation, and five JSON.parse() attempts (raw, trimmed,
- * BOM-stripped, null-stripped, and all three normalizations combined) each
- * with the exact error message/position captured on failure. Never calls
- * setValue(). Always saves the full result to a JSON file in the OS temp
- * folder in addition to returning it.
+ * probeSourceTextDeep()), calls getValue() ONCE, and does an exhaustive
+ * byte-level inspection of the resulting string. Never calls setValue().
  *
- * @param {{mogrtPath: string, videoTrackIndex?: number}} payload
+ * The ENTIRE body below runs inside one top-level try/catch (task 3): any
+ * exception at any stage -- including ones outside every inner try/catch
+ * already present in the individual steps -- is caught here and turned
+ * into a plain JS object with `ok:false`, `stage`, `error`,
+ * `errorLine`/`errorFileName`/`errorStack` (task 4), so dispatch()'s own
+ * JSON.stringify(response) always has a real object to serialize instead
+ * of an exception escaping past it. `stage` is updated right before each
+ * major phase begins (task 5): argument-parsing, mogrt-insertion,
+ * source-text-lookup, raw-string-inspection, json-serialization,
+ * temp-file-writing -- specifically so a real-host "EvalScript error."
+ * (CEP's own fallback string for an ExtendScript-side fault that escapes
+ * normal script-level try/catch) can, on the next run, be narrowed down:
+ * if this wrapper is reached and still returns valid JSON with a `stage`
+ * value, the crash was a normal catchable exception at that stage; if
+ * "EvalScript error." still comes back with NO JSON at all, the fault is
+ * happening below the JS engine's own catch mechanism (most plausible
+ * culprit: the file I/O in temp-file-writing -- see `payload.skipFileSave`
+ * below, and the standalone `testRawBytesHelpers` command, which exercises
+ * the exact same byte/JSON helpers with zero Premiere host object access
+ * so that hypothesis can be tested in isolation).
+ *
+ * @param {{mogrtPath: string, videoTrackIndex?: number, skipFileSave?: boolean}} payload
  */
 $._captionStudioBridge.inspectSourceTextRawBytes = function (payload, requestId) {
   var diagnostics = [];
   function logStep(message) {
     diagnostics.push(message);
   }
+  var stage = STAGE_ARGUMENT_PARSING;
 
-  var mogrtPath = payload.mogrtPath;
-  var requestedVideoTrackIndex = typeof payload.videoTrackIndex === "number" ? payload.videoTrackIndex : null;
+  try {
+    var mogrtPath = payload.mogrtPath;
+    var requestedVideoTrackIndex = typeof payload.videoTrackIndex === "number" ? payload.videoTrackIndex : null;
+    var skipFileSave = Boolean(payload.skipFileSave);
 
-  if (!mogrtPath) {
-    return { ok: false, requestId: requestId, error: "payload.mogrtPath is required.", diagnostics: diagnostics };
-  }
+    if (!mogrtPath) {
+      return { ok: false, requestId: requestId, stage: stage, error: "payload.mogrtPath is required.", diagnostics: diagnostics };
+    }
 
-  var project = app.project;
-  if (!project) {
-    return { ok: false, requestId: requestId, error: "No active Premiere project. Open a project first.", diagnostics: diagnostics };
-  }
-  var sequence = project.activeSequence;
-  if (!sequence) {
-    return { ok: false, requestId: requestId, error: "No active sequence. Open a sequence first.", diagnostics: diagnostics };
-  }
-  logStep("Active sequence: " + sequence.name);
+    var project = app.project;
+    if (!project) {
+      return { ok: false, requestId: requestId, stage: stage, error: "No active Premiere project. Open a project first.", diagnostics: diagnostics };
+    }
+    var sequence = project.activeSequence;
+    if (!sequence) {
+      return { ok: false, requestId: requestId, stage: stage, error: "No active sequence. Open a sequence first.", diagnostics: diagnostics };
+    }
+    logStep("Active sequence: " + sequence.name);
 
-  var videoTrackCount = sequence.videoTracks.numTracks;
-  var audioTrackCount = sequence.audioTracks.numTracks;
-  logStep("Video track count: " + videoTrackCount + ", audio track count: " + audioTrackCount);
+    var videoTrackCount = sequence.videoTracks.numTracks;
+    var audioTrackCount = sequence.audioTracks.numTracks;
+    logStep("Video track count: " + videoTrackCount + ", audio track count: " + audioTrackCount);
 
-  var videoTrackIndex;
-  if (requestedVideoTrackIndex !== null && requestedVideoTrackIndex >= 0 && requestedVideoTrackIndex < videoTrackCount) {
-    videoTrackIndex = requestedVideoTrackIndex;
-    logStep("Using requested video track index: " + videoTrackIndex);
-  } else {
-    videoTrackIndex = videoTrackCount > 0 ? videoTrackCount - 1 : 0;
+    var videoTrackIndex;
+    if (requestedVideoTrackIndex !== null && requestedVideoTrackIndex >= 0 && requestedVideoTrackIndex < videoTrackCount) {
+      videoTrackIndex = requestedVideoTrackIndex;
+      logStep("Using requested video track index: " + videoTrackIndex);
+    } else {
+      videoTrackIndex = videoTrackCount > 0 ? videoTrackCount - 1 : 0;
+      logStep(
+        "Requested video track index (" + requestedVideoTrackIndex + ") missing/out of range for " + videoTrackCount +
+          " track(s) -- falling back to the topmost video track: " + videoTrackIndex + "."
+      );
+    }
+
+    var audioTrackIndex;
+    if (audioTrackCount <= 0) {
+      audioTrackIndex = 0;
+      logStep("Sequence reports 0 audio tracks -- using audioTrackIndex 0 (best effort).");
+    } else if (videoTrackIndex < audioTrackCount) {
+      audioTrackIndex = videoTrackIndex;
+    } else {
+      audioTrackIndex = audioTrackCount - 1;
+      logStep("videoTrackIndex (" + videoTrackIndex + ") exceeds audio track count (" + audioTrackCount + ") -- clamping audioTrackIndex to " + audioTrackIndex + ".");
+    }
+
+    var playheadTime = sequence.getPlayerPosition();
     logStep(
-      "Requested video track index (" + requestedVideoTrackIndex + ") missing/out of range for " + videoTrackCount +
-        " track(s) — falling back to the topmost video track: " + videoTrackIndex + "."
+      "Requested insertion time: " + playheadTime.seconds.toFixed(3) + "s (" + playheadTime.ticks + " ticks). Requested tracks: video=" +
+        videoTrackIndex + ", audio=" + audioTrackIndex + "."
     );
-  }
 
-  var audioTrackIndex;
-  if (audioTrackCount <= 0) {
-    audioTrackIndex = 0;
-    logStep("Sequence reports 0 audio tracks — using audioTrackIndex 0 (best effort).");
-  } else if (videoTrackIndex < audioTrackCount) {
-    audioTrackIndex = videoTrackIndex;
-  } else {
-    audioTrackIndex = audioTrackCount - 1;
-    logStep("videoTrackIndex (" + videoTrackIndex + ") exceeds audio track count (" + audioTrackCount + ") — clamping audioTrackIndex to " + audioTrackIndex + ".");
-  }
+    // --- Stage: mogrt-insertion ---
+    stage = STAGE_MOGRT_INSERTION;
 
-  var playheadTime;
-  try {
-    playheadTime = sequence.getPlayerPosition();
-  } catch (errPh) {
-    return {
-      ok: false,
-      requestId: requestId,
-      error: "sequence.getPlayerPosition() threw: " + (errPh && errPh.message ? errPh.message : String(errPh)),
-      diagnostics: diagnostics,
-    };
-  }
-  logStep(
-    "Requested insertion time: " + playheadTime.seconds.toFixed(3) + "s (" + playheadTime.ticks + " ticks). Requested tracks: video=" +
-      videoTrackIndex + ", audio=" + audioTrackIndex + "."
-  );
-
-  var beforeSnapshot = snapshotAllVideoTracks(sequence);
-  var importReturnValue;
-  var importThrew = false;
-  var importError = null;
-  try {
-    importReturnValue = sequence.importMGT(mogrtPath, playheadTime.ticks, videoTrackIndex, audioTrackIndex);
-  } catch (errImport) {
-    importThrew = true;
-    importError = errImport && errImport.message ? errImport.message : String(errImport);
-  }
-  var importReturnType = typeof importReturnValue;
-  logStep("importMGT() returned: type=" + importReturnType + ", value=" + safeStringifyShallow(importReturnValue));
-
-  if (importThrew) {
-    return { ok: false, requestId: requestId, error: "sequence.importMGT() threw: " + importError, diagnostics: diagnostics };
-  }
-
-  var afterSnapshot = snapshotAllVideoTracks(sequence);
-
-  var trackItem = null;
-  var detectionMethod = null;
-  var detectedTrackIndex = null;
-
-  if (looksLikeTrackItem(importReturnValue)) {
-    trackItem = importReturnValue;
-    detectionMethod = "importMGT return value";
-  }
-  if (!trackItem) {
-    var newClip = findNewClipAcrossTracks(beforeSnapshot, afterSnapshot);
-    if (newClip) {
-      trackItem = sequence.videoTracks[newClip.trackIndex].clips[newClip.clipIndex];
-      detectionMethod = "new clip diff across all tracks";
-      detectedTrackIndex = newClip.trackIndex;
+    var beforeSnapshot = snapshotAllVideoTracks(sequence);
+    var importReturnValue;
+    var importThrew = false;
+    var importError = null;
+    try {
+      importReturnValue = sequence.importMGT(mogrtPath, playheadTime.ticks, videoTrackIndex, audioTrackIndex);
+    } catch (errImport) {
+      importThrew = true;
+      importError = errImport && errImport.message ? errImport.message : String(errImport);
     }
-  }
-  if (!trackItem) {
-    var mogrtBaseName = basenameNoExt(mogrtPath);
-    var byTimeAndName = findClipByTimeAndName(afterSnapshot, playheadTime.seconds, mogrtBaseName, 1.0);
-    if (byTimeAndName) {
-      trackItem = sequence.videoTracks[byTimeAndName.trackIndex].clips[byTimeAndName.clipIndex];
-      detectionMethod = "time+name match";
-      detectedTrackIndex = byTimeAndName.trackIndex;
-    }
-  }
-  if (!trackItem) {
-    logStep("No inserted clip could be detected on any of the " + videoTrackCount + " video track(s) after checking all three detection tiers.");
-    return {
-      ok: false,
-      requestId: requestId,
-      error: "importMGT() did not appear to add a clip to any video track (checked all " + videoTrackCount + " track(s)).",
-      diagnostics: diagnostics,
-      beforeClipCounts: mapClipCounts(beforeSnapshot),
-      afterClipCounts: mapClipCounts(afterSnapshot),
-    };
-  }
-  if (detectedTrackIndex === null) {
-    detectedTrackIndex = findTrackIndexForClip(sequence, trackItem);
-  }
-  logStep('Inserted clip: "' + trackItem.name + '" on video track ' + (detectedTrackIndex === null ? "unknown" : detectedTrackIndex) + " via " + detectionMethod + ".");
+    var importReturnType = typeof importReturnValue;
+    logStep("importMGT() returned: type=" + importReturnType + ", value=" + safeStringifyShallow(importReturnValue));
 
-  var sourceTextParam = null;
-  var componentDisplayName = null;
-  try {
-    for (var ci = 0; ci < trackItem.components.numItems; ci++) {
-      var component = trackItem.components[ci];
-      var compName = null;
-      try { compName = component.displayName; } catch (eCompName) {}
-      for (var pi = 0; pi < component.properties.numItems; pi++) {
-        var param = component.properties[pi];
-        var pDisplayName = null;
-        try { pDisplayName = param.displayName; } catch (ePName) {}
-        if (pDisplayName === "Source Text") {
-          sourceTextParam = param;
-          componentDisplayName = compName;
-        }
+    if (importThrew) {
+      return { ok: false, requestId: requestId, stage: stage, error: "sequence.importMGT() threw: " + importError, diagnostics: diagnostics };
+    }
+
+    var afterSnapshot = snapshotAllVideoTracks(sequence);
+
+    var trackItem = null;
+    var detectionMethod = null;
+    var detectedTrackIndex = null;
+
+    if (looksLikeTrackItem(importReturnValue)) {
+      trackItem = importReturnValue;
+      detectionMethod = "importMGT return value";
+    }
+    if (!trackItem) {
+      var newClip = findNewClipAcrossTracks(beforeSnapshot, afterSnapshot);
+      if (newClip) {
+        trackItem = sequence.videoTracks[newClip.trackIndex].clips[newClip.clipIndex];
+        detectionMethod = "new clip diff across all tracks";
+        detectedTrackIndex = newClip.trackIndex;
       }
     }
-  } catch (errLocate) {
-    logStep("Error while enumerating components/params: " + (errLocate && errLocate.message ? errLocate.message : String(errLocate)));
-  }
-
-  var result = {
-    trackItemName: trackItem.name,
-    detectedTrackIndex: detectedTrackIndex,
-    detectionMethod: detectionMethod,
-  };
-
-  if (!sourceTextParam) {
-    logStep('No "Source Text" param found on the inserted clip\'s components.');
-    result.sourceTextFound = false;
-    result.diagnostics = diagnostics;
-    var savedNoParam = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
-    result.savedDiagnosticFile = savedNoParam;
-    return { ok: true, requestId: requestId, result: result };
-  }
-
-  result.sourceTextFound = true;
-  result.componentDisplayName = componentDisplayName;
-
-  var rawValue;
-  var getValueThrew = false;
-  var getValueError = null;
-  var getValueErrorLine = null;
-  try {
-    rawValue = sourceTextParam.getValue();
-  } catch (errGet) {
-    getValueThrew = true;
-    getValueError = errGet && errGet.message ? errGet.message : String(errGet);
-    getValueErrorLine = errGet && typeof errGet.line !== "undefined" ? errGet.line : null;
-  }
-
-  if (getValueThrew) {
-    logStep("getValue() THREW: " + getValueError + (getValueErrorLine !== null ? " (line " + getValueErrorLine + ")" : ""));
-    result.getValueThrew = true;
-    result.getValueThrowLocation = "getValue() call on the located Source Text param";
-    result.getValueError = getValueError;
-    result.getValueErrorLine = getValueErrorLine;
-    result.diagnostics = diagnostics;
-    var savedThrew = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
-    result.savedDiagnosticFile = savedThrew;
-    return { ok: true, requestId: requestId, result: result };
-  }
-
-  var rawType = typeof rawValue;
-  result.getValueRawType = rawType;
-  logStep("getValue() succeeded. typeof result: " + rawType);
-
-  if (rawType !== "string") {
-    logStep("getValue() did not return a string (returned " + rawType + ") — this diagnostic is specifically for the string-shape anomaly, so byte-level analysis is skipped. See probeSourceTextDeep for a general structural dump of non-string shapes.");
-    try {
-      result.nonStringJsonStringify = JSON.stringify(rawValue);
-    } catch (eNs) {
-      result.nonStringJsonStringify = "[could not JSON.stringify: " + (eNs.message || eNs) + "]";
+    if (!trackItem) {
+      var mogrtBaseName = basenameNoExt(mogrtPath);
+      var byTimeAndName = findClipByTimeAndName(afterSnapshot, playheadTime.seconds, mogrtBaseName, 1.0);
+      if (byTimeAndName) {
+        trackItem = sequence.videoTracks[byTimeAndName.trackIndex].clips[byTimeAndName.clipIndex];
+        detectionMethod = "time+name match";
+        detectedTrackIndex = byTimeAndName.trackIndex;
+      }
     }
-    result.diagnostics = diagnostics;
-    var savedNonString = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
-    result.savedDiagnosticFile = savedNonString;
-    return { ok: true, requestId: requestId, result: result };
-  }
+    if (!trackItem) {
+      logStep("No inserted clip could be detected on any of the " + videoTrackCount + " video track(s) after checking all three detection tiers.");
+      return {
+        ok: false,
+        requestId: requestId,
+        stage: stage,
+        error: "importMGT() did not appear to add a clip to any video track (checked all " + videoTrackCount + " track(s)).",
+        diagnostics: diagnostics,
+        beforeClipCounts: mapClipCounts(beforeSnapshot),
+        afterClipCounts: mapClipCounts(afterSnapshot),
+      };
+    }
+    if (detectedTrackIndex === null) {
+      detectedTrackIndex = findTrackIndexForClip(sequence, trackItem);
+    }
+    logStep('Inserted clip: "' + trackItem.name + '" on video track ' + (detectedTrackIndex === null ? "unknown" : detectedTrackIndex) + " via " + detectionMethod + ".");
 
-  // --- Task 1: exact string length ---
-  result.rawStringLength = rawValue.length;
-  logStep("Raw string length: " + result.rawStringLength);
+    // --- Stage: source-text-lookup ---
+    stage = STAGE_SOURCE_TEXT_LOOKUP;
 
-  // --- Task 2: JSON.stringify(rawValue) — reveals hidden/escaped characters ---
-  try {
-    result.jsonStringifyOfRawValue = JSON.stringify(rawValue);
-  } catch (eJs) {
-    result.jsonStringifyOfRawValue = "[could not JSON.stringify: " + (eJs.message || eJs) + "]";
-  }
-  logStep("JSON.stringify(rawValue): " + result.jsonStringifyOfRawValue);
+    var sourceTextParam = null;
+    var componentDisplayName = null;
+    try {
+      for (var ci = 0; ci < trackItem.components.numItems; ci++) {
+        var component = trackItem.components[ci];
+        var compName = null;
+        try { compName = component.displayName; } catch (eCompName) {}
+        for (var pi = 0; pi < component.properties.numItems; pi++) {
+          var param = component.properties[pi];
+          var pDisplayName = null;
+          try { pDisplayName = param.displayName; } catch (ePName) {}
+          if (pDisplayName === "Source Text") {
+            sourceTextParam = param;
+            componentDisplayName = compName;
+          }
+        }
+      }
+    } catch (errLocate) {
+      logStep("Error while enumerating components/params: " + (errLocate && errLocate.message ? errLocate.message : String(errLocate)));
+    }
 
-  // --- Task 3: every character code and hex value ---
-  result.charCodeDump = charCodeHexDump(rawValue, RAW_BYTES_CHAR_DUMP_CAP);
-  result.charCodeDumpTruncated = rawValue.length > RAW_BYTES_CHAR_DUMP_CAP;
-  logStep(
-    "Character code dump: " + result.charCodeDump.length + " character(s) logged" +
-      (result.charCodeDumpTruncated ? " (truncated at " + RAW_BYTES_CHAR_DUMP_CAP + " of " + rawValue.length + ")" : "") + "."
-  );
+    var result = {
+      trackItemName: trackItem.name,
+      detectedTrackIndex: detectedTrackIndex,
+      detectionMethod: detectionMethod,
+    };
 
-  // --- Task 4: first/last 32 characters separately ---
-  result.first32 = rawValue.substring(0, Math.min(32, rawValue.length));
-  result.first32CharCodes = charCodeHexDump(result.first32, 32);
-  result.last32 = rawValue.length > 32 ? rawValue.substring(rawValue.length - 32) : rawValue;
-  result.last32CharCodes = charCodeHexDump(result.last32, 32);
-  logStep("First 32 chars: " + JSON.stringify(result.first32) + " | Last 32 chars: " + JSON.stringify(result.last32));
+    if (!sourceTextParam) {
+      logStep('No "Source Text" param found on the inserted clip\'s components.');
+      result.sourceTextFound = false;
+      result.diagnostics = diagnostics;
+      if (!skipFileSave) {
+        stage = STAGE_TEMP_FILE_WRITING;
+        result.savedDiagnosticFile = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
+      }
+      return { ok: true, requestId: requestId, result: result };
+    }
 
-  // --- Detect BOM / null characters (needed for task 6, reported either way) ---
-  result.hasUtf8Bom = rawValue.length > 0 && rawValue.charCodeAt(0) === 0xfeff;
-  result.hasNullCharacters = rawValue.indexOf("\u0000") !== -1;
-  logStep("hasUtf8Bom: " + result.hasUtf8Bom + ", hasNullCharacters: " + result.hasNullCharacters);
+    result.sourceTextFound = true;
+    result.componentDisplayName = componentDisplayName;
 
-  // --- Task 5: JSON.parse(rawValue), exact exception + position on failure ---
-  var rawAttempt = tryJsonParse("raw", rawValue);
+    var rawValue;
+    var getValueThrew = false;
+    var getValueError = null;
+    var getValueErrorLine = null;
+    try {
+      rawValue = sourceTextParam.getValue();
+    } catch (errGet) {
+      getValueThrew = true;
+      getValueError = errGet && errGet.message ? errGet.message : String(errGet);
+      getValueErrorLine = errGet && typeof errGet.line !== "undefined" ? errGet.line : null;
+    }
 
-  // --- Task 6: trimmed / BOM-stripped / null-stripped / fully-normalized ---
-  var trimmed;
-  try {
-    trimmed = rawValue.trim();
-  } catch (eTrim) {
-    trimmed = rawValue.replace(/^\s+|\s+$/g, "");
-    logStep("String.prototype.trim() unavailable/threw (" + (eTrim.message || eTrim) + ") — used a manual regex trim instead.");
-  }
-  var trimmedAttempt = tryJsonParse("trimmed", trimmed);
+    if (getValueThrew) {
+      logStep("getValue() THREW: " + getValueError + (getValueErrorLine !== null ? " (line " + getValueErrorLine + ")" : ""));
+      result.getValueThrew = true;
+      result.getValueThrowLocation = "getValue() call on the located Source Text param";
+      result.getValueError = getValueError;
+      result.getValueErrorLine = getValueErrorLine;
+      result.diagnostics = diagnostics;
+      if (!skipFileSave) {
+        stage = STAGE_TEMP_FILE_WRITING;
+        result.savedDiagnosticFile = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
+      }
+      return { ok: true, requestId: requestId, result: result };
+    }
 
-  var noBom = result.hasUtf8Bom ? rawValue.substring(1) : rawValue;
-  var noBomAttempt = tryJsonParse("bom-stripped", noBom);
+    var rawType = typeof rawValue;
+    result.getValueRawType = rawType;
+    logStep("getValue() succeeded. typeof result: " + rawType);
 
-  var noNulls = rawValue.replace(/\u0000/g, "");
-  var noNullsAttempt = tryJsonParse("null-stripped", noNulls);
+    if (rawType !== "string") {
+      logStep("getValue() did not return a string (returned " + rawType + ") -- this diagnostic is specifically for the string-shape anomaly, so byte-level analysis is skipped. See probeSourceTextDeep for a general structural dump of non-string shapes.");
+      stage = STAGE_JSON_SERIALIZATION;
+      try {
+        result.nonStringJsonStringify = JSON.stringify(rawValue);
+      } catch (eNs) {
+        result.nonStringJsonStringify = "[could not JSON.stringify: " + (eNs.message || eNs) + "]";
+      }
+      result.diagnostics = diagnostics;
+      if (!skipFileSave) {
+        stage = STAGE_TEMP_FILE_WRITING;
+        result.savedDiagnosticFile = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
+      }
+      return { ok: true, requestId: requestId, result: result };
+    }
 
-  var fullyNormalized = noBom.replace(/\u0000/g, "").replace(/^\s+|\s+$/g, "");
-  var fullyNormalizedAttempt = tryJsonParse("fully-normalized (bom+nulls+trim)", fullyNormalized);
+    // --- Stage: raw-string-inspection ---
+    stage = STAGE_RAW_STRING_INSPECTION;
 
-  result.jsonParseAttempts = [rawAttempt, trimmedAttempt, noBomAttempt, noNullsAttempt, fullyNormalizedAttempt];
-  result.isValidJsonAfterNormalization = fullyNormalizedAttempt.ok;
+    // --- Task 1: exact string length ---
+    result.rawStringLength = rawValue.length;
+    logStep("Raw string length: " + result.rawStringLength);
 
-  for (var jpi = 0; jpi < result.jsonParseAttempts.length; jpi++) {
-    var attempt = result.jsonParseAttempts[jpi];
+    // --- Task 2: JSON.stringify(rawValue) -- reveals hidden/escaped characters ---
+    try {
+      result.jsonStringifyOfRawValue = JSON.stringify(rawValue);
+    } catch (eJs) {
+      result.jsonStringifyOfRawValue = "[could not JSON.stringify: " + (eJs.message || eJs) + "]";
+    }
+    logStep("JSON.stringify(rawValue): " + result.jsonStringifyOfRawValue);
+
+    // --- Task 3: every character code and hex value ---
+    result.charCodeDump = charCodeHexDump(rawValue, RAW_BYTES_CHAR_DUMP_CAP);
+    result.charCodeDumpTruncated = rawValue.length > RAW_BYTES_CHAR_DUMP_CAP;
     logStep(
-      'JSON.parse attempt "' + attempt.label + '": ' +
-        (attempt.ok
-          ? "SUCCEEDED"
-          : "FAILED — " + attempt.error + (attempt.errorPosition !== null ? " (position " + attempt.errorPosition + ")" : "") +
-              (attempt.errorLine !== null ? " (line " + attempt.errorLine + ")" : ""))
+      "Character code dump: " + result.charCodeDump.length + " character(s) logged" +
+        (result.charCodeDumpTruncated ? " (truncated at " + RAW_BYTES_CHAR_DUMP_CAP + " of " + rawValue.length + ")" : "") + "."
     );
+
+    // --- Task 4: first/last 32 characters separately ---
+    result.first32 = rawValue.substring(0, Math.min(32, rawValue.length));
+    result.first32CharCodes = charCodeHexDump(result.first32, 32);
+    result.last32 = rawValue.length > 32 ? rawValue.substring(rawValue.length - 32) : rawValue;
+    result.last32CharCodes = charCodeHexDump(result.last32, 32);
+    logStep("First 32 chars: " + JSON.stringify(result.first32) + " | Last 32 chars: " + JSON.stringify(result.last32));
+
+    // --- Detect BOM / null characters (needed for task 6, reported either way) ---
+    result.hasUtf8Bom = rawValue.length > 0 && rawValue.charCodeAt(0) === 0xfeff;
+    result.hasNullCharacters = rawValue.length !== stripNullChars(rawValue).length;
+    logStep("hasUtf8Bom: " + result.hasUtf8Bom + ", hasNullCharacters: " + result.hasNullCharacters);
+
+    // --- Stage: json-serialization (the JSON.parse()/JSON.stringify() normalization attempts) ---
+    stage = STAGE_JSON_SERIALIZATION;
+
+    // --- Task 5: JSON.parse(rawValue), exact exception + position on failure ---
+    var rawAttempt = tryJsonParse("raw", rawValue);
+
+    // --- Task 6: trimmed / BOM-stripped / null-stripped / fully-normalized ---
+    var trimmed;
+    try {
+      trimmed = rawValue.trim();
+    } catch (eTrim) {
+      trimmed = rawValue.replace(/^\s+|\s+$/g, "");
+      logStep("String.prototype.trim() unavailable/threw (" + (eTrim.message || eTrim) + ") -- used a manual regex trim instead.");
+    }
+    var trimmedAttempt = tryJsonParse("trimmed", trimmed);
+
+    var noBom = result.hasUtf8Bom ? rawValue.substring(1) : rawValue;
+    var noBomAttempt = tryJsonParse("bom-stripped", noBom);
+
+    var noNulls = stripNullChars(rawValue);
+    var noNullsAttempt = tryJsonParse("null-stripped", noNulls);
+
+    var fullyNormalized = stripNullChars(noBom).replace(/^\s+|\s+$/g, "");
+    var fullyNormalizedAttempt = tryJsonParse("fully-normalized (bom+nulls+trim)", fullyNormalized);
+
+    result.jsonParseAttempts = [rawAttempt, trimmedAttempt, noBomAttempt, noNullsAttempt, fullyNormalizedAttempt];
+    result.isValidJsonAfterNormalization = fullyNormalizedAttempt.ok;
+
+    for (var jpi = 0; jpi < result.jsonParseAttempts.length; jpi++) {
+      var attempt = result.jsonParseAttempts[jpi];
+      logStep(
+        'JSON.parse attempt "' + attempt.label + '": ' +
+          (attempt.ok
+            ? "SUCCEEDED"
+            : "FAILED -- " + attempt.error + (attempt.errorPosition !== null ? " (position " + attempt.errorPosition + ")" : "") +
+                (attempt.errorLine !== null ? " (line " + attempt.errorLine + ")" : ""))
+      );
+    }
+
+    // --- Task 7: no setValue() call anywhere in this diagnostic. ---
+
+    result.diagnostics = diagnostics;
+
+    // --- Stage: temp-file-writing ---
+    if (skipFileSave) {
+      logStep("payload.skipFileSave=true -- temp-file writing skipped, byte-level result still returned in full.");
+      result.savedDiagnosticFile = { ok: false, error: "skipped (payload.skipFileSave=true)" };
+    } else {
+      stage = STAGE_TEMP_FILE_WRITING;
+      var saved = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
+      result.savedDiagnosticFile = saved;
+      logStep(saved.ok ? "Full diagnostic saved to: " + saved.path : "Could not save diagnostic file: " + saved.error);
+    }
+
+    return { ok: true, requestId: requestId, result: result };
+  } catch (fatalErr) {
+    return buildFatalFailure(requestId, stage, diagnostics, fatalErr);
   }
+};
 
-  // --- Task 7: no setValue() call anywhere in this diagnostic. ---
+/**
+ * Standalone diagnostic (task 8): exercises the exact same byte/JSON
+ * helpers inspectSourceTextRawBytes() uses (charCodeHexDump, tryJsonParse,
+ * JSON.stringify) against a plain string from `payload.testString` -- NO
+ * Premiere host objects (no project/sequence/MOGRT/ComponentParam)
+ * touched at all. Purpose: isolate whether an "EvalScript error." is
+ * coming from the byte/JSON string-processing logic itself (this command
+ * would ALSO fail) versus the Premiere-specific insertion/lookup/file-I/O
+ * path (this command would succeed even if the full diagnostic doesn't).
+ * Also wrapped in a top-level try/catch with the same stage-tagged
+ * failure envelope as inspectSourceTextRawBytes().
+ *
+ * @param {{testString?: string}} payload
+ */
+$._captionStudioBridge.testRawBytesHelpers = function (payload, requestId) {
+  var diagnostics = [];
+  function logStep(message) {
+    diagnostics.push(message);
+  }
+  var stage = STAGE_ARGUMENT_PARSING;
 
-  result.diagnostics = diagnostics;
+  try {
+    // Default deliberately includes a UTF-8 BOM, an embedded null
+    // character, and surrounding whitespace around "{}" -- built via
+    // String.fromCharCode() rather than string escape literals, per the
+    // same escape-handling caution as stripNullChars() above -- and
+    // reproduces the exact real-host anomaly this whole diagnostic exists
+    // to explain (typeof "string", preview looks like "{}", JSON.parse
+    // fails).
+    var defaultTestString = String.fromCharCode(0xfeff) + " {}" + String.fromCharCode(0) + "  ";
+    var testString = typeof payload.testString === "string" ? payload.testString : defaultTestString;
+    logStep("Using test string (length " + testString.length + ").");
 
-  // --- Task 9: save the full result as JSON ---
-  var saved = saveDiagnosticJson({ requestId: requestId, result: result }, "caption-studio-source-text-raw-dump.json");
-  result.savedDiagnosticFile = saved;
-  logStep(saved.ok ? "Full diagnostic saved to: " + saved.path : "Could not save diagnostic file: " + saved.error);
+    stage = STAGE_RAW_STRING_INSPECTION;
+    var result = {
+      rawStringLength: testString.length,
+      charCodeDump: charCodeHexDump(testString, RAW_BYTES_CHAR_DUMP_CAP),
+      first32: testString.substring(0, Math.min(32, testString.length)),
+      last32: testString.length > 32 ? testString.substring(testString.length - 32) : testString,
+      hasUtf8Bom: testString.length > 0 && testString.charCodeAt(0) === 0xfeff,
+      hasNullCharacters: testString.length !== stripNullChars(testString).length,
+    };
 
-  return { ok: true, requestId: requestId, result: result };
+    stage = STAGE_JSON_SERIALIZATION;
+    try {
+      result.jsonStringifyOfRawValue = JSON.stringify(testString);
+    } catch (eJs) {
+      result.jsonStringifyOfRawValue = "[could not JSON.stringify: " + (eJs.message || eJs) + "]";
+    }
+
+    var trimmed;
+    try {
+      trimmed = testString.trim();
+    } catch (eTrim) {
+      trimmed = testString.replace(/^\s+|\s+$/g, "");
+    }
+    var noBom = result.hasUtf8Bom ? testString.substring(1) : testString;
+    var noNulls = stripNullChars(testString);
+    var fullyNormalized = stripNullChars(noBom).replace(/^\s+|\s+$/g, "");
+
+    result.jsonParseAttempts = [
+      tryJsonParse("raw", testString),
+      tryJsonParse("trimmed", trimmed),
+      tryJsonParse("bom-stripped", noBom),
+      tryJsonParse("null-stripped", noNulls),
+      tryJsonParse("fully-normalized (bom+nulls+trim)", fullyNormalized),
+    ];
+    result.isValidJsonAfterNormalization = result.jsonParseAttempts[4].ok;
+
+    logStep("Byte/JSON helper self-test completed with no exceptions.");
+    result.diagnostics = diagnostics;
+    return { ok: true, requestId: requestId, result: result };
+  } catch (fatalErr) {
+    return buildFatalFailure(requestId, stage, diagnostics, fatalErr);
+  }
 };

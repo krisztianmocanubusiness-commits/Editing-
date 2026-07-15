@@ -103,5 +103,8 @@ export const store = createStore({
     lastProbeResult: null, // full probeSourceTextDeep() return value, or null — see src/ppro/cepBridge.js
     rawBytesRunning: false,
     lastRawBytesResult: null, // full inspectSourceTextRawBytes() return value, or null — see src/ppro/cepBridge.js
+    skipFileSave: false,
+    selfTestRunning: false,
+    lastSelfTestResult: null, // full testRawBytesHelpers() return value, or null — see src/ppro/cepBridge.js
   },
 });

@@ -297,10 +297,14 @@ export async function probeSourceTextDeep(opts) {
  * @param {string} opts.mogrtPath
  * @param {(message: string, level?: string) => void} opts.log
  * @param {number} [opts.videoTrackIndex]
+ * @param {boolean} [opts.skipFileSave] — isolates whether temp-file writing
+ *   is what's crashing: if the full diagnostic reproduces an "EvalScript
+ *   error." but a run with this set to true does not, the fault is in the
+ *   File/Folder temp-file write, not the byte/JSON inspection logic itself.
  * @param {number} [opts.timeoutMs]
  */
 export async function inspectSourceTextRawBytes(opts) {
-  const { mogrtPath, log, videoTrackIndex, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+  const { mogrtPath, log, videoTrackIndex, skipFileSave, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
 
   log("════ CEP Source Text Raw Byte Inspection — start ════", "info");
 
@@ -325,6 +329,7 @@ export async function inspectSourceTextRawBytes(opts) {
 
   const payload = { mogrtPath };
   if (typeof resolvedVideoTrackIndex === "number") payload.videoTrackIndex = resolvedVideoTrackIndex;
+  if (skipFileSave) payload.skipFileSave = true;
 
   const result = await callCepBridge("inspectSourceTextRawBytes", payload, { timeoutMs, log });
 
@@ -332,6 +337,55 @@ export async function inspectSourceTextRawBytes(opts) {
     result.ok
       ? "════ CEP Source Text Raw Byte Inspection — finished ════"
       : "════ CEP Source Text Raw Byte Inspection — finished with errors ════",
+    result.ok ? "success" : "error"
+  );
+  return result;
+}
+
+/**
+ * Task 8's standalone diagnostic: exercises inspectSourceTextRawBytes()'s
+ * byte/JSON helpers (charCodeHexDump, tryJsonParse, JSON.stringify)
+ * against a plain dummy string in ExtendScript — no Premiere host objects
+ * touched at all (no project/sequence/MOGRT/ComponentParam). Only checks
+ * the CEP bridge is reachable first; does NOT require a .mogrt path, an
+ * active project, or an active sequence, since it never uses any of them.
+ * See cep-bridge/jsx/hostscript.jsx's testRawBytesHelpers() for exactly
+ * what runs host-side, and docs/CEP_BRIDGE_INVESTIGATION.md Part 10 for
+ * why this exists (isolating whether an "EvalScript error." on
+ * inspectSourceTextRawBytes() comes from the string-processing logic
+ * itself versus the MOGRT-insertion/file-I/O path).
+ *
+ * @param {Object} opts
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {string} [opts.testString] — defaults host-side to a string with
+ *   a BOM, an embedded null character, and surrounding whitespace around
+ *   "{}" — reproducing the real-host anomaly this whole investigation
+ *   exists to explain.
+ * @param {number} [opts.timeoutMs]
+ */
+export async function testRawBytesHelpers(opts) {
+  const { log, testString, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+
+  log("════ CEP Raw Bytes Helper Self-Test — start ════", "info");
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const payload = {};
+  if (typeof testString === "string") payload.testString = testString;
+
+  const result = await callCepBridge("testRawBytesHelpers", payload, { timeoutMs, log });
+
+  log(
+    result.ok ? "════ CEP Raw Bytes Helper Self-Test — finished ════" : "════ CEP Raw Bytes Helper Self-Test — finished with errors ════",
     result.ok ? "success" : "error"
   );
   return result;

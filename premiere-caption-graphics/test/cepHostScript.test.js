@@ -186,11 +186,19 @@ test('dispatch() routes the "inspectSourceTextRawBytes" command to $._captionStu
 
 function extractInspectRawBytesFnSource() {
   const source = readHostScript();
-  // This function is the last one defined in the file, so bound the match
-  // to just its body (from its definition to EOF) — matches the same
-  // pattern already used for probeSourceTextDeep's isolation above.
-  const match = source.match(/\$\._captionStudioBridge\.inspectSourceTextRawBytes = function[\s\S]*$/);
+  // Bound the match to just this function's body — from its definition up
+  // to (but not including) testRawBytesHelpers, the next function defined
+  // in the file — so assertions about "never calls setValue()" etc. can't
+  // accidentally pass/fail because of unrelated code in a sibling function.
+  const match = source.match(/\$\._captionStudioBridge\.inspectSourceTextRawBytes = function[\s\S]*?\n};\n/);
   assert.ok(match, "expected to find the inspectSourceTextRawBytes function body");
+  return match[0];
+}
+
+function extractTestRawBytesHelpersFnSource() {
+  const source = readHostScript();
+  const match = source.match(/\$\._captionStudioBridge\.testRawBytesHelpers = function[\s\S]*$/);
+  assert.ok(match, "expected to find the testRawBytesHelpers function body");
   return match[0];
 }
 
@@ -234,12 +242,93 @@ test("inspectSourceTextRawBytes saves the full result to a JSON file via the doc
   assert.match(fnSource, /saveDiagnosticJson\(/);
 });
 
-test("hostscript.jsx stays ES3/ES5-compatible (no const/let/arrow functions/template literals) since ExtendScript can't parse modern syntax", () => {
+// --- Real-host bug: inspectSourceTextRawBytes() failed with a non-JSON
+// "EvalScript error." response instead of a structured JSON failure. Per
+// the CEP evalScript contract, that literal string is returned when the
+// ExtendScript engine faults in a way that escapes normal script-level
+// try/catch, so this section (a) hardens the command with a top-level
+// try/catch + pipeline stage tracking so any NORMAL catchable exception
+// always comes back as valid JSON with a `stage` telling us exactly where,
+// and (b) adds a standalone command that exercises the same byte/JSON
+// helpers with zero Premiere host object access, to isolate whether the
+// fault is in that string-processing logic or in the MOGRT/file-I/O path.
+// See docs/CEP_BRIDGE_INVESTIGATION.md Part 10.
+
+test("inspectSourceTextRawBytes wraps its ENTIRE body in one top-level try/catch that returns a stage-tagged failure envelope", () => {
+  const fnSource = extractInspectRawBytesFnSource();
+  const tryIndex = fnSource.indexOf("try {");
+  const catchIndex = fnSource.indexOf("} catch (fatalErr) {");
+  assert.ok(tryIndex !== -1, "expected a top-level try { at the start of the function body");
+  assert.ok(catchIndex !== -1, "expected a top-level } catch (fatalErr) { wrapping the whole function body");
+  assert.match(fnSource, /return buildFatalFailure\(requestId, stage, diagnostics, fatalErr\);/);
+});
+
+test("buildFatalFailure() returns ok:false with stage, error, errorLine, errorFileName, errorStack", () => {
   const source = readHostScript();
-  // Strip line/block comments and string contents loosely before scanning,
-  // to avoid false positives from comment text (e.g. "not `const`").
+  assert.match(source, /function\s+buildFatalFailure\s*\(/);
+  assert.match(source, /ok:\s*false,[\s\S]{0,120}stage:\s*stage,[\s\S]{0,120}error:\s*message,[\s\S]{0,120}errorLine:\s*line,[\s\S]{0,120}errorFileName:\s*fileName,[\s\S]{0,120}errorStack:\s*stack,/);
+});
+
+test("inspectSourceTextRawBytes tags every phase with an early stage marker: argument-parsing, mogrt-insertion, source-text-lookup, raw-string-inspection, json-serialization, temp-file-writing", () => {
+  const source = readHostScript();
+  assert.match(source, /var\s+STAGE_ARGUMENT_PARSING\s*=\s*["']argument-parsing["']/);
+  assert.match(source, /var\s+STAGE_MOGRT_INSERTION\s*=\s*["']mogrt-insertion["']/);
+  assert.match(source, /var\s+STAGE_SOURCE_TEXT_LOOKUP\s*=\s*["']source-text-lookup["']/);
+  assert.match(source, /var\s+STAGE_RAW_STRING_INSPECTION\s*=\s*["']raw-string-inspection["']/);
+  assert.match(source, /var\s+STAGE_JSON_SERIALIZATION\s*=\s*["']json-serialization["']/);
+  assert.match(source, /var\s+STAGE_TEMP_FILE_WRITING\s*=\s*["']temp-file-writing["']/);
+
+  const fnSource = extractInspectRawBytesFnSource();
+  assert.match(fnSource, /stage\s*=\s*STAGE_MOGRT_INSERTION/);
+  assert.match(fnSource, /stage\s*=\s*STAGE_SOURCE_TEXT_LOOKUP/);
+  assert.match(fnSource, /stage\s*=\s*STAGE_RAW_STRING_INSPECTION/);
+  assert.match(fnSource, /stage\s*=\s*STAGE_JSON_SERIALIZATION/);
+  assert.match(fnSource, /stage\s*=\s*STAGE_TEMP_FILE_WRITING/);
+});
+
+test("inspectSourceTextRawBytes never calls setValue() even inside its top-level try/catch (task 6/7 still hold after hardening)", () => {
+  const fnSource = extractInspectRawBytesFnSource();
+  assert.doesNotMatch(fnSource, /\.setValue\s*\(/);
+});
+
+test('dispatch() routes the "testRawBytesHelpers" command to $._captionStudioBridge.testRawBytesHelpers', () => {
+  const source = readHostScript();
+  assert.match(source, /command\s*===\s*["']testRawBytesHelpers["']/);
+  assert.match(source, /\$\._captionStudioBridge\.testRawBytesHelpers\s*=\s*function\s*\(/);
+});
+
+test("testRawBytesHelpers touches zero Premiere host objects (no app.project, no sequence, no importMGT/getValue/setValue) and reuses the same byte/JSON helpers", () => {
+  const fnSource = extractTestRawBytesHelpersFnSource();
+  assert.doesNotMatch(fnSource, /app\.project/, "testRawBytesHelpers must not touch app.project — it exists specifically to test in isolation from Premiere host objects");
+  assert.doesNotMatch(fnSource, /\.activeSequence/);
+  assert.doesNotMatch(fnSource, /importMGT/);
+  assert.doesNotMatch(fnSource, /\.getValue\s*\(/);
+  assert.doesNotMatch(fnSource, /\.setValue\s*\(/);
+  assert.match(fnSource, /charCodeHexDump\(/, "expected testRawBytesHelpers to reuse the real charCodeHexDump() helper");
+  assert.match(fnSource, /tryJsonParse\(/, "expected testRawBytesHelpers to reuse the real tryJsonParse() helper");
+  assert.match(fnSource, /return buildFatalFailure\(requestId, stage, diagnostics, fatalErr\);/, "expected testRawBytesHelpers to use the same stage-tagged failure envelope");
+});
+
+// --- Task 2/9: block specific ExtendScript-incompatible syntax/features ---
+
+test("hostscript.jsx never uses null-character/BOM string escape literals — uses stripNullChars()/String.fromCharCode() instead, to avoid any Unicode-escape-parsing ambiguity in ExtendScript's older engine", () => {
+  const source = readHostScript();
+  assert.match(source, /function\s+stripNullChars\s*\(/, "expected a stripNullChars() helper that strips null characters via charCodeAt(), not a regex/string escape literal");
+  assert.match(source, /String\.fromCharCode\(0\)/, "expected the null character to be constructed via String.fromCharCode(0) rather than an escape literal");
+});
+
+test("hostscript.jsx stays ES3/ES5-compatible: no const/let, no arrow functions, no template literals, no startsWith/endsWith/codePointAt, no Array.prototype.map/filter/reduce, no Object.keys on host objects", () => {
+  const source = readHostScript();
+  // Strip line/block comments before scanning, to avoid false positives
+  // from comment text (e.g. this test's own name mentioning `const`).
   const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
   assert.doesNotMatch(withoutComments, /\bconst\s+\w/, "found `const` — hostscript.jsx must use `var` only");
   assert.doesNotMatch(withoutComments, /\blet\s+\w/, "found `let` — hostscript.jsx must use `var` only");
   assert.doesNotMatch(withoutComments, /=>\s*{|=>\s*\(/, "found an arrow function — hostscript.jsx must use `function` only");
+  assert.doesNotMatch(withoutComments, /`/, "found a backtick — hostscript.jsx must use string concatenation, never template literals");
+  assert.doesNotMatch(withoutComments, /\.startsWith\s*\(/, "found String.prototype.startsWith() — not guaranteed on ExtendScript's older engine");
+  assert.doesNotMatch(withoutComments, /\.endsWith\s*\(/, "found String.prototype.endsWith() — not guaranteed on ExtendScript's older engine");
+  assert.doesNotMatch(withoutComments, /\.codePointAt\s*\(/, "found String.prototype.codePointAt() — not guaranteed on ExtendScript's older engine");
+  assert.doesNotMatch(withoutComments, /\.map\s*\(function|\.filter\s*\(function|\.reduce\s*\(function/, "found Array.prototype.map/filter/reduce — use a plain for loop instead");
+  assert.doesNotMatch(withoutComments, /Object\.keys\s*\(/, "found Object.keys() — host object properties aren't reliably enumerable this way; use .reflect.properties instead (see dumpValueDeep)");
 });

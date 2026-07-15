@@ -6,6 +6,7 @@ import {
   testCepWriteProof,
   probeSourceTextDeep,
   inspectSourceTextRawBytes,
+  testRawBytesHelpers,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../ppro/cepBridge.js";
@@ -68,14 +69,14 @@ async function runSourceTextProbe() {
 }
 
 async function runRawBytesInspection() {
-  const { mogrtPath } = store.getState().cepBridge;
+  const { mogrtPath, skipFileSave } = store.getState().cepBridge;
   if (!mogrtPath) {
     log("Choose a .mogrt to inspect first.", "error");
     return;
   }
   patchCepBridge({ rawBytesRunning: true, lastRawBytesResult: null });
   try {
-    const result = await inspectSourceTextRawBytes({ mogrtPath, log });
+    const result = await inspectSourceTextRawBytes({ mogrtPath, log, skipFileSave });
     console.error("[Caption Graphics Studio] CEP Source Text Raw Byte Inspection result:", JSON.stringify(result, null, 2));
     patchCepBridge({ lastRawBytesResult: result });
   } catch (err) {
@@ -84,6 +85,21 @@ async function runRawBytesInspection() {
     patchCepBridge({ lastRawBytesResult: { ok: false, step: "crash" } });
   } finally {
     patchCepBridge({ rawBytesRunning: false });
+  }
+}
+
+async function runRawBytesHelperSelfTest() {
+  patchCepBridge({ selfTestRunning: true, lastSelfTestResult: null });
+  try {
+    const result = await testRawBytesHelpers({ log });
+    console.error("[Caption Graphics Studio] CEP Raw Bytes Helper Self-Test result:", JSON.stringify(result, null, 2));
+    patchCepBridge({ lastSelfTestResult: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] CEP Raw Bytes Helper Self-Test crashed:", err);
+    log(`CEP Raw Bytes Helper Self-Test crashed unexpectedly: ${err.message || err}`, "error");
+    patchCepBridge({ lastSelfTestResult: { ok: false, step: "crash" } });
+  } finally {
+    patchCepBridge({ selfTestRunning: false });
   }
 }
 
@@ -289,6 +305,19 @@ function probeResultBlock(result) {
   return el("div", { class: "inspector-results" }, lines);
 }
 
+function fatalStageBlock(r) {
+  if (!r || !r.stage) return null;
+  return el("div", { class: "inspector-results" }, [
+    el("div", { class: "status-line log-error", text: `✗ FATAL at stage "${r.stage}": ${r.error ?? "unknown error"}` }),
+    el("div", {
+      class: "status-line",
+      text: `errorLine: ${r.errorLine ?? "n/a"}, errorFileName: ${r.errorFileName ?? "n/a"}`,
+    }),
+    r.errorStack ? el("details", { class: "status-line" }, [el("summary", { text: "errorStack" }), el("pre", { class: "diagnostics-log" }, [r.errorStack])]) : null,
+    diagnosticsBlock(r.diagnostics),
+  ]);
+}
+
 function rawBytesResultBlock(result) {
   if (!result) return null;
   if (!result.ok) {
@@ -303,6 +332,15 @@ function rawBytesResultBlock(result) {
           text: `Clip counts per video track — before: [${(result.beforeClipCounts ?? []).join(", ")}], after: [${(result.afterClipCounts ?? []).join(", ")}].`,
         })
       );
+    }
+    if (result.stage) {
+      lines.push(
+        el("div", { class: "status-line log-error", text: `FATAL at stage "${result.stage}".` }),
+        el("div", { class: "status-line", text: `errorLine: ${result.errorLine ?? "n/a"}, errorFileName: ${result.errorFileName ?? "n/a"}` })
+      );
+      if (result.errorStack) {
+        lines.push(el("details", { class: "status-line" }, [el("summary", { text: "errorStack" }), el("pre", { class: "diagnostics-log" }, [result.errorStack])]));
+      }
     }
     const diag = diagnosticsBlock(result.diagnostics);
     if (diag) lines.push(diag);
@@ -411,6 +449,51 @@ function rawBytesResultBlock(result) {
   return el("div", { class: "inspector-results" }, lines);
 }
 
+function selfTestResultBlock(result) {
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    if (result.stage) return fatalStageBlock(result);
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Raw Bytes Helper Self-Test failed${stepLabel}${result.error ? `: ${result.error}` : ""}` }),
+      diagnosticsBlock(result.diagnostics),
+    ]);
+  }
+
+  const r = result.result ?? {};
+  const lines = [
+    el("div", { class: "status-line log-success", text: `✓ Self-test completed — no Premiere host objects touched. Test string length: ${r.rawStringLength ?? "n/a"}.` }),
+    el("div", { class: "status-line", text: `JSON.stringify(testString): ${r.jsonStringifyOfRawValue ?? "n/a"}` }),
+    el("div", {
+      class: "status-line",
+      text: `Has UTF-8 BOM: ${String(r.hasUtf8Bom)}. Has null character(s): ${String(r.hasNullCharacters)}.`,
+    }),
+  ];
+  const charDump = jsonDetailsBlock(`Full character code dump (${r.charCodeDump?.length ?? 0} char(s))`, r.charCodeDump);
+  if (charDump) lines.push(charDump);
+  if (Array.isArray(r.jsonParseAttempts)) {
+    lines.push(
+      el(
+        "div",
+        { class: "status-line" },
+        [
+          "JSON.parse() attempts: " +
+            r.jsonParseAttempts
+              .map((a) => `${a.label}=${a.ok ? "OK" : `FAIL(${a.error}${a.errorPosition != null ? ` @${a.errorPosition}` : ""})`}`)
+              .join("; "),
+        ]
+      ),
+      el("div", {
+        class: `status-line ${r.isValidJsonAfterNormalization ? "log-success" : "log-warn"}`,
+        text: r.isValidJsonAfterNormalization ? "✓ Valid JSON after full normalization." : "✗ Still not valid JSON even after full normalization.",
+      })
+    );
+  }
+  const diag = diagnosticsBlock(r.diagnostics);
+  if (diag) lines.push(diag);
+  return el("div", { class: "inspector-results" }, lines);
+}
+
 export function renderCepBridgePanel(onChange) {
   const state = store.getState();
   const cb = state.cepBridge;
@@ -440,6 +523,25 @@ export function renderCepBridgePanel(onChange) {
     disabled: !isHosted() || cb.running || cb.probeRunning || cb.rawBytesRunning || !cb.mogrtPath || undefined,
     onClick: async () => {
       await runRawBytesInspection();
+      onChange();
+    },
+  });
+  const skipFileSaveCheckbox = el("input", { type: "checkbox" });
+  skipFileSaveCheckbox.checked = cb.skipFileSave;
+  skipFileSaveCheckbox.addEventListener("change", () => {
+    patchCepBridge({ skipFileSave: skipFileSaveCheckbox.checked });
+    onChange();
+  });
+  const skipFileSaveLabel = el("label", { class: "field-inline" }, [
+    skipFileSaveCheckbox,
+    " Skip temp-file writing (isolates whether file I/O is the crash cause)",
+  ]);
+  const selfTestBtn = el("button", {
+    class: "btn",
+    text: cb.selfTestRunning ? "Testing…" : "Run Byte/JSON Helper Self-Test (no Premiere objects touched)",
+    disabled: !isHosted() || cb.selfTestRunning || undefined,
+    onClick: async () => {
+      await runRawBytesHelperSelfTest();
       onChange();
     },
   });
@@ -491,6 +593,20 @@ export function renderCepBridgePanel(onChange) {
       ]
     ),
     el("div", { class: "row" }, [rawBytesBtn]),
+    el("div", { class: "row" }, [skipFileSaveLabel]),
     rawBytesResultBlock(cb.lastRawBytesResult),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        'Self-test: runs the exact same character-code-dump/JSON.parse helpers against a built-in dummy string ' +
+          "(with a BOM, a null character, and surrounding whitespace around \"{}\") — zero Premiere host objects " +
+          "touched (no project/sequence/MOGRT). If \"Inspect Source Text Raw Bytes\" fails with a non-JSON " +
+          '"EvalScript error." but THIS succeeds, the fault is in the MOGRT-insertion/file-I/O path, not the ' +
+          "byte/JSON logic itself. See docs/CEP_BRIDGE_INVESTIGATION.md Part 10.",
+      ]
+    ),
+    el("div", { class: "row" }, [selfTestBtn]),
+    selfTestResultBlock(cb.lastSelfTestResult),
   ]);
 }

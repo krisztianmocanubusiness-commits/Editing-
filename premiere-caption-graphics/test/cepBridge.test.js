@@ -7,6 +7,7 @@ import {
   testCepWriteProof,
   probeSourceTextDeep,
   inspectSourceTextRawBytes,
+  testRawBytesHelpers,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../src/ppro/cepBridge.js";
@@ -368,4 +369,91 @@ test("inspectSourceTextRawBytes forwards an explicit videoTrackIndex verbatim wi
     }
   );
   assert.equal(capturedPayload.videoTrackIndex, 12);
+});
+
+test("inspectSourceTextRawBytes only includes skipFileSave in the payload when explicitly truthy", async () => {
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      capturedPayload = JSON.parse(init.body).payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: {} });
+    },
+    async () => {
+      await inspectSourceTextRawBytes({ mogrtPath: "/x.mogrt", log: noopLog, skipFileSave: true });
+    }
+  );
+  assert.equal(capturedPayload.skipFileSave, true);
+});
+
+test("inspectSourceTextRawBytes omits skipFileSave from the payload when not requested", async () => {
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      capturedPayload = JSON.parse(init.body).payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: {} });
+    },
+    async () => {
+      await inspectSourceTextRawBytes({ mogrtPath: "/x.mogrt", log: noopLog });
+    }
+  );
+  assert.equal("skipFileSave" in capturedPayload, false);
+});
+
+// --- testRawBytesHelpers ---
+
+test("testRawBytesHelpers returns step:bridge-unavailable and never calls /command when the health check fails (no mogrtPath required at all)", async () => {
+  const calledUrls = [];
+  await withFetch(
+    async (url) => {
+      calledUrls.push(url);
+      throw new Error("connect ECONNREFUSED");
+    },
+    async () => {
+      const result = await testRawBytesHelpers({ log: noopLog });
+      assert.equal(result.ok, false);
+      assert.equal(result.step, "bridge-unavailable");
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health"]);
+});
+
+test("testRawBytesHelpers calls the testRawBytesHelpers host command with an empty payload by default and forwards the result", async () => {
+  const calledUrls = [];
+  let capturedCommand = null;
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      calledUrls.push(url);
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      const body = JSON.parse(init.body);
+      capturedCommand = body.command;
+      capturedPayload = body.payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: { rawStringLength: 7 } });
+    },
+    async () => {
+      const result = await testRawBytesHelpers({ log: noopLog });
+      assert.equal(result.ok, true);
+      assert.equal(result.result.rawStringLength, 7);
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health", "http://localhost:3010/command"]);
+  assert.equal(capturedCommand, "testRawBytesHelpers");
+  assert.deepEqual(capturedPayload, {});
+});
+
+test("testRawBytesHelpers forwards an explicit testString verbatim", async () => {
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      capturedPayload = JSON.parse(init.body).payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: {} });
+    },
+    async () => {
+      await testRawBytesHelpers({ log: noopLog, testString: "hello" });
+    }
+  );
+  assert.equal(capturedPayload.testString, "hello");
 });

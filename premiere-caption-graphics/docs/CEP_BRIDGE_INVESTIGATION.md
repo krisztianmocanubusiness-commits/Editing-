@@ -548,3 +548,118 @@ been run against a live Premiere host by this agent. The next live run's
 what `getValue()` returns and why it wasn't parsing as JSON — the specific
 question this diagnostic exists to answer before any further `setValue()`
 experiments are attempted.
+
+## Part 10: fourth real-host run — "EvalScript error." instead of a JSON failure; ExtendScript-engine hardening
+
+**Confirmed real-host bug report:** `inspectSourceTextRawBytes()` failed
+immediately with `Non-JSON response from ExtendScript: EvalScript error.`,
+while `probeSourceTextDeep()` continued to work fine. That literal string,
+`"EvalScript error."`, is CEP's own `evalScript()` fallback for a fault
+inside the ExtendScript engine that escapes normal script-level
+`try/catch` — meaning the exception was happening somewhere `dispatch()`'s
+own wrapping `try/catch` (which normally always returns valid JSON, even
+on failure) never got a chance to catch.
+
+**What this investigation confirmed and what it couldn't confirm:**
+- A full static audit of `inspectSourceTextRawBytes()`'s source against
+  every specific unsupported-feature suspect the bug report listed
+  (`String.prototype.codePointAt`/`startsWith`/`endsWith`,
+  `Array.prototype.map`/`filter`/`reduce`, `let`/`const`, arrow functions,
+  template literals, `Object.keys` on host objects) found **none of them
+  present** — the function was already ES3/ES5-safe on every one of those
+  specific points.
+- However, a **real, separately-confirmed bug** was found and fixed while
+  auditing this exact function: this project's own tooling had twice
+  (see Part 9) accidentally written a literal NUL byte into
+  `hostscript.jsx`'s source instead of the intended null-character escape
+  sequence — direct, first-hand evidence that escape-sequence handling
+  around this specific character is genuinely unreliable in this toolchain
+  right now. Since the bug report explicitly names "Unicode escape
+  handling that ExtendScript may parse differently" as a suspect, and this
+  project's own editing tools independently demonstrated exactly that kind
+  of unreliability on the identical character, the null-character/BOM
+  handling in `inspectSourceTextRawBytes()` was rewritten from
+  `/\` + `u0000/g` regex literals to a plain `stripNullChars()` helper
+  (character-by-character loop, `charCodeAt(i) !== 0`) and
+  `String.fromCharCode(0)` construction — removing every escape-sequence
+  literal of that kind from the file entirely, so there is nothing left
+  for either toolchain to potentially mis-encode.
+- The single operation unique to `inspectSourceTextRawBytes()` that
+  `probeSourceTextDeep()` (still working) never performs is the temp-file
+  write (`saveDiagnosticJson()`, via `File`/`Folder`) — the prime
+  remaining suspect for an engine-level fault outside normal `try/catch`,
+  though this is a hypothesis, not a confirmed cause.
+- **This agent has no live Premiere host access**, so which of these (if
+  any) was the actual root cause could not be directly confirmed here —
+  the changes below are the grounded mitigation plus the tooling needed to
+  pin it down definitively on the next real-host run.
+
+**Hardening (`cep-bridge/jsx/hostscript.jsx`):**
+- `inspectSourceTextRawBytes()`'s ENTIRE body now runs inside one
+  top-level `try { ... } catch (fatalErr) { return buildFatalFailure(...); }`
+  — every normal catchable exception, no matter where it happens, now
+  always returns a plain JS object instead of letting anything escape past
+  `dispatch()`'s own `JSON.stringify(response)`.
+- A `stage` variable is set right before each phase begins —
+  `argument-parsing`, `mogrt-insertion`, `source-text-lookup`,
+  `raw-string-inspection`, `json-serialization`, `temp-file-writing` — and
+  `buildFatalFailure(requestId, stage, diagnostics, err)` returns
+  `{ok: false, stage, error, errorLine, errorFileName, errorStack, diagnostics}`
+  on any fatal exception, using ExtendScript's own `Error.line`/
+  `.fileName`/`.stack` where available. On the next live run: if this
+  wrapper is reached and a `stage`-tagged JSON response comes back, the
+  fault was a normal catchable exception at that exact stage; if
+  `"EvalScript error."` still comes back with **no JSON at all**, the
+  fault is happening below the JS engine's own catch mechanism entirely —
+  strong evidence for the temp-file-write hypothesis above.
+- `payload.skipFileSave` (new, optional): when true, `temp-file-writing`
+  is skipped entirely and the byte-level result is still returned in full
+  — lets the next live run test the temp-file-write hypothesis directly by
+  running the diagnostic twice, once normally and once with this flag set.
+- **New standalone command, `testRawBytesHelpers()`** (task 8): exercises
+  the exact same `charCodeHexDump()`/`tryJsonParse()`/`JSON.stringify()`
+  helpers against a built-in dummy string (a BOM, an embedded null
+  character, and surrounding whitespace around `"{}"`, reproducing the
+  Part 9 anomaly on purpose) — with **zero Premiere host object access**:
+  no `app.project`, no `activeSequence`, no `importMGT`, no `getValue`/
+  `setValue`. If this command also fails with `"EvalScript error."`, the
+  fault is in the byte/JSON string-processing logic itself; if it
+  succeeds, the fault is specifically in the MOGRT-insertion/
+  Source-Text-lookup/file-I/O path that `inspectSourceTextRawBytes()`
+  layers on top of it.
+- `stripNullChars(s)` (new helper): replaces every prior null-character
+  regex/escape-literal usage, as described above.
+
+**UXP/UI side:**
+- `src/ppro/cepBridge.js` adds `skipFileSave` support to
+  `inspectSourceTextRawBytes()` (only included in the payload when
+  explicitly truthy) and a new `testRawBytesHelpers(opts)` client function
+  — the latter doesn't even require a `.mogrt` path, since the host
+  command it calls never touches one.
+- `src/ui/cepBridgePanel.js` adds a "Skip temp-file writing" checkbox next
+  to the raw-bytes button, and a fourth button, "Run Byte/JSON Helper
+  Self-Test (no Premiere objects touched)", rendering the self-test's
+  result the same way as the raw-bytes inspection. Both the raw-bytes and
+  self-test failure views now surface `stage`/`errorLine`/`errorFileName`/
+  `errorStack` when present.
+- `test/cepBridge.test.js` and `test/cepHostScript.test.js` add coverage:
+  the two new client functions' request shape/gating, and static
+  regression checks that (a) the top-level try/catch and all six stage
+  markers are present and used, (b) `buildFatalFailure()`'s exact return
+  shape, (c) `testRawBytesHelpers()` never references `app.project`,
+  `activeSequence`, `importMGT`, `getValue`, or `setValue`, (d) no
+  null-character escape-sequence literal exists anywhere in the file
+  anymore (only `stripNullChars()`/`String.fromCharCode(0)`), and (e) a
+  broader ES3-compatibility sweep blocking `startsWith`/`endsWith`/
+  `codePointAt`, `Array.prototype.map`/`filter`/`reduce`, `Object.keys`,
+  template literals, `const`/`let`, and arrow functions from ever
+  reappearing in this file.
+
+**What is still unverified:** whether this actually resolves the
+`"EvalScript error."` on a live host, and — if it doesn't — exactly which
+`stage` (if a JSON response comes back at all) or which of the two
+isolation tools (`skipFileSave`, `testRawBytesHelpers`) narrows it down.
+This agent has no live Premiere host access in this environment; the next
+real-host run of "Inspect Source Text Raw Bytes" and "Run Byte/JSON Helper
+Self-Test" will show, with direct evidence, exactly where in the pipeline
+the fault actually is.

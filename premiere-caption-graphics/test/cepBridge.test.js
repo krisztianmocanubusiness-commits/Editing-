@@ -624,7 +624,7 @@ test("BYPASS_TEST_SCRIPTS never routes through $._captionStudioBridge.dispatch(.
   }
 });
 
-test("runRawEvalScript returns step:bridge-unavailable and never POSTs /raw-eval when the health check fails", async () => {
+test("runRawEvalScript sets transportError (not ok:false-via-'step') and never POSTs /raw-eval when the health check fails", async () => {
   const calledUrls = [];
   await withFetch(
     async (url) => {
@@ -634,13 +634,14 @@ test("runRawEvalScript returns step:bridge-unavailable and never POSTs /raw-eval
     async () => {
       const result = await runRawEvalScript({ script: "JSON.stringify({ok:true})", log: noopLog });
       assert.equal(result.ok, false);
-      assert.equal(result.step, "bridge-unavailable");
+      assert.match(result.transportError, /CEP bridge unavailable/);
+      assert.equal(result.isEvalScriptError, false);
     }
   );
   assert.deepEqual(calledUrls, ["http://localhost:3010/health"]);
 });
 
-test("runRawEvalScript POSTs { script } to /raw-eval (not /command — bypasses the dispatcher JSON-RPC envelope entirely) and forwards the raw result", async () => {
+test("runRawEvalScript POSTs { script } to /raw-eval (not /command — bypasses the dispatcher JSON-RPC envelope and callCepBridge() entirely) and forwards the raw result verbatim", async () => {
   const calledUrls = [];
   let capturedInit = null;
   await withFetch(
@@ -652,18 +653,19 @@ test("runRawEvalScript POSTs { script } to /raw-eval (not /command — bypasses 
         ok: true,
         script: "JSON.stringify({ok:true})",
         rawResult: '{"ok":true}',
+        rawResultType: "string",
         rawResultLength: 11,
-        rawResultJsonStringify: '"{\\"ok\\":true}"',
-        parsedOk: true,
-        parsedValue: { ok: true },
-        parseError: null,
+        isEvalScriptError: false,
+        transportError: null,
       });
     },
     async () => {
       const result = await runRawEvalScript({ script: "JSON.stringify({ok:true})", log: noopLog });
       assert.equal(result.ok, true);
       assert.equal(result.rawResult, '{"ok":true}');
-      assert.equal(result.parsedOk, true);
+      assert.equal(result.rawResultType, "string");
+      assert.equal(result.rawResultLength, 11);
+      assert.equal(result.isEvalScriptError, false);
     }
   );
   assert.deepEqual(calledUrls, ["http://localhost:3010/health", "http://localhost:3010/raw-eval"]);
@@ -671,24 +673,48 @@ test("runRawEvalScript POSTs { script } to /raw-eval (not /command — bypasses 
   assert.deepEqual(JSON.parse(capturedInit.body), { script: "JSON.stringify({ok:true})" });
 });
 
-test("runRawEvalScript reports the literal EvalScript-error case distinctly (rawResult exactly equal to the literal string)", async () => {
+test("runRawEvalScript never JSON.parses rawResult itself — it forwards whatever the bridge returned exactly as-is, even a bare non-JSON string like 'c'", async () => {
   await withFetch(
     async (url) => {
       if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
       return fakeJsonResponse(200, {
         ok: true,
+        script: 'basenameNoExt("/a/b/c.mogrt")',
+        rawResult: "c",
+        rawResultType: "string",
+        rawResultLength: 1,
+        isEvalScriptError: false,
+        transportError: null,
+      });
+    },
+    async () => {
+      const result = await runRawEvalScript({ script: BYPASS_TEST_SCRIPTS.BARE_GLOBAL_HELPER.script, log: noopLog });
+      assert.equal(result.ok, true);
+      assert.equal(result.rawResult, "c");
+      assert.equal(result.isEvalScriptError, false);
+    }
+  );
+});
+
+test("runRawEvalScript reports the literal EvalScript-error case distinctly via isEvalScriptError, with ok:false", async () => {
+  await withFetch(
+    async (url) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      return fakeJsonResponse(200, {
+        ok: false,
         script: 'dispatch("{}")',
         rawResult: "EvalScript error.",
-        rawResultLength: 18,
-        rawResultJsonStringify: '"EvalScript error."',
-        parsedOk: false,
-        parseError: "Unexpected token E in JSON at position 0",
+        rawResultType: "string",
+        rawResultLength: 17,
+        isEvalScriptError: true,
+        transportError: null,
       });
     },
     async () => {
       const result = await runRawEvalScript({ script: BYPASS_TEST_SCRIPTS.BARE_DISPATCH_EXPECTED_FAIL.script, log: noopLog });
+      assert.equal(result.ok, false);
       assert.equal(result.rawResult, "EvalScript error.");
-      assert.equal(result.parsedOk, false);
+      assert.equal(result.isEvalScriptError, true);
     }
   );
 });

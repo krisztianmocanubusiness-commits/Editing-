@@ -1035,3 +1035,125 @@ fails, the issue is specific to that one command's registration —
 independent of how the call was constructed, which would point back at
 the file actually loaded not containing `echoPayload` at all (the
 install-location risk above, restated in a directly falsifiable way).
+
+## Part 14: eighth real-host run — a real bug found in the transport itself, not ExtendScript
+
+**Confirmed real-host result that redirects this investigation again:**
+all six `/raw-eval` bypass tests reported "finished with errors" —
+**including test #1, the pure literal `JSON.stringify({ok:true})` with
+zero reference to any project code, ExtendScript engine, or Premiere
+API.** Since that specific script cannot fail for any ExtendScript-side
+reason (it doesn't touch `$._captionStudioBridge`, `dispatch`, or any
+custom function — it's a call to a built-in that every JavaScript engine
+has), a uniform failure across all six, including this one, means the bug
+was never in ExtendScript execution at all. It was in this investigation's
+own `/raw-eval` transport and response classification, added in Part 13.
+
+**The actual bug, found by re-reading Part 13's own code:** the previous
+`runRawEvalScript()` (`cep-bridge/client/main.js`) attempted
+`JSON.parse()` on every raw callback and recorded `parsedOk`/
+`parsedValue`/`parseError` alongside an unconditional `ok: true` — but
+most of the bypass scripts deliberately *don't* return JSON at all (a bare
+helper function returning a plain string like `"c"`, or `dispatch("{}")`
+throwing a `ReferenceError`). The transport layer itself wasn't actually
+setting `ok: false` incorrectly — but the accompanying documentation and
+UI language conflated "JSON.parse failed" with "this test failed," and
+the whole response shape mixed two genuinely different failure modes
+(a transport/HTTP-layer problem vs. `resultString === "EvalScript
+error."`) into one ambiguous `ok` flag that the caller-side "finished with
+errors" log line then reported on. Per the task list this round, the fix
+removes JSON parsing from `/raw-eval` entirely and makes the
+success/failure classification explicit and narrow.
+
+### The fix
+
+**New: `cep-bridge/client/rawEvalClassify.cjs`** — pure classification
+logic, zero browser/CEP dependencies (unlike the rest of `client/main.js`,
+which needs `document`/`CSInterface` to even load), so — unlike every
+other file in `cep-bridge/`, which can only get static source-text
+regression checks — this one gets **real, executable unit tests**
+(`test/cepRawEvalClassify.test.js`, task 8's exact five cases:
+`'{"ok":true}'`, `'c'`, `'undefined'` (the string), `''`, and
+`'EvalScript error.'`, plus near-miss/substring cases and a real JS
+`undefined` callback). `.cjs`, not `.js` — this project's `package.json`
+sets `"type": "module"`, and a plain `.js` file would be parsed as ESM
+under Node's `require()`/`import` resolution regardless of its contents;
+`.cjs` forces unambiguous CommonJS so both `client/main.js`'s
+`require("./rawEvalClassify.cjs")` (inside the CEP panel) and the test
+file's `import` (under plain Node) load the exact same code.
+
+```js
+function classifyRawEvalResult(resultString) {
+  const rawResultType = typeof resultString;
+  const rawResult = resultString === undefined ? null : resultString;
+  const rawResultLength = rawResult === null ? 0 : String(rawResult).length;
+  const isEvalScriptError = resultString === "EvalScript error.";
+  return { ok: !isEvalScriptError, rawResult, rawResultType, rawResultLength, isEvalScriptError };
+}
+```
+
+`ok` is `false` **only** when `resultString` is exactly the literal
+`"EvalScript error."` string — never because it "isn't JSON."
+
+**`cep-bridge/client/main.js`:**
+- `runRawEvalScript()` now calls `classifyRawEvalResult()` instead of
+  attempting its own `JSON.parse()` (tasks 2/5 — `/raw-eval` treats the
+  callback as raw text only).
+- Logs the raw callback's `typeof`, length, and `JSON.stringify()` of it
+  **before** classification (task 1).
+- Every resolution path (success, `isEvalScriptError`, timeout,
+  synchronous `evalScript()` throw) now returns the same seven-field
+  envelope (task 3): `{ok, script, rawResult, rawResultType,
+  rawResultLength, isEvalScriptError, transportError}` — `transportError`
+  is `null` on a normal ExtendScript-level response (whether or not it was
+  `"EvalScript error."`) and non-null **only** when the transport/CEP
+  layer itself failed (timeout, synchronous throw) — task 4's exact two
+  conditions for `ok: false`, now split into two distinct, independently
+  checkable fields (`isEvalScriptError` vs. `transportError`) rather than
+  one overloaded `ok`.
+- `handleRawEval()` now logs the exact received request body and the
+  extracted `script` field **unconditionally, on every call** (task 9) —
+  directly answering "is the route actually receiving the requested
+  script" without guessing.
+
+**`src/ppro/cepBridge.js`'s `runRawEvalScript()`** (UXP side): updated to
+the same seven-field shape; every one of its own failure branches
+(health-check failure, non-2xx HTTP response, fetch exception/timeout)
+now sets `transportError` (never a generic `error`/`step` field, and
+never conflated with `isEvalScriptError`) — and, per task 6, it still
+does **not** route through `callCepBridge()` (the `/command`
+dispatch-command parser every other command uses) — `/raw-eval` remains
+its own, separate HTTP call with its own response shape.
+
+**`src/ui/cepBridgePanel.js`'s `bypassResultBlock()`** (task 7): now shows
+`rawResult` (via `JSON.stringify()`, so hidden characters are visible),
+`rawResultType`, `rawResultLength`, `isEvalScriptError`, and — kept
+visually distinct from all of the above — `transportError` when present.
+
+### Verification
+
+- `test/cepRawEvalClassify.test.js` (8 tests, real execution): task 8's
+  exact five success/failure cases, plus near-miss substrings and the
+  real-`undefined` edge case.
+- `test/cepClientMain.test.js` (new, static source-text regression checks,
+  same reasoning as `test/cepHostScript.test.js`): confirms
+  `runRawEvalScript()` never calls `JSON.parse()` on the raw callback,
+  logs `typeof`/length/`JSON.stringify()` before classifying, that the
+  transport-failure envelope always includes all seven fields, that `ok`
+  is never derived from JSON-parseability anywhere in the raw-eval path,
+  and that `/command`'s own (unrelated, unchanged) JSON body-parsing is
+  still intact.
+- `test/cepBridge.test.js`: `runRawEvalScript()`'s UXP-side client
+  function updated/extended for the new shape, including a case
+  forwarding a bare non-JSON string (`"c"`) as a genuine success.
+
+### What this run cannot answer without live-host access
+
+Whether this actually fixes what the user sees, and — now that the
+transport layer reports real, unambiguous ExtendScript-level results —
+which of the six bypass tests' `isEvalScriptError` is actually `true`.
+That result is what will finally answer Part 13's still-open question
+(pure literal vs. bare-global helper vs. bare-global new function vs.
+bare unscoped `dispatch` vs. qualified `dispatch` for a known-working vs.
+known-failing command) — this round's fix was necessary but was, by
+itself, about the measurement tool, not the thing being measured.

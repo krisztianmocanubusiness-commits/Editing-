@@ -544,13 +544,21 @@ export const BYPASS_TEST_SCRIPTS = {
  * POSTs a literal ExtendScript source string directly to the CEP bridge's
  * /raw-eval endpoint — bypassing callCepBridge()/the /command JSON-RPC
  * envelope, hostscript.jsx's dispatch() function, and
- * runExtendScriptCommand()'s own script-building entirely. Returns the
- * raw callback result exactly as cep-bridge/client/main.js's
- * runRawEvalScript() captured it (task 7): rawResult, rawResultLength,
- * rawResultJsonStringify, and a best-effort parsedOk/parsedValue/
- * parseError (many of the bypass scripts above don't return JSON at all,
- * so a parse failure there is expected and informative, not itself an
- * error).
+ * runExtendScriptCommand()'s own script-building entirely (task 6: does
+ * NOT reuse callCepBridge(), the parser every other dispatch-routed
+ * command goes through — this is a genuinely separate HTTP endpoint with
+ * its own response shape).
+ *
+ * Returns the raw callback result exactly as
+ * cep-bridge/client/main.js's runRawEvalScript()/classifyRawEvalResult()
+ * captured it: `{ok, script, rawResult, rawResultType, rawResultLength,
+ * isEvalScriptError, transportError}`. `ok` is false ONLY when
+ * `isEvalScriptError` is true (the raw callback was exactly the literal
+ * "EvalScript error." string) or `transportError` is set (this function's
+ * own health-check/fetch/timeout layer failed) — never because
+ * `rawResult` "isn't JSON", since most of the bypass scripts intentionally
+ * don't return JSON at all. This function never JSON.parses `rawResult`
+ * itself (task 5) — it's exactly what the CEP bridge sent back.
  *
  * @param {Object} opts
  * @param {string} opts.script — literal ExtendScript source, e.g. one of BYPASS_TEST_SCRIPTS[...].script.
@@ -569,7 +577,15 @@ export async function runRawEvalScript(opts) {
         'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
       "error"
     );
-    return { ok: false, step: "bridge-unavailable", error: health.error };
+    return {
+      ok: false,
+      script,
+      rawResult: null,
+      rawResultType: "undefined",
+      rawResultLength: 0,
+      isEvalScriptError: false,
+      transportError: `CEP bridge unavailable: ${health.error}`,
+    };
   }
   log("✓ CEP bridge is reachable.", "success");
 
@@ -585,7 +601,15 @@ export async function runRawEvalScript(opts) {
     });
     clearTimeout(timeoutHandle);
     if (!response.ok) {
-      result = { ok: false, error: `CEP bridge returned HTTP ${response.status}.` };
+      result = {
+        ok: false,
+        script,
+        rawResult: null,
+        rawResultType: "undefined",
+        rawResultLength: 0,
+        isEvalScriptError: false,
+        transportError: `CEP bridge returned HTTP ${response.status}.`,
+      };
     } else {
       result = await response.json();
     }
@@ -593,7 +617,13 @@ export async function runRawEvalScript(opts) {
     clearTimeout(timeoutHandle);
     result = {
       ok: false,
-      error: err && err.name === "AbortError" ? `CEP bridge did not respond within ${timeoutMs}ms.` : `CEP bridge unavailable: ${err.message || err}`,
+      script,
+      rawResult: null,
+      rawResultType: "undefined",
+      rawResultLength: 0,
+      isEvalScriptError: false,
+      transportError:
+        err && err.name === "AbortError" ? `CEP bridge did not respond within ${timeoutMs}ms.` : `CEP bridge unavailable: ${err.message || err}`,
     };
   }
 

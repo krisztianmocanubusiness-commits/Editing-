@@ -626,26 +626,29 @@ function echoResultBlock(result) {
 
 function bypassResultBlock(result) {
   if (!result) return null;
-  if (!result.ok) {
-    return el("div", { class: "inspector-results" }, [
-      el("div", { class: "status-line log-error", text: `✗ Bypass call failed at the bridge layer: ${result.error ?? "unknown error"}` }),
-    ]);
-  }
+  // Task 7: show rawResult, rawResultType, rawResultLength,
+  // isEvalScriptError, and any transport error — always, regardless of
+  // `ok`, since `transportError` (a real network/bridge-layer failure)
+  // and `isEvalScriptError` (the raw callback was literally
+  // "EvalScript error.") are two DIFFERENT failure modes that must stay
+  // visibly distinct, not collapsed into one generic "failed" line.
   const lines = [
     el("div", { class: "status-line", text: `evalScript source: ${result.script ?? "n/a"}` }),
-    el("div", { class: "status-line", text: `Raw callback: length=${result.rawResultLength ?? "n/a"}, JSON.stringify=${result.rawResultJsonStringify ?? "n/a"}` }),
-    el("div", {
-      class: `status-line ${result.rawResult === "EvalScript error." ? "log-error" : "log-success"}`,
-      text:
-        result.rawResult === "EvalScript error."
-          ? '✗ Raw callback IS the literal "EvalScript error." string — this exact layer is where it breaks.'
-          : "✓ Raw callback is NOT the literal \"EvalScript error.\" string — this layer succeeded (or failed differently).",
-    }),
-    el("div", {
-      class: `status-line ${result.parsedOk ? "log-success" : ""}`,
-      text: result.parsedOk ? `JSON.parse succeeded: ${JSON.stringify(result.parsedValue)}` : `JSON.parse did not succeed (${result.parseError ?? "n/a"}) — may be expected for this script.`,
-    }),
   ];
+  if (result.transportError) {
+    lines.push(el("div", { class: "status-line log-error", text: `✗ Transport error (network/bridge layer, not ExtendScript): ${result.transportError}` }));
+  } else {
+    lines.push(
+      el("div", { class: "status-line", text: `rawResult: ${JSON.stringify(result.rawResult)}` }),
+      el("div", { class: "status-line", text: `rawResultType: ${result.rawResultType ?? "n/a"}, rawResultLength: ${result.rawResultLength ?? "n/a"}` }),
+      el("div", {
+        class: `status-line ${result.isEvalScriptError ? "log-error" : "log-success"}`,
+        text: result.isEvalScriptError
+          ? '✗ isEvalScriptError: true — raw callback IS the literal "EvalScript error." string — this exact layer is where it breaks.'
+          : '✓ isEvalScriptError: false — raw callback is NOT the literal "EvalScript error." string.',
+      })
+    );
+  }
   return el("div", { class: "inspector-results" }, lines);
 }
 

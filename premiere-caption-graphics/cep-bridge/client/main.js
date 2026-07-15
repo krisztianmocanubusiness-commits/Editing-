@@ -19,6 +19,12 @@
 
 // eslint-disable-next-line no-undef
 const http = require("http");
+// eslint-disable-next-line no-undef
+// .cjs extension (not .js) so this loads as CommonJS unambiguously,
+// regardless of any package.json "type" field Node might otherwise
+// consult — this file is also imported directly by
+// test/cepRawEvalClassify.test.js under plain Node.
+const { classifyRawEvalResult } = require("./rawEvalClassify.cjs");
 
 const PORT = 3010;
 const HOST = "127.0.0.1"; // local-only — never bind 0.0.0.0 for a bridge that can execute host scripting.
@@ -149,11 +155,15 @@ function runExtendScriptCommand(command, payload, requestId) {
  * (`echoPayloadDirect(...)`), a bare (incorrectly-scoped, expected to
  * fail) reference to `dispatch(...)`, or a hand-written, pre-escaped call
  * to the correctly-scoped `$._captionStudioBridge.dispatch(...)` for both
- * a known-working and a known-failing command. Returns the RAW callback
- * result before any JSON parsing is attempted (task 7): the exact string,
- * its length, a JSON.stringify() of it, and a best-effort JSON.parse()
- * attempt (informative only — many of the literals above are not meant to
- * return JSON at all).
+ * a known-working and a known-failing command.
+ *
+ * Treats the evalScript() callback as RAW TEXT ONLY (tasks 2/5 — this
+ * function never calls JSON.parse() on it; classification is delegated to
+ * classifyRawEvalResult(), which is ok:false ONLY when the raw text is
+ * EXACTLY the literal "EvalScript error." string, or when the
+ * transport/CEP layer itself throws below — never because the text
+ * "isn't JSON", since most of the bypass scripts above intentionally
+ * don't return JSON at all).
  */
 function runRawEvalScript(script) {
   return new Promise((resolve) => {
@@ -161,7 +171,15 @@ function runRawEvalScript(script) {
     const timeoutHandle = setTimeout(() => {
       if (settled) return;
       settled = true;
-      resolve({ ok: false, error: `evalScript did not respond within ${EVALSCRIPT_TIMEOUT_MS}ms.`, script });
+      resolve({
+        ok: false,
+        script,
+        rawResult: null,
+        rawResultType: "undefined",
+        rawResultLength: 0,
+        isEvalScriptError: false,
+        transportError: `evalScript did not respond within ${EVALSCRIPT_TIMEOUT_MS}ms.`,
+      });
     }, EVALSCRIPT_TIMEOUT_MS);
 
     log(`raw bypass evalScript source: ${script}`, "info");
@@ -173,39 +191,31 @@ function runRawEvalScript(script) {
         settled = true;
         clearTimeout(timeoutHandle);
 
-        const rawResult = resultString === undefined ? null : resultString;
-        const rawResultLength = rawResult === null ? 0 : String(rawResult).length;
-        const rawResultJsonStringify = JSON.stringify(rawResult);
-        log(`raw bypass evalScript() callback: length=${rawResultLength}, JSON.stringify=${rawResultJsonStringify}`, "info");
+        // Task 1: log the exact callback — raw value, typeof, length,
+        // JSON.stringify() of it, and whether it's literally
+        // "EvalScript error." — BEFORE any classification/interpretation.
+        const classified = classifyRawEvalResult(resultString);
+        log(
+          `raw bypass evalScript() callback: typeof=${typeof resultString}, length=${classified.rawResultLength}, ` +
+            `JSON.stringify=${JSON.stringify(resultString)}, isEvalScriptError=${classified.isEvalScriptError}`,
+          "info"
+        );
 
-        let parsedOk = false;
-        let parsedValue;
-        let parseError = null;
-        if (rawResult !== null) {
-          try {
-            parsedValue = JSON.parse(rawResult);
-            parsedOk = true;
-          } catch (err) {
-            parseError = String(err.message || err);
-          }
-        }
-
-        resolve({
-          ok: true,
-          script,
-          rawResult,
-          rawResultLength,
-          rawResultJsonStringify,
-          parsedOk,
-          parsedValue: parsedOk ? parsedValue : undefined,
-          parseError,
-        });
+        resolve({ ...classified, script, transportError: null });
       });
     } catch (err) {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutHandle);
-      resolve({ ok: false, error: `evalScript threw synchronously: ${err.message || err}`, script });
+      resolve({
+        ok: false,
+        script,
+        rawResult: null,
+        rawResultType: "undefined",
+        rawResultLength: 0,
+        isEvalScriptError: false,
+        transportError: `evalScript threw synchronously: ${err.message || err}`,
+      });
     }
   });
 }
@@ -263,24 +273,38 @@ async function handleCommand(req, res) {
  * evalScript(), bypassing dispatch()/the JSON request envelope entirely.
  * Body must be `{ "script": "<literal ExtendScript source>" }`.
  */
+function rawEvalTransportFailure(script, transportError) {
+  return { ok: false, script: script ?? null, rawResult: null, rawResultType: "undefined", rawResultLength: 0, isEvalScriptError: false, transportError };
+}
+
 async function handleRawEval(req, res) {
+  let rawBody;
   let parsedBody;
   try {
-    const raw = await readRequestBody(req);
-    parsedBody = JSON.parse(raw);
+    rawBody = await readRequestBody(req);
+    parsedBody = JSON.parse(rawBody);
   } catch (err) {
-    log(`✗ /raw-eval: couldn't parse request body: ${err.message || err}`, "error");
-    sendJson(res, 200, { ok: false, error: `Invalid JSON request body: ${err.message || err}` });
+    log(`✗ /raw-eval: couldn't parse request body: ${err.message || err}. Raw body received: ${JSON.stringify(rawBody)}`, "error");
+    sendJson(res, 200, rawEvalTransportFailure(null, `Invalid JSON request body: ${err.message || err}`));
     return;
   }
 
   const { script } = parsedBody || {};
+  // Task 9: verify the route is actually receiving the requested script,
+  // not an undefined/wrong body field — logged unconditionally, every call.
+  log(`→ /raw-eval received body: ${JSON.stringify(parsedBody)} (script field: ${JSON.stringify(script)})`, "info");
   if (!script || typeof script !== "string") {
-    sendJson(res, 200, { ok: false, error: "Request body must include a string `script` field." });
+    sendJson(res, 200, rawEvalTransportFailure(script ?? null, "Request body must include a string `script` field."));
     return;
   }
 
   const result = await runRawEvalScript(script);
+  log(
+    result.ok
+      ? "✓ /raw-eval succeeded (raw callback was not the literal \"EvalScript error.\" string)"
+      : `✗ /raw-eval failed: ${result.transportError ?? (result.isEvalScriptError ? 'raw callback was the literal "EvalScript error." string' : "unknown")}`,
+    result.ok ? "success" : "error"
+  );
   sendJson(res, 200, result);
 }
 

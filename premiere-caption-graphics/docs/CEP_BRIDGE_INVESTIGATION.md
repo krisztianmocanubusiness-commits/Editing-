@@ -1157,3 +1157,80 @@ That result is what will finally answer Part 13's still-open question
 bare unscoped `dispatch` vs. qualified `dispatch` for a known-working vs.
 known-failing command) — this round's fix was necessary but was, by
 itself, about the measurement tool, not the thing being measured.
+
+## Part 15: a real startup regression, caused by Part 14's own fix
+
+**Confirmed real-host result:** after Part 14's commit, the CEP Bridge
+panel got stuck on index.html's static "Starting…" text and never
+progressed — a genuine regression, distinct from every ExtendScript-side
+question this investigation had been chasing. Before that commit, the
+bridge started and was reachable normally.
+
+**Root cause:** Part 14 added `require("./rawEvalClassify.cjs")` —
+requiring a *local project file* by relative path — at the very top of
+`cep-bridge/client/main.js`, executed before any DOM/status code ran, and
+with no `try`/`catch` anywhere around it. CEP's `--enable-nodejs`/
+`--mixed-context` flags give the panel real Node.js `require()`, and
+`require("http")` (a *built-in* module) has always worked here — but this
+project had no actual confirmed evidence that `require()`-ing a *local*
+file by relative path from inside a CEP panel works reliably, and it
+apparently doesn't (or doesn't in this exact host/CEP-version
+combination): whatever that `require()` call actually did, it broke
+before returning, and — because there was no `try`/`catch` — the
+exception propagated all the way up and stopped the *entire script* from
+executing any further. Every single line after it, including the very
+first `setStatus()` call, never ran. The panel was left showing
+index.html's literal default text forever, with **no error visible
+anywhere** — not in the panel, not even distinguishable from a slow
+network request without opening DevTools.
+
+**The fix, per the task list:**
+
+1. **`classifyRawEvalResult` is now inlined directly in `main.js`**
+   (tasks 4/5/6) — no `require()` of any local project file anywhere in
+   this file anymore. Only `require("http")` (a Node built-in) remains,
+   exactly as it always has been. A separate, byte-for-byte-logic-
+   identical copy still lives in `rawEvalClassify.cjs`, purely so it keeps
+   getting real executable unit tests under plain Node
+   (`test/cepRawEvalClassify.test.js`) — but that file is **never**
+   loaded by `main.js` at runtime anymore. A new drift-guard test
+   (`test/cepClientMain.test.js`) extracts both copies' function bodies,
+   normalizes formatting differences, and asserts they stay logically
+   identical, so the two can't silently diverge now that they're
+   maintained as two separate copies.
+2. **The entire startup sequence now runs inside one top-level
+   `try`/`catch`** (task 3). `renderStartupError(err)` is defined
+   *outside* that block, depending on nothing but `document`/`console`
+   (guaranteed present regardless of anything else failing), and renders
+   the full error message and stack trace directly into the panel's
+   status line and log — so any *future* synchronous startup failure,
+   whatever causes it, is immediately visible in the panel itself instead
+   of silently freezing on "Starting…" again.
+3. **Four visible startup-stage markers** (task 2), set via `setStatus()`/
+   `log()` at each point: `"Loading client script…"` → `"Loading
+   classifier…"` → `"Starting HTTP server…"` → `"Listening on
+   http://…"`. If a future regression reappears, the panel's last-shown
+   stage pinpoints which phase of startup it happened in.
+4. **`server.listen(...)` is called exactly as it was before Part 14**
+   (task 7) — same `PORT`/`HOST`, same callback structure, now just
+   additionally wrapped by the outer `try`/`catch` and preceded by the new
+   stage markers.
+
+**Verification (task 8):** `test/cepClientMain.test.js` adds regression
+checks that main.js's actual *code* (not its explanatory comments, which
+still describe the old bug by name) never calls `require()` on anything
+but `"http"`; that `classifyRawEvalResult` is defined inline; that the
+whole file is wrapped in one top-level `try`/`catch` ending in
+`renderStartupError(err)`; that `renderStartupError` itself doesn't
+reference anything defined inside the `try` block; that all four stage
+markers appear, in the correct order; and that `server.listen(...)` is
+still called unconditionally.
+
+### What this run cannot answer without live-host access
+
+Whether the panel now starts correctly again. This agent has no live
+Premiere/CEP host access in this environment — the fix is grounded in a
+direct, first-hand read of exactly what changed between "last known
+working" and "now stuck," but confirming the panel reaches "Listening on
+http://127.0.0.1:3010 — hostscript.jsx build: …" again requires the next
+real-host run.

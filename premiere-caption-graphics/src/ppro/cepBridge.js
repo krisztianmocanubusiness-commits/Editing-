@@ -390,3 +390,39 @@ export async function testRawBytesHelpers(opts) {
   );
   return result;
 }
+
+/**
+ * Runs exactly ONE step of the bisectHostScript() host command — see
+ * cep-bridge/jsx/hostscript.jsx's bisectHostScript() for the exact
+ * progression (0-11), built per the user's explicit instruction to stop
+ * adding diagnostics and instead find the precise breaking statement by
+ * testing one incremental addition at a time. Never touches app/project/
+ * sequence at any step, so — like testRawBytesHelpers() — it doesn't
+ * require a .mogrt path, an active project, or an active sequence.
+ *
+ * @param {Object} opts
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {number} opts.step — 0 through 11; see hostscript.jsx for what each step adds.
+ * @param {number} [opts.timeoutMs]
+ */
+export async function bisectHostScript(opts) {
+  const { log, step, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+
+  log(`════ CEP Bisect — step ${step} — start ════`, "info");
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const result = await callCepBridge("bisectHostScript", { step }, { timeoutMs, log });
+
+  log(result.ok ? `════ CEP Bisect — step ${step} — finished ════` : `════ CEP Bisect — step ${step} — finished with errors ════`, result.ok ? "success" : "error");
+  return result;
+}

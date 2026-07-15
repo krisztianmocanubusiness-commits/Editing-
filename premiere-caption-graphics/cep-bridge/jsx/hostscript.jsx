@@ -47,6 +47,8 @@ $._captionStudioBridge.dispatch = function (requestJsonString) {
       response = $._captionStudioBridge.inspectSourceTextRawBytes(payload, requestId);
     } else if (command === "testRawBytesHelpers") {
       response = $._captionStudioBridge.testRawBytesHelpers(payload, requestId);
+    } else if (command === "bisectHostScript") {
+      response = $._captionStudioBridge.bisectHostScript(payload, requestId);
     } else {
       response = { ok: false, requestId: requestId, error: "Unknown command: " + command };
     }
@@ -1663,5 +1665,134 @@ $._captionStudioBridge.testRawBytesHelpers = function (payload, requestId) {
     return { ok: true, requestId: requestId, result: result };
   } catch (fatalErr) {
     return buildFatalFailure(requestId, stage, diagnostics, fatalErr);
+  }
+};
+
+// --- Bisection: find the exact statement that breaks under this host's ExtendScript engine ---
+//
+// Real-host finding that changes the diagnosis: testRawBytesHelpers()
+// touches ZERO Premiere APIs (no app.project, no sequence, no MOGRT, no
+// file I/O) and STILL fails with the same non-JSON "EvalScript error." as
+// inspectSourceTextRawBytes(). Since a full static audit found none of the
+// specifically-named unsupported ES features actually present in the
+// source, and since Node's own parser accepts the whole file without
+// complaint, the remaining plausible explanation is a genuine
+// compile-time fault in one specific statement that only surfaces when
+// that code path is actually exercised (older JS engines with deferred/
+// lazy per-function compilation can behave exactly like this: the file
+// loads and OTHER functions run fine, but a real syntax-level problem
+// inside one specific function isn't discovered until that function is
+// first invoked — which would also explain why it isn't caught by any
+// try/catch, script-level or dispatch()'s own, since it's not a normal
+// runtime exception).
+//
+// This command exists to find that exact statement by bisection, per the
+// user's explicit instruction to stop adding diagnostics and instead test
+// ONE incremental addition at a time. `payload.step` selects how much
+// code runs, in the exact order requested: (0) the bare minimum — return
+// a plain object, identical in shape to the already-confirmed-working
+// "ping" command; (1) a returned object with one added field; (2) declare
+// a short string literal; (3) read .length off it; (4) JSON.stringify()
+// it; (5) a charCodeAt() loop (the core of charCodeHexDump()); (6) hex
+// conversion + string-padding loop (the rest of charCodeHexDump()'s
+// logic, written out inline rather than calling the real function); (7)
+// call the REAL charCodeHexDump() helper directly; (8) a bare
+// JSON.parse() in try/catch (the core of tryJsonParse()); (9) call the
+// REAL tryJsonParse() helper directly; (10) call the REAL
+// stripNullChars() helper directly; (11) call the REAL
+// testRawBytesHelpers() command function directly — the exact function
+// that fails on the live host today. Never touches app/project/sequence
+// at any step (task 5). Each step returns immediately — no step runs any
+// code beyond what it specifically tests (task 2/4: one addition per
+// step, never combined).
+$._captionStudioBridge.bisectHostScript = function (payload, requestId) {
+  var step = typeof payload.step === "number" ? payload.step : 0;
+
+  try {
+    if (step === 0) {
+      // Identical shape to "ping" (the simplest command in this file,
+      // confirmed working) — if THIS fails, the fault is in
+      // dispatch()'s routing to a new command branch, not in any of the
+      // string/JSON logic tested by the later steps.
+      return { ok: true, requestId: requestId, result: { step: 0, stepName: "minimal object return (same shape as ping)" } };
+    }
+
+    if (step === 1) {
+      return { ok: true, requestId: requestId, result: { step: 1, stepName: "return plain object with one added field" } };
+    }
+
+    if (step === 2) {
+      var s2 = "{}";
+      return { ok: true, requestId: requestId, result: { step: 2, stepName: 'var s = "{}";', s: s2 } };
+    }
+
+    if (step === 3) {
+      var s3 = "{}";
+      var len3 = s3.length;
+      return { ok: true, requestId: requestId, result: { step: 3, stepName: "var len = s.length;", len: len3 } };
+    }
+
+    if (step === 4) {
+      var s4 = "{}";
+      var stringified4 = JSON.stringify(s4);
+      return { ok: true, requestId: requestId, result: { step: 4, stepName: "JSON.stringify(s)", stringified: stringified4 } };
+    }
+
+    if (step === 5) {
+      var s5 = "{}";
+      var codes5 = [];
+      for (var i5 = 0; i5 < s5.length; i5++) {
+        codes5.push(s5.charCodeAt(i5));
+      }
+      return { ok: true, requestId: requestId, result: { step: 5, stepName: "charCodeAt loop", codes: codes5 } };
+    }
+
+    if (step === 6) {
+      var s6 = "{}";
+      var hexes6 = [];
+      for (var i6 = 0; i6 < s6.length; i6++) {
+        var code6 = s6.charCodeAt(i6);
+        var hex6 = code6.toString(16);
+        while (hex6.length < 4) hex6 = "0" + hex6;
+        hexes6.push("0x" + hex6);
+      }
+      return { ok: true, requestId: requestId, result: { step: 6, stepName: "hex conversion + padding loop (inline, not calling charCodeHexDump)", hexes: hexes6 } };
+    }
+
+    if (step === 7) {
+      var dump7 = charCodeHexDump("{}", 10);
+      return { ok: true, requestId: requestId, result: { step: 7, stepName: "call the real charCodeHexDump() helper directly", dump: dump7 } };
+    }
+
+    if (step === 8) {
+      var ok8 = false;
+      var err8 = null;
+      try {
+        JSON.parse("{}");
+        ok8 = true;
+      } catch (e8) {
+        err8 = e8 && e8.message ? e8.message : String(e8);
+      }
+      return { ok: true, requestId: requestId, result: { step: 8, stepName: "bare JSON.parse() in try/catch (core of tryJsonParse)", parsedOk: ok8, parseError: err8 } };
+    }
+
+    if (step === 9) {
+      var attempt9 = tryJsonParse("bisect", "{}");
+      return { ok: true, requestId: requestId, result: { step: 9, stepName: "call the real tryJsonParse() helper directly", attempt: attempt9 } };
+    }
+
+    if (step === 10) {
+      var stripped10 = stripNullChars("a" + String.fromCharCode(0) + "b");
+      return { ok: true, requestId: requestId, result: { step: 10, stepName: "call the real stripNullChars() helper directly", stripped: stripped10 } };
+    }
+
+    if (step === 11) {
+      var innerResult11 = $._captionStudioBridge.testRawBytesHelpers({}, requestId);
+      return { ok: true, requestId: requestId, result: { step: 11, stepName: "call the real testRawBytesHelpers() command directly", inner: innerResult11 } };
+    }
+
+    return { ok: false, requestId: requestId, error: "Unknown bisect step: " + step + ". Valid steps are 0-11.", stepRequested: step };
+  } catch (fatalErr) {
+    return buildFatalFailure(requestId, "bisect-step-" + step, [], fatalErr);
   }
 };

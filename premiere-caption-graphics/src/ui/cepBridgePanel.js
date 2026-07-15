@@ -7,9 +7,12 @@ import {
   probeSourceTextDeep,
   inspectSourceTextRawBytes,
   testRawBytesHelpers,
+  bisectHostScript,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../ppro/cepBridge.js";
+
+const BISECT_MAX_STEP = 11;
 
 function patchCepBridge(patch) {
   store.set((s) => ({ cepBridge: { ...s.cepBridge, ...patch } }));
@@ -100,6 +103,22 @@ async function runRawBytesHelperSelfTest() {
     patchCepBridge({ lastSelfTestResult: { ok: false, step: "crash" } });
   } finally {
     patchCepBridge({ selfTestRunning: false });
+  }
+}
+
+async function runBisectStep() {
+  const { bisectStep } = store.getState().cepBridge;
+  patchCepBridge({ bisectRunning: true, lastBisectResult: null });
+  try {
+    const result = await bisectHostScript({ log, step: bisectStep });
+    console.error(`[Caption Graphics Studio] CEP Bisect step ${bisectStep} result:`, JSON.stringify(result, null, 2));
+    patchCepBridge({ lastBisectResult: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] CEP Bisect crashed:", err);
+    log(`CEP Bisect crashed unexpectedly: ${err.message || err}`, "error");
+    patchCepBridge({ lastBisectResult: { ok: false, step: "crash" } });
+  } finally {
+    patchCepBridge({ bisectRunning: false });
   }
 }
 
@@ -494,6 +513,22 @@ function selfTestResultBlock(result) {
   return el("div", { class: "inspector-results" }, lines);
 }
 
+function bisectResultBlock(result) {
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    if (result.stage) return fatalStageBlock(result);
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Bisect step failed${stepLabel}${result.error ? `: ${result.error}` : ""}` }),
+    ]);
+  }
+  const r = result.result ?? {};
+  return el("div", { class: "inspector-results" }, [
+    el("div", { class: "status-line log-success", text: `✓ Step ${r.step ?? "?"} succeeded: "${r.stepName ?? "n/a"}".` }),
+    jsonDetailsBlock("Full step result", r),
+  ]);
+}
+
 export function renderCepBridgePanel(onChange) {
   const state = store.getState();
   const cb = state.cepBridge;
@@ -542,6 +577,36 @@ export function renderCepBridgePanel(onChange) {
     disabled: !isHosted() || cb.selfTestRunning || undefined,
     onClick: async () => {
       await runRawBytesHelperSelfTest();
+      onChange();
+    },
+  });
+
+  const bisectStepInput = el("input", { type: "number", min: "0", max: String(BISECT_MAX_STEP), step: "1" });
+  bisectStepInput.value = String(cb.bisectStep);
+  bisectStepInput.addEventListener("change", () => {
+    const n = Math.max(0, Math.min(BISECT_MAX_STEP, Number(bisectStepInput.value) || 0));
+    patchCepBridge({ bisectStep: n });
+    onChange();
+  });
+  const bisectStepLabel = el("label", { class: "field-inline" }, [" Bisect step (0–" + BISECT_MAX_STEP + "): ", bisectStepInput]);
+  const bisectRunBtn = el("button", {
+    class: "btn",
+    text: cb.bisectRunning ? "Running…" : `Run Bisect Step ${cb.bisectStep}`,
+    disabled: !isHosted() || cb.bisectRunning || undefined,
+    onClick: async () => {
+      await runBisectStep();
+      onChange();
+    },
+  });
+  const bisectNextBtn = el("button", {
+    class: "btn",
+    text: "Run Bisect Step, Then Advance ↦",
+    disabled: !isHosted() || cb.bisectRunning || cb.bisectStep >= BISECT_MAX_STEP || undefined,
+    onClick: async () => {
+      await runBisectStep();
+      if (store.getState().cepBridge.lastBisectResult?.ok) {
+        patchCepBridge({ bisectStep: Math.min(BISECT_MAX_STEP, cb.bisectStep + 1) });
+      }
       onChange();
     },
   });
@@ -608,5 +673,21 @@ export function renderCepBridgePanel(onChange) {
     ),
     el("div", { class: "row" }, [selfTestBtn]),
     selfTestResultBlock(cb.lastSelfTestResult),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Bisection: since the self-test above still fails with a non-JSON \"EvalScript error.\" while touching zero " +
+          "Premiere APIs, the fault is somewhere in this file's own code. Steps 0–11 add exactly one construct at a " +
+          "time (return a plain object → a string literal → .length → JSON.stringify() → a charCodeAt loop → hex " +
+          "conversion → the real charCodeHexDump() → a bare JSON.parse() → the real tryJsonParse() → the real " +
+          "stripNullChars() → the real testRawBytesHelpers()). Run step 0, confirm it succeeds, then advance one " +
+          "step at a time — the first step that returns \"EvalScript error.\" instead of a JSON result is the exact " +
+          "breaking statement. See docs/CEP_BRIDGE_INVESTIGATION.md Part 11.",
+      ]
+    ),
+    el("div", { class: "row" }, [bisectStepLabel]),
+    el("div", { class: "row" }, [bisectRunBtn, bisectNextBtn]),
+    bisectResultBlock(cb.lastBisectResult),
   ]);
 }

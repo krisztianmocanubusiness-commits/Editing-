@@ -106,5 +106,8 @@ export const store = createStore({
     skipFileSave: false,
     selfTestRunning: false,
     lastSelfTestResult: null, // full testRawBytesHelpers() return value, or null — see src/ppro/cepBridge.js
+    bisectStep: 0,
+    bisectRunning: false,
+    lastBisectResult: null, // full bisectHostScript() return value, or null — see src/ppro/cepBridge.js
   },
 });

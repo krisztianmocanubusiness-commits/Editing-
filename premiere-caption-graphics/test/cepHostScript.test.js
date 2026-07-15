@@ -197,7 +197,13 @@ function extractInspectRawBytesFnSource() {
 
 function extractTestRawBytesHelpersFnSource() {
   const source = readHostScript();
-  const match = source.match(/\$\._captionStudioBridge\.testRawBytesHelpers = function[\s\S]*$/);
+  // Bound the match to just this function's body — from its definition up
+  // to (but not including) bisectHostScript, the next function defined in
+  // the file — so assertions like "never references app.project" can't
+  // accidentally fail (or pass) because of unrelated code/comments in a
+  // sibling function. Same pattern used for inspectSourceTextRawBytes's
+  // extraction helper above.
+  const match = source.match(/\$\._captionStudioBridge\.testRawBytesHelpers = function[\s\S]*?\n};\n/);
   assert.ok(match, "expected to find the testRawBytesHelpers function body");
   return match[0];
 }
@@ -331,4 +337,67 @@ test("hostscript.jsx stays ES3/ES5-compatible: no const/let, no arrow functions,
   assert.doesNotMatch(withoutComments, /\.codePointAt\s*\(/, "found String.prototype.codePointAt() — not guaranteed on ExtendScript's older engine");
   assert.doesNotMatch(withoutComments, /\.map\s*\(function|\.filter\s*\(function|\.reduce\s*\(function/, "found Array.prototype.map/filter/reduce — use a plain for loop instead");
   assert.doesNotMatch(withoutComments, /Object\.keys\s*\(/, "found Object.keys() — host object properties aren't reliably enumerable this way; use .reflect.properties instead (see dumpValueDeep)");
+});
+
+// --- bisectHostScript: incremental bisection to find the exact breaking
+// statement, per the user's explicit instruction to stop adding
+// diagnostics and instead test one addition at a time. See
+// docs/CEP_BRIDGE_INVESTIGATION.md Part 11.
+
+test('dispatch() routes the "bisectHostScript" command to $._captionStudioBridge.bisectHostScript', () => {
+  const source = readHostScript();
+  assert.match(source, /command\s*===\s*["']bisectHostScript["']/);
+  assert.match(source, /\$\._captionStudioBridge\.bisectHostScript\s*=\s*function\s*\(/);
+});
+
+function extractBisectFnSource() {
+  const source = readHostScript();
+  const match = source.match(/\$\._captionStudioBridge\.bisectHostScript = function[\s\S]*$/);
+  assert.ok(match, "expected to find the bisectHostScript function body");
+  return match[0];
+}
+
+test("bisectHostScript never touches app/project/sequence at any step (task 5)", () => {
+  const fnSource = extractBisectFnSource();
+  assert.doesNotMatch(fnSource, /app\.project/, "bisectHostScript must never reference app.project — it exists specifically to isolate the fault from Premiere host objects");
+  assert.doesNotMatch(fnSource, /\.activeSequence/);
+  assert.doesNotMatch(fnSource, /importMGT/);
+});
+
+test("bisectHostScript's step 0 returns a minimal object identical in shape to the already-working ping command", () => {
+  const fnSource = extractBisectFnSource();
+  assert.match(fnSource, /step === 0/);
+  assert.match(fnSource, /stepName:\s*"minimal object return \(same shape as ping\)"/);
+});
+
+test("bisectHostScript progresses through every requested incremental construct: a string literal, .length, JSON.stringify, a charCodeAt loop, hex conversion, the real charCodeHexDump/tryJsonParse/stripNullChars helpers, and finally the real testRawBytesHelpers command", () => {
+  const fnSource = extractBisectFnSource();
+  assert.match(fnSource, /var\s+s2\s*=\s*"\{\}";/, "step 2: string literal");
+  assert.match(fnSource, /var\s+len3\s*=\s*s3\.length;/, "step 3: .length");
+  assert.match(fnSource, /var\s+stringified4\s*=\s*JSON\.stringify\(s4\);/, "step 4: JSON.stringify");
+  assert.match(fnSource, /codes5\.push\(s5\.charCodeAt\(i5\)\);/, "step 5: charCodeAt loop");
+  assert.match(fnSource, /code6\.toString\(16\)/, "step 6: hex conversion");
+  assert.match(fnSource, /var\s+dump7\s*=\s*charCodeHexDump\("\{\}",\s*10\);/, "step 7: real charCodeHexDump()");
+  assert.match(fnSource, /JSON\.parse\("\{\}"\);/, "step 8: bare JSON.parse in try/catch");
+  assert.match(fnSource, /var\s+attempt9\s*=\s*tryJsonParse\("bisect",\s*"\{\}"\);/, "step 9: real tryJsonParse()");
+  assert.match(fnSource, /var\s+stripped10\s*=\s*stripNullChars\(/, "step 10: real stripNullChars()");
+  assert.match(fnSource, /\$\._captionStudioBridge\.testRawBytesHelpers\(\{\},\s*requestId\)/, "step 11: the real testRawBytesHelpers() command");
+});
+
+test("bisectHostScript tests exactly one new construct per step — never combines two untested features in a single step body", () => {
+  const fnSource = extractBisectFnSource();
+  // Each `if (step === N) { ... }` block, up through step 6 (the last
+  // step built from scratch rather than calling an already-defined real
+  // helper), should contain at most one "new" call/operator beyond what
+  // the previous step already covered. Concretely: step 2 shouldn't yet
+  // call .length or JSON.stringify; step 3 shouldn't yet call
+  // JSON.stringify or run a charCodeAt loop, etc. — checked by making
+  // sure each numbered step block is small (a handful of lines), which
+  // is what "one statement at a time" means in practice here.
+  const stepBlocks = fnSource.match(/if \(step === \d+\) \{[\s\S]*?\n    \}\n/g) || [];
+  assert.ok(stepBlocks.length >= 10, "expected at least steps 0-9 as separate, individually small if-blocks");
+  for (const block of stepBlocks) {
+    const lineCount = block.split("\n").length;
+    assert.ok(lineCount <= 12, `a bisect step block is unexpectedly large (${lineCount} lines) — each step should add only one construct:\n${block}`);
+  }
 });

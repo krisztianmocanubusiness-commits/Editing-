@@ -663,3 +663,98 @@ This agent has no live Premiere host access in this environment; the next
 real-host run of "Inspect Source Text Raw Bytes" and "Run Byte/JSON Helper
 Self-Test" will show, with direct evidence, exactly where in the pipeline
 the fault actually is.
+
+## Part 11: fifth real-host run — the self-test fails too; bisection instead of more diagnostics
+
+**Confirmed real-host result that changes the diagnosis:**
+`testRawBytesHelpers()` — the standalone self-test built in Part 10
+specifically to touch zero Premiere APIs — ALSO fails with the same
+non-JSON `Non-JSON response from ExtendScript: EvalScript error.`. Since
+this command never references `app.project`, `activeSequence`, any MOGRT,
+or any file I/O, the fault cannot be in Premiere-object handling or
+temp-file writes — it is somewhere in `hostscript.jsx`'s own code, most
+likely one of the string/JSON helpers this command shares with
+`inspectSourceTextRawBytes()` (`charCodeHexDump`, `tryJsonParse`,
+`stripNullChars`) or something about how those functions/the new
+top-level `STAGE_*` constants are declared.
+
+**Why more diagnostics wouldn't help, and bisection is the right move:**
+Every prior round added MORE code (more dumping, more stage tracking, more
+try/catch) — but if the fault is a genuine parse/compile-level problem in
+one specific statement, adding more code around it doesn't help find it,
+and can't be caught by try/catch at all if it's not a normal runtime
+exception. Per the user's explicit instruction, this round adds no new
+diagnostics — instead, `bisectHostScript()` isolates the exact breaking
+statement by testing exactly one incremental addition at a time, letting
+the next live-host run pinpoint it directly rather than guessing further.
+
+**`cep-bridge/jsx/hostscript.jsx`'s new `bisectHostScript(payload, requestId)`
+command** — `payload.step` (0–11) selects how much code runs; every step
+returns immediately, so no step ever executes more than the one construct
+it specifically tests:
+
+| Step | Tests |
+| --- | --- |
+| 0 | Return a minimal plain object — identical in shape to the already-confirmed-working `"ping"` command. If THIS fails, the fault is in `dispatch()`'s routing to a new command branch, not in any of the code below. |
+| 1 | Return a plain object with one added field. |
+| 2 | `var s = "{}";` — declare a short string literal. |
+| 3 | `var len = s.length;` — read `.length`. |
+| 4 | `JSON.stringify(s)` — stringify the string itself. |
+| 5 | A `charCodeAt()` loop — the core of `charCodeHexDump()`, written out inline. |
+| 6 | Hex conversion (`.toString(16)`) + a string-padding `while` loop — the rest of `charCodeHexDump()`'s logic, still inline. |
+| 7 | Call the REAL `charCodeHexDump()` helper directly. |
+| 8 | A bare `JSON.parse()` in `try`/`catch` — the core of `tryJsonParse()`. |
+| 9 | Call the REAL `tryJsonParse()` helper directly. |
+| 10 | Call the REAL `stripNullChars()` helper directly. |
+| 11 | Call the REAL `testRawBytesHelpers()` command function directly — the exact function that fails on the live host today. |
+
+Never references `app.project`/`activeSequence`/`importMGT` at any step
+(task 5) — consistent with the confirmed finding that Premiere APIs are
+not where the fault is. The whole function is wrapped in its own
+top-level `try`/`catch` too, tagging any normal catchable exception with
+`"bisect-step-N"` via the same `buildFatalFailure()` used elsewhere — but
+per the working theory below, the actual fault may not be a normal
+catchable exception at all.
+
+**Working theory (not confirmed — this agent has no live host access):**
+older JS engines with lazy/deferred per-function compilation can parse a
+file's overall structure (function boundaries, top-level statements)
+successfully at load time, while a genuine syntax-level problem *inside*
+one specific function's body isn't discovered until that function is
+first invoked. This would explain every observed fact simultaneously:
+`dispatch()`, `"ping"`, `createTextGraphic()`, and `probeSourceTextDeep()`
+all continue to work (the file's overall structure parses fine); a fault
+specific to `testRawBytesHelpers()`/`inspectSourceTextRawBytes()`/their
+shared helpers only surfaces when one of those is actually called; and it
+isn't caught by any `try`/`catch` — script-level or `dispatch()`'s own —
+because a deferred compile-time fault isn't a normal runtime exception. If
+this theory is right, `bisectHostScript()`'s steps 5 through 10 are
+exactly the ones capable of finding it, since they're the first point
+where each new construct is exercised in isolation.
+
+**UXP/UI side:**
+- `src/ppro/cepBridge.js` adds `bisectHostScript({log, step})` — same
+  reachability-check-then-command pattern as the other CEP entry points;
+  doesn't require a `.mogrt` path.
+- `src/ui/cepBridgePanel.js` adds a step number input (0–11) and two
+  buttons — "Run Bisect Step N" and "Run Bisect Step, Then Advance" (which
+  auto-increments the step only after a successful result) — rendering
+  each step's raw result or, on failure, the same `stage`/`errorLine`/
+  `errorFileName`/`errorStack` fields the hardening in Part 10 added.
+- `test/cepBridge.test.js` and `test/cepHostScript.test.js` add coverage:
+  the client function's request shape, and static regression checks that
+  `bisectHostScript()` is wired into `dispatch()`, never references
+  `app.project`/`activeSequence`/`importMGT`, that step 0 matches
+  `"ping"`'s shape, that every requested construct (steps 2 through 11) is
+  present in the right order, and that each step's `if` block stays small
+  (a structural proxy for "tests exactly one new thing").
+
+**What this run cannot answer without live-host access:** which step is
+the first to fail. Run step 0 first to confirm the baseline works, then
+advance one step at a time (or use "Run Bisect Step, Then Advance," which
+stops auto-advancing the moment a step fails) — the first step whose
+result is the raw `"EvalScript error."` string instead of a JSON result is
+the exact breaking statement, and its step number directly identifies
+which construct (a plain string operation, a specific helper function, or
+something about how these functions/constants are declared in the file)
+is the true root cause.

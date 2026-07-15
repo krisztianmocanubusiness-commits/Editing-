@@ -163,6 +163,77 @@ test("probeSourceTextDeep documents exactly where getValue() threw, on both the 
   assert.match(source, /readBackThrowLocation/);
 });
 
+// --- inspectSourceTextRawBytes: byte-level string inspection ---
+// See docs/CEP_BRIDGE_INVESTIGATION.md Part 9. Built to explain an
+// internally inconsistent real-host result (typeof "string", a preview
+// that looked like "{}", yet JSON.parse() failing / structuredKind
+// "none"). These checks guard: the file must be plain UTF-8 text (a
+// literal NUL byte accidentally landed in this file once during
+// development and silently corrupted it — see the commit history), the
+// new command must be wired in, must never call setValue(), and must
+// perform the specific byte-level checks the task asked for.
+
+test("hostscript.jsx contains no literal NUL bytes (must be clean UTF-8 text, not corrupted by an accidental binary character)", () => {
+  const buffer = fs.readFileSync(HOSTSCRIPT_PATH);
+  assert.equal(buffer.includes(0x00), false, "found a literal NUL byte in hostscript.jsx — it must only ever use the \\u0000 escape sequence in source, never an actual NUL character");
+});
+
+test('dispatch() routes the "inspectSourceTextRawBytes" command to $._captionStudioBridge.inspectSourceTextRawBytes', () => {
+  const source = readHostScript();
+  assert.match(source, /command\s*===\s*["']inspectSourceTextRawBytes["']/);
+  assert.match(source, /\$\._captionStudioBridge\.inspectSourceTextRawBytes\s*=\s*function\s*\(/);
+});
+
+function extractInspectRawBytesFnSource() {
+  const source = readHostScript();
+  // This function is the last one defined in the file, so bound the match
+  // to just its body (from its definition to EOF) — matches the same
+  // pattern already used for probeSourceTextDeep's isolation above.
+  const match = source.match(/\$\._captionStudioBridge\.inspectSourceTextRawBytes = function[\s\S]*$/);
+  assert.ok(match, "expected to find the inspectSourceTextRawBytes function body");
+  return match[0];
+}
+
+test("inspectSourceTextRawBytes never calls setValue() anywhere in its body", () => {
+  const fnSource = extractInspectRawBytesFnSource();
+  assert.doesNotMatch(fnSource, /\.setValue\s*\(/, "inspectSourceTextRawBytes must never call setValue() — read-only byte inspection only");
+});
+
+test("inspectSourceTextRawBytes logs the exact string length, JSON.stringify of the raw value, and a full character code + hex dump", () => {
+  const source = readHostScript();
+  const fnSource = extractInspectRawBytesFnSource();
+  assert.match(fnSource, /result\.rawStringLength\s*=\s*rawValue\.length/);
+  assert.match(fnSource, /result\.jsonStringifyOfRawValue\s*=\s*JSON\.stringify\(rawValue\)/);
+  assert.match(source, /function\s+charCodeHexDump\s*\(/, "expected a top-level charCodeHexDump() helper");
+  assert.match(fnSource, /result\.charCodeDump\s*=\s*charCodeHexDump\(/);
+});
+
+test("inspectSourceTextRawBytes logs the first and last 32 characters separately", () => {
+  const fnSource = extractInspectRawBytesFnSource();
+  assert.match(fnSource, /result\.first32\s*=/);
+  assert.match(fnSource, /result\.last32\s*=/);
+});
+
+test("inspectSourceTextRawBytes attempts JSON.parse on the raw value plus trimmed/BOM-stripped/null-stripped/fully-normalized variants, each capturing the exact error and position", () => {
+  const source = readHostScript();
+  assert.match(source, /function\s+tryJsonParse\s*\(/, "expected a tryJsonParse() helper capturing ok/error/errorPosition");
+  assert.match(source, /posMatch\s*=\s*entry\.error\.match\(\/position/i, "expected the failure position to be parsed out of the JSON.parse error message");
+  const fnSource = extractInspectRawBytesFnSource();
+  assert.match(fnSource, /tryJsonParse\(\s*["']raw["']/);
+  assert.match(fnSource, /tryJsonParse\(\s*["']trimmed["']/);
+  assert.match(fnSource, /tryJsonParse\(\s*["']bom-stripped["']/);
+  assert.match(fnSource, /tryJsonParse\(\s*["']null-stripped["']/);
+  assert.match(fnSource, /result\.jsonParseAttempts\s*=\s*\[/);
+});
+
+test("inspectSourceTextRawBytes saves the full result to a JSON file via the documented ExtendScript File/Folder API", () => {
+  const source = readHostScript();
+  assert.match(source, /function\s+saveDiagnosticJson\s*\(/);
+  assert.match(source, /new File\(Folder\.temp\.fsName/, "expected the diagnostic file to be written via Folder.temp — ExtendScript's documented temp-folder global");
+  const fnSource = extractInspectRawBytesFnSource();
+  assert.match(fnSource, /saveDiagnosticJson\(/);
+});
+
 test("hostscript.jsx stays ES3/ES5-compatible (no const/let/arrow functions/template literals) since ExtendScript can't parse modern syntax", () => {
   const source = readHostScript();
   // Strip line/block comments and string contents loosely before scanning,

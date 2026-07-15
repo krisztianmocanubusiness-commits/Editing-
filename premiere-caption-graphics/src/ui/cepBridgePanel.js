@@ -2,7 +2,13 @@ import { el } from "./components/dom.js";
 import { store } from "../state/store.js";
 import { log } from "../util/log.js";
 import { getUxp, isHosted } from "../ppro/client.js";
-import { testCepWriteProof, probeSourceTextDeep, CEP_WRITE_PROOF_SENTINEL, CEP_SOURCE_TEXT_PROBE_SENTINEL } from "../ppro/cepBridge.js";
+import {
+  testCepWriteProof,
+  probeSourceTextDeep,
+  inspectSourceTextRawBytes,
+  CEP_WRITE_PROOF_SENTINEL,
+  CEP_SOURCE_TEXT_PROBE_SENTINEL,
+} from "../ppro/cepBridge.js";
 
 function patchCepBridge(patch) {
   store.set((s) => ({ cepBridge: { ...s.cepBridge, ...patch } }));
@@ -58,6 +64,26 @@ async function runSourceTextProbe() {
     patchCepBridge({ lastProbeResult: { ok: false, step: "crash" } });
   } finally {
     patchCepBridge({ probeRunning: false });
+  }
+}
+
+async function runRawBytesInspection() {
+  const { mogrtPath } = store.getState().cepBridge;
+  if (!mogrtPath) {
+    log("Choose a .mogrt to inspect first.", "error");
+    return;
+  }
+  patchCepBridge({ rawBytesRunning: true, lastRawBytesResult: null });
+  try {
+    const result = await inspectSourceTextRawBytes({ mogrtPath, log });
+    console.error("[Caption Graphics Studio] CEP Source Text Raw Byte Inspection result:", JSON.stringify(result, null, 2));
+    patchCepBridge({ lastRawBytesResult: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] CEP Source Text Raw Byte Inspection crashed:", err);
+    log(`CEP Source Text Raw Byte Inspection crashed unexpectedly: ${err.message || err}`, "error");
+    patchCepBridge({ lastRawBytesResult: { ok: false, step: "crash" } });
+  } finally {
+    patchCepBridge({ rawBytesRunning: false });
   }
 }
 
@@ -263,6 +289,128 @@ function probeResultBlock(result) {
   return el("div", { class: "inspector-results" }, lines);
 }
 
+function rawBytesResultBlock(result) {
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    const lines = [
+      el("div", { class: "status-line log-error", text: `✗ Source Text Raw Byte Inspection failed${stepLabel}${result.error ? `: ${result.error}` : ""}` }),
+    ];
+    if (Array.isArray(result.beforeClipCounts) || Array.isArray(result.afterClipCounts)) {
+      lines.push(
+        el("div", {
+          class: "status-line",
+          text: `Clip counts per video track — before: [${(result.beforeClipCounts ?? []).join(", ")}], after: [${(result.afterClipCounts ?? []).join(", ")}].`,
+        })
+      );
+    }
+    const diag = diagnosticsBlock(result.diagnostics);
+    if (diag) lines.push(diag);
+    return el("div", { class: "inspector-results" }, lines);
+  }
+
+  const r = result.result ?? {};
+  const lines = [
+    el("div", {
+      class: "status-line log-success",
+      text: `✓ Clip created: "${r.trackItemName ?? "n/a"}" on video track ${r.detectedTrackIndex ?? "unknown"} via "${r.detectionMethod ?? "n/a"}".`,
+    }),
+  ];
+
+  if (!r.sourceTextFound) {
+    lines.push(el("div", { class: "status-line log-warn", text: '⚠ No "Source Text" param was found on this clip\'s components.' }));
+    const diag0 = diagnosticsBlock(r.diagnostics);
+    if (diag0) lines.push(diag0);
+    return el("div", { class: "inspector-results" }, lines);
+  }
+
+  if (r.getValueThrew) {
+    lines.push(
+      el("div", {
+        class: "status-line log-error",
+        text: `✗ getValue() THREW at: ${r.getValueThrowLocation ?? "n/a"} — ${r.getValueError ?? "unknown error"}${r.getValueErrorLine != null ? ` (line ${r.getValueErrorLine})` : ""}`,
+      })
+    );
+    const diagT = diagnosticsBlock(r.diagnostics);
+    if (diagT) lines.push(diagT);
+    return el("div", { class: "inspector-results" }, lines);
+  }
+
+  lines.push(el("div", { class: "status-line", text: `getValue() typeof: "${r.getValueRawType ?? "n/a"}".` }));
+
+  if (r.getValueRawType !== "string") {
+    lines.push(
+      el("div", {
+        class: "status-line log-warn",
+        text: `getValue() did not return a string — byte-level analysis skipped. Value: ${r.nonStringJsonStringify ?? "n/a"}`,
+      })
+    );
+    const diagNs = diagnosticsBlock(r.diagnostics);
+    if (diagNs) lines.push(diagNs);
+    return el("div", { class: "inspector-results" }, lines);
+  }
+
+  lines.push(
+    el("div", { class: "status-line", text: `Raw string length: ${r.rawStringLength ?? "n/a"}.` }),
+    el("div", { class: "status-line", text: `JSON.stringify(rawValue): ${r.jsonStringifyOfRawValue ?? "n/a"}` }),
+    el("div", { class: "status-line", text: `First 32 chars: ${JSON.stringify(r.first32 ?? "")} | Last 32 chars: ${JSON.stringify(r.last32 ?? "")}` }),
+    el("div", {
+      class: "status-line",
+      text: `Has UTF-8 BOM: ${String(r.hasUtf8Bom)}. Has null character(s): ${String(r.hasNullCharacters)}.`,
+    })
+  );
+
+  const charDump = jsonDetailsBlock(
+    `Full character code dump (${r.charCodeDump?.length ?? 0} char(s)${r.charCodeDumpTruncated ? ", truncated" : ""})`,
+    r.charCodeDump
+  );
+  if (charDump) lines.push(charDump);
+
+  if (Array.isArray(r.jsonParseAttempts)) {
+    lines.push(
+      el(
+        "div",
+        { class: "status-line" },
+        [
+          "JSON.parse() attempts: " +
+            r.jsonParseAttempts
+              .map((a) => `${a.label}=${a.ok ? "OK" : `FAIL(${a.error}${a.errorPosition != null ? ` @${a.errorPosition}` : ""})`}`)
+              .join("; "),
+        ]
+      ),
+      el("div", {
+        class: `status-line ${r.isValidJsonAfterNormalization ? "log-success" : "log-warn"}`,
+        text: r.isValidJsonAfterNormalization
+          ? "✓ Valid JSON after full normalization (BOM-stripped + null-stripped + trimmed)."
+          : "✗ Still not valid JSON even after full normalization.",
+      })
+    );
+    const attemptsDump = jsonDetailsBlock("Full JSON.parse() attempts (all 5)", r.jsonParseAttempts);
+    if (attemptsDump) lines.push(attemptsDump);
+  }
+
+  if (r.savedDiagnosticFile) {
+    lines.push(
+      el("div", {
+        class: `status-line ${r.savedDiagnosticFile.ok ? "log-success" : "log-warn"}`,
+        text: r.savedDiagnosticFile.ok
+          ? `✓ Full diagnostic saved to: ${r.savedDiagnosticFile.path}`
+          : `⚠ Could not save diagnostic file: ${r.savedDiagnosticFile.error}`,
+      })
+    );
+  }
+
+  lines.push(
+    el("div", {
+      class: "status-line",
+      text: "This clip was NOT auto-removed — check the Premiere timeline directly to visually confirm, then delete it by hand. See cep-bridge/README.md.",
+    })
+  );
+  const diag = diagnosticsBlock(r.diagnostics);
+  if (diag) lines.push(diag);
+  return el("div", { class: "inspector-results" }, lines);
+}
+
 export function renderCepBridgePanel(onChange) {
   const state = store.getState();
   const cb = state.cepBridge;
@@ -271,7 +419,7 @@ export function renderCepBridgePanel(onChange) {
   const runBtn = el("button", {
     class: "btn btn-primary",
     text: cb.running ? "Testing…" : "Test CEP Write (POC)",
-    disabled: !isHosted() || cb.running || cb.probeRunning || !cb.mogrtPath || undefined,
+    disabled: !isHosted() || cb.running || cb.probeRunning || cb.rawBytesRunning || !cb.mogrtPath || undefined,
     onClick: async () => {
       await runWriteProof();
       onChange();
@@ -280,9 +428,18 @@ export function renderCepBridgePanel(onChange) {
   const probeBtn = el("button", {
     class: "btn btn-primary",
     text: cb.probeRunning ? "Probing…" : "Probe Source Text (deep, read-first)",
-    disabled: !isHosted() || cb.running || cb.probeRunning || !cb.mogrtPath || undefined,
+    disabled: !isHosted() || cb.running || cb.probeRunning || cb.rawBytesRunning || !cb.mogrtPath || undefined,
     onClick: async () => {
       await runSourceTextProbe();
+      onChange();
+    },
+  });
+  const rawBytesBtn = el("button", {
+    class: "btn btn-primary",
+    text: cb.rawBytesRunning ? "Inspecting…" : "Inspect Source Text Raw Bytes",
+    disabled: !isHosted() || cb.running || cb.probeRunning || cb.rawBytesRunning || !cb.mogrtPath || undefined,
+    onClick: async () => {
+      await runRawBytesInspection();
       onChange();
     },
   });
@@ -321,5 +478,19 @@ export function renderCepBridgePanel(onChange) {
     ),
     el("div", { class: "row" }, [probeBtn]),
     probeResultBlock(cb.lastProbeResult),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Byte-level inspection: built after a probe run reported typeof \"string\" for getValue() with a preview that " +
+          'looked like "{}", yet JSON.parse() failed. Logs the exact string length, JSON.stringify() of the whole ' +
+          "string, every character code + hex, the first/last 32 characters, and five JSON.parse() attempts (raw, " +
+          "trimmed, BOM-stripped, null-stripped, fully-normalized) with exact failure messages/positions. Never " +
+          "calls setValue(). Also saves the full result to a JSON file in the OS temp folder. See " +
+          "docs/CEP_BRIDGE_INVESTIGATION.md Part 9.",
+      ]
+    ),
+    el("div", { class: "row" }, [rawBytesBtn]),
+    rawBytesResultBlock(cb.lastRawBytesResult),
   ]);
 }

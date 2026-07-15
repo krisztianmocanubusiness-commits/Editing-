@@ -101,5 +101,7 @@ export const store = createStore({
     lastResult: null, // full testCepWriteProof() return value, or null — see src/ppro/cepBridge.js
     probeRunning: false,
     lastProbeResult: null, // full probeSourceTextDeep() return value, or null — see src/ppro/cepBridge.js
+    rawBytesRunning: false,
+    lastRawBytesResult: null, // full inspectSourceTextRawBytes() return value, or null — see src/ppro/cepBridge.js
   },
 });

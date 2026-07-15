@@ -454,3 +454,97 @@ attempted — `result.sourceTextWriteOk`/`result.beforeAfterDiff` will show,
 with evidence, exactly what Premiere stores for native graphic text and
 whether `ComponentParam.setValue()` can change it. That is what this
 diagnostic exists to surface, not assume.
+
+## Part 9: third real-host run — an internally inconsistent probe result; byte-level Source Text inspection
+
+**Confirmed real-host anomaly report:** a `probeSourceTextDeep()` run found
+the Source Text param, `getValue()` succeeded, `typeof` the result was
+`"string"`, the UI's rendered preview of that string *looked like* `"{}"`,
+but the same result also said `JSON.parse()` failed and classified the
+shape as `structuredKind: "none"`. Those two facts don't fit together: if
+the string really were exactly the two characters `{}`, `JSON.parse()`
+would succeed. Something about the string's actual bytes doesn't match
+what its rendered preview showed — a leading UTF-8 BOM, embedded null
+characters, surrounding whitespace, or non-printing characters are all
+things a casual preview can hide but that break `JSON.parse()`.
+
+Rather than guess at `setValue()` shapes against a string that isn't fully
+understood, this round adds a byte-level diagnostic,
+`inspectSourceTextRawBytes()`, that answers the anomaly with hard evidence
+instead of another API experiment.
+
+**What `cep-bridge/jsx/hostscript.jsx`'s new `inspectSourceTextRawBytes()`
+command does** (reuses `createTextGraphic()`/`probeSourceTextDeep()`'s
+track resolution + three-tier clip detection to insert and locate the
+clip and its Source Text param — insertion is solved, so this doesn't
+re-solve it — then, once `getValue()` succeeds and returns a string):
+
+1. **Exact string length** — `rawValue.length`.
+2. **`JSON.stringify(rawValue)`** — the single most revealing check here:
+   `JSON.stringify()` escapes control characters, the BOM, and anything
+   else invisible in a plain rendered preview into visible `\uXXXX`
+   sequences.
+3. **Every character code + hex value** — `charCodeHexDump()`, one entry
+   per character (`{index, char, code, hex}`), bounded to 4000 characters
+   (`charCodeDumpTruncated` reports if the real string is longer).
+4. **First and last 32 characters, logged separately** — `first32`/
+   `last32`, plus their own char-code dumps.
+5. **`JSON.parse(rawValue)`** wrapped in `tryJsonParse()`, which captures
+   the exact thrown message, best-effort parses a character position out
+   of that message (`/position\s+(\d+)/i` — ExtendScript's JSON
+   implementation doesn't expose a structured position field, only prose),
+   and `Error.line` where available.
+6. Four more `tryJsonParse()` attempts against normalized variants:
+   `rawValue.trim()` (falling back to a manual regex trim if
+   `String.prototype.trim()` is unavailable on this ExtendScript engine —
+   logged either way), a UTF-8-BOM-stripped copy (`hasUtf8Bom` checks
+   `charCodeAt(0) === 0xfeff`), a null-character-stripped copy
+   (`hasNullCharacters` checks for `\u0000`), and a fully-normalized copy
+   (all three combined) — `result.isValidJsonAfterNormalization` reports
+   whether that last, most-permissive attempt succeeded.
+7. **Never calls `setValue()`** — this command has no write path at all.
+8. Every step above is also pushed to `result.diagnostics` as a readable
+   log line.
+9. **Saves the complete result to a JSON file** via `saveDiagnosticJson()`
+   — ExtendScript's documented `File`/`Folder` API, writing to
+   `Folder.temp.fsName + "/caption-studio-source-text-raw-dump.json"` —
+   in addition to returning it over the bridge; `result.savedDiagnosticFile`
+   reports the saved path (or the write error, non-fatally).
+
+**A real bug this diagnostic's own development caught:** while first
+writing the null-character-stripping logic, a literal NUL byte was
+accidentally embedded directly in `hostscript.jsx`'s source (instead of
+the intended `\u0000` escape sequence) — caught by `file
+cep-bridge/jsx/hostscript.jsx` reporting the file as non-text/binary
+immediately after the edit, and by `grep` matching it as a "binary file".
+Fixed by replacing the literal NUL bytes with proper `\u0000` escapes
+before this was ever committed. `test/cepHostScript.test.js` now has a
+dedicated regression test (`hostscript.jsx contains no literal NUL
+bytes...`) reading the file as a raw buffer and asserting no `0x00` byte
+exists, so this specific corruption can't silently reappear.
+
+**UXP/UI side:**
+- `src/ppro/cepBridge.js` adds `inspectSourceTextRawBytes(opts)` — same
+  reachability-check-then-command pattern as the other two CEP entry
+  points, calling the `"inspectSourceTextRawBytes"` host command with
+  `{mogrtPath, videoTrackIndex?}` (no text/duration fields — this
+  diagnostic doesn't write anything).
+- `src/ui/cepBridgePanel.js` adds a third button, "Inspect Source Text Raw
+  Bytes", rendering the exact length, `JSON.stringify()` output, first/last
+  32 characters, BOM/null-character flags, the full character-code dump
+  (collapsible), all five `JSON.parse()` attempts with their outcomes, the
+  final normalized-validity verdict, and the saved-file path.
+- `test/cepBridge.test.js` and `test/cepHostScript.test.js` add coverage:
+  the client function's request shape/gating (no text/duration fields sent,
+  same never-hard-code-track-0 convention), and static regression checks
+  that `inspectSourceTextRawBytes()` is wired into `dispatch()`, never
+  calls `setValue()` anywhere in its body, performs each of the specific
+  byte-level checks above, and that the file itself stays clean UTF-8 text.
+
+**What is still unverified:** as with every prior round, this has not yet
+been run against a live Premiere host by this agent. The next live run's
+`result.charCodeDump`, `result.jsonStringifyOfRawValue`, and
+`result.jsonParseAttempts` will show, with byte-level evidence, exactly
+what `getValue()` returns and why it wasn't parsing as JSON — the specific
+question this diagnostic exists to answer before any further `setValue()`
+experiments are attempted.

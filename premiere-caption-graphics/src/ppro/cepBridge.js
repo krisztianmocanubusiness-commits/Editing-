@@ -276,3 +276,63 @@ export async function probeSourceTextDeep(opts) {
   );
   return result;
 }
+
+/**
+ * Byte-level inspection of the exact string getValue() returns for Source
+ * Text — built to explain an internally inconsistent real-host result
+ * from probeSourceTextDeep() (typeof "string", a preview that LOOKED like
+ * "{}", but JSON.parse() failing / structuredKind "none"). Never calls
+ * setValue(). See cep-bridge/jsx/hostscript.jsx's
+ * inspectSourceTextRawBytes() for exactly what runs host-side (exact
+ * length, JSON.stringify(), every character code + hex, first/last 32
+ * characters, and JSON.parse() attempts against the raw string plus
+ * trimmed/BOM-stripped/null-stripped/fully-normalized variants — each
+ * with the exact failure message + position captured), and
+ * docs/CEP_BRIDGE_INVESTIGATION.md Part 9 for why this exists.
+ *
+ * Deliberately does NOT clean up the created clip — same rationale as
+ * testCepWriteProof(); see cep-bridge/README.md.
+ *
+ * @param {Object} opts
+ * @param {string} opts.mogrtPath
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {number} [opts.videoTrackIndex]
+ * @param {number} [opts.timeoutMs]
+ */
+export async function inspectSourceTextRawBytes(opts) {
+  const { mogrtPath, log, videoTrackIndex, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+
+  log("════ CEP Source Text Raw Byte Inspection — start ════", "info");
+
+  if (!mogrtPath) {
+    log("✗ No .mogrt selected.", "error");
+    return { ok: false, step: "mogrt-path" };
+  }
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const resolvedVideoTrackIndex =
+    typeof videoTrackIndex === "number" ? videoTrackIndex : await resolveTopVideoTrackIndexForCep(log);
+
+  const payload = { mogrtPath };
+  if (typeof resolvedVideoTrackIndex === "number") payload.videoTrackIndex = resolvedVideoTrackIndex;
+
+  const result = await callCepBridge("inspectSourceTextRawBytes", payload, { timeoutMs, log });
+
+  log(
+    result.ok
+      ? "════ CEP Source Text Raw Byte Inspection — finished ════"
+      : "════ CEP Source Text Raw Byte Inspection — finished with errors ════",
+    result.ok ? "success" : "error"
+  );
+  return result;
+}

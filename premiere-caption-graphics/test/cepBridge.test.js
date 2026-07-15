@@ -6,6 +6,7 @@ import {
   checkCepBridgeHealth,
   testCepWriteProof,
   probeSourceTextDeep,
+  inspectSourceTextRawBytes,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../src/ppro/cepBridge.js";
@@ -294,4 +295,77 @@ test("probeSourceTextDeep forwards an explicit videoTrackIndex and newTextValue 
   );
   assert.equal(capturedPayload.videoTrackIndex, 12);
   assert.equal(capturedPayload.newTextValue, "__CUSTOM__");
+});
+
+// --- inspectSourceTextRawBytes ---
+
+test("inspectSourceTextRawBytes returns step:mogrt-path without calling fetch at all when no mogrtPath is given", async () => {
+  let fetchCalled = false;
+  await withFetch(
+    async () => {
+      fetchCalled = true;
+      return fakeJsonResponse(200, { ok: true });
+    },
+    async () => {
+      const result = await inspectSourceTextRawBytes({ mogrtPath: "", log: noopLog });
+      assert.equal(result.ok, false);
+      assert.equal(result.step, "mogrt-path");
+    }
+  );
+  assert.equal(fetchCalled, false);
+});
+
+test("inspectSourceTextRawBytes returns step:bridge-unavailable and never calls /command when the health check fails", async () => {
+  const calledUrls = [];
+  await withFetch(
+    async (url) => {
+      calledUrls.push(url);
+      throw new Error("connect ECONNREFUSED");
+    },
+    async () => {
+      const result = await inspectSourceTextRawBytes({ mogrtPath: "/x.mogrt", log: noopLog });
+      assert.equal(result.ok, false);
+      assert.equal(result.step, "bridge-unavailable");
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health"]);
+});
+
+test("inspectSourceTextRawBytes calls the inspectSourceTextRawBytes host command with just mogrtPath (no text/duration fields) and forwards the result; videoTrackIndex omitted when unresolvable", async () => {
+  const calledUrls = [];
+  let capturedCommand = null;
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      calledUrls.push(url);
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      const body = JSON.parse(init.body);
+      capturedCommand = body.command;
+      capturedPayload = body.payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: { rawStringLength: 2 } });
+    },
+    async () => {
+      const result = await inspectSourceTextRawBytes({ mogrtPath: "/x.mogrt", log: noopLog });
+      assert.equal(result.ok, true);
+      assert.equal(result.result.rawStringLength, 2);
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health", "http://localhost:3010/command"]);
+  assert.equal(capturedCommand, "inspectSourceTextRawBytes");
+  assert.deepEqual(capturedPayload, { mogrtPath: "/x.mogrt" });
+});
+
+test("inspectSourceTextRawBytes forwards an explicit videoTrackIndex verbatim without trying to resolve one", async () => {
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      capturedPayload = JSON.parse(init.body).payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: {} });
+    },
+    async () => {
+      await inspectSourceTextRawBytes({ mogrtPath: "/x.mogrt", log: noopLog, videoTrackIndex: 12 });
+    }
+  );
+  assert.equal(capturedPayload.videoTrackIndex, 12);
 });

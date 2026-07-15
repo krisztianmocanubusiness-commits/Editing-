@@ -99,5 +99,7 @@ export const store = createStore({
     mogrtPath: "",
     running: false,
     lastResult: null, // full testCepWriteProof() return value, or null — see src/ppro/cepBridge.js
+    probeRunning: false,
+    lastProbeResult: null, // full probeSourceTextDeep() return value, or null — see src/ppro/cepBridge.js
   },
 });

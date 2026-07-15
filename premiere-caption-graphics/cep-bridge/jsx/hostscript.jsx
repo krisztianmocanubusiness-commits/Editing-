@@ -41,6 +41,8 @@ $._captionStudioBridge.dispatch = function (requestJsonString) {
       };
     } else if (command === "createTextGraphic") {
       response = $._captionStudioBridge.createTextGraphic(payload, requestId);
+    } else if (command === "probeSourceTextDeep") {
+      response = $._captionStudioBridge.probeSourceTextDeep(payload, requestId);
     } else {
       response = { ok: false, requestId: requestId, error: "Unknown command: " + command };
     }
@@ -429,6 +431,687 @@ $._captionStudioBridge.createTextGraphic = function (payload, requestId) {
     result.sourceTextReadBack = sourceTextParam.getValue();
   } catch (err) {
     result.sourceTextReadBackError = err && err.message ? err.message : String(err);
+  }
+
+  result.diagnostics = diagnostics;
+  return { ok: true, requestId: requestId, result: result };
+};
+
+// --- Deep Source Text parameter introspection (read-before-write) ---
+//
+// Real-host breakthrough (see docs/CEP_BRIDGE_INVESTIGATION.md Part 8):
+// insertion is solved — importMGT() correctly lands the MOGRT on the
+// resolved top video track, and the inserted graphic visibly shows its
+// default "Hello World" text. The only remaining unknown is what shape
+// ComponentParam.getValue()/.setValue() actually use for that visible
+// text. probeSourceTextDeep() (below) answers that with evidence before
+// attempting any more blind setValue() calls: it dumps everything
+// reflect-visible about the Source Text ComponentParam and about
+// getValue()'s return value BEFORE ever calling setValue(), and only
+// attempts a write — a targeted, evidence-based one — if that dump
+// reveals a genuinely constructible (plain-object or JSON-string) shape
+// with an identifiable text-like field.
+//
+// GROUNDING: ExtendScript host object properties (like ComponentParam's)
+// are typically NOT enumerable via plain `for...in` — the documented,
+// reliable way to enumerate them is the built-in ExtendScript Reflection
+// Interface: `value.reflect` returns a ReflectionObject with `.name`
+// (class name), `.properties` (Array of ReflectionInfo, each with
+// `.name`/`.dataType`/`.type`), and `.methods` (Array of ReflectionInfo,
+// each with `.name`/`.arguments`) — see Adobe's JavaScript Tools Guide,
+// "ExtendScript Reflection Interface" section. `.type` reports
+// "readonly"/"readwrite"/"createonly"/"method", but Adobe's own developer
+// community has documented cases (After Effects) where a property reports
+// "readwrite" yet is still actually read-only at write time — so `.type`
+// here is informational only, every read AND every write below stays
+// wrapped in try/catch regardless of what `.type` claims.
+
+// Bound the recursive dump so a deeply-nested or self-referential host
+// object graph can't hang the ExtendScript engine or return a
+// multi-megabyte JSON payload through evalScript.
+var DUMP_MAX_DEPTH = 5;
+var DUMP_NODE_BUDGET = 400;
+var DUMP_MAX_ARRAY_ITEMS = 30;
+var DUMP_MAX_TEXT_FIELD_MATCHES = 40;
+
+function isArrayLikeValue(value) {
+  try {
+    return Object.prototype.toString.call(value) === "[object Array]";
+  } catch (e) {
+    return false;
+  }
+}
+
+function isHostObjectWithReflect(value) {
+  try {
+    return typeof value === "object" && value !== null && typeof value.reflect !== "undefined" && typeof value.reflect.properties !== "undefined";
+  } catch (e) {
+    return false;
+  }
+}
+
+function refAlreadyVisited(visitedRefs, value) {
+  for (var i = 0; i < visitedRefs.length; i++) {
+    if (visitedRefs[i] === value) return true;
+  }
+  return false;
+}
+
+/**
+ * Recursively dumps ANY value — primitive, plain object, array, or
+ * ExtendScript host object — into a plain, JSON-safe JS structure.
+ * Host objects are enumerated via `.reflect` (see grounding note above);
+ * plain (non-host) objects fall back to for...in, since they don't have a
+ * meaningful .reflect. Depth/node-count/array-length are all bounded.
+ */
+function dumpValueDeep(value, depth, visitedRefs, budget) {
+  if (typeof value === "undefined") return "undefined";
+  if (value === null) return null;
+  if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") return value;
+  if (typeof value === "function") return "[function]";
+
+  budget.count = budget.count + 1;
+  if (budget.count > DUMP_NODE_BUDGET) return "[dump truncated: node budget exceeded]";
+  if (depth > DUMP_MAX_DEPTH) return "[max depth reached]";
+  if (refAlreadyVisited(visitedRefs, value)) return "[circular/repeated reference]";
+  visitedRefs.push(value);
+
+  if (isArrayLikeValue(value)) {
+    var arr = [];
+    var len = 0;
+    try { len = value.length; } catch (eLen) { return "[array: could not read length: " + (eLen.message || eLen) + "]"; }
+    var cap = Math.min(len, DUMP_MAX_ARRAY_ITEMS);
+    for (var i = 0; i < cap; i++) {
+      var item;
+      try { item = value[i]; } catch (eItem) { item = "[error reading index " + i + ": " + (eItem.message || eItem) + "]"; }
+      arr.push(dumpValueDeep(item, depth + 1, visitedRefs, budget));
+    }
+    if (len > cap) arr.push("[... " + (len - cap) + " more item(s) truncated]");
+    return arr;
+  }
+
+  if (isHostObjectWithReflect(value)) {
+    var out = { __hostObjectClass: null, __reflectProperties: [], __reflectMethods: [] };
+    try { out.__hostObjectClass = value.reflect.name; } catch (eName) {}
+    var propNames = [];
+    try {
+      var props = value.reflect.properties;
+      for (var p = 0; p < props.length; p++) {
+        var pname = null, pdt = null, ptype = null;
+        try { pname = props[p].name; } catch (ePn) {}
+        try { pdt = props[p].dataType; } catch (ePd) {}
+        try { ptype = props[p].type; } catch (ePt) {}
+        out.__reflectProperties.push({ name: pname, dataType: pdt, type: ptype });
+        if (pname && pname !== "reflect") propNames.push(pname);
+      }
+    } catch (eProps) {
+      out.__reflectPropertiesError = eProps && eProps.message ? eProps.message : String(eProps);
+    }
+    try {
+      var methods = value.reflect.methods;
+      for (var m = 0; m < methods.length; m++) {
+        var mname = null, margs = [];
+        try { mname = methods[m].name; } catch (eMn) {}
+        try {
+          var margsRaw = methods[m].arguments;
+          for (var a = 0; a < margsRaw.length; a++) {
+            var an = null;
+            try { an = margsRaw[a].name; } catch (eAn) {}
+            margs.push(an);
+          }
+        } catch (eArgs) {}
+        out.__reflectMethods.push({ name: mname, arguments: margs });
+      }
+    } catch (eMethods) {
+      out.__reflectMethodsError = eMethods && eMethods.message ? eMethods.message : String(eMethods);
+    }
+    for (var n = 0; n < propNames.length; n++) {
+      var key = propNames[n];
+      var fieldValue;
+      try {
+        fieldValue = value[key];
+      } catch (eRead) {
+        out[key] = "[error reading property: " + (eRead.message || eRead) + "]";
+        continue;
+      }
+      out[key] = dumpValueDeep(fieldValue, depth + 1, visitedRefs, budget);
+    }
+    return out;
+  }
+
+  // Plain object, or a host object whose .reflect didn't work — fall back
+  // to for...in (works for plain JS objects; for host objects it usually
+  // yields nothing, which is itself informative and gets reported below).
+  var plain = {};
+  var sawAnyKey = false;
+  try {
+    for (var k in value) {
+      sawAnyKey = true;
+      var v;
+      try { v = value[k]; } catch (eFor) { v = "[error reading property '" + k + "': " + (eFor.message || eFor) + "]"; }
+      plain[k] = dumpValueDeep(v, depth + 1, visitedRefs, budget);
+    }
+  } catch (eEnum) {
+    return "[object: for...in enumeration threw: " + (eEnum.message || eEnum) + "]";
+  }
+  if (!sawAnyKey) return "[object: no enumerable properties via for...in, and no working .reflect]";
+  return plain;
+}
+
+var TEXT_LIKE_FIELD_NAME_PATTERN = /text|value|string|content|run/i;
+
+/**
+ * Walks an already-dumped (plain, JSON-safe) tree looking for keys whose
+ * NAME suggests they might hold the visible text — textEditValue,
+ * fontTextRunLength, text, value, runs, etc. — without assuming any one
+ * of them is THE answer. Records the live parent object + key too (not
+ * just a path string) so a caller can mutate the exact field directly.
+ */
+function collectTextLikeFields(node, pathPrefix, out, depth) {
+  if (out.length >= DUMP_MAX_TEXT_FIELD_MATCHES) return;
+  if (depth > DUMP_MAX_DEPTH) return;
+  if (node === null || typeof node !== "object") return;
+  if (isArrayLikeValue(node)) {
+    for (var i = 0; i < node.length; i++) {
+      if (out.length >= DUMP_MAX_TEXT_FIELD_MATCHES) return;
+      collectTextLikeFields(node[i], pathPrefix + "[" + i + "]", out, depth + 1);
+    }
+    return;
+  }
+  for (var k in node) {
+    if (out.length >= DUMP_MAX_TEXT_FIELD_MATCHES) return;
+    var childPath = pathPrefix ? pathPrefix + "." + k : k;
+    if (TEXT_LIKE_FIELD_NAME_PATTERN.test(k)) {
+      out.push({ path: childPath, key: k, parent: node, valuePreview: safeStringifyShallow(node[k]) });
+    }
+    collectTextLikeFields(node[k], childPath, out, depth + 1);
+  }
+}
+
+/** Bounded before/after leaf-level diff over two already-dumped plain trees. */
+function diffDumpedTrees(before, after, pathPrefix, out) {
+  if (out.length >= 200) return;
+  var beforeIsObj = before !== null && typeof before === "object";
+  var afterIsObj = after !== null && typeof after === "object";
+  if (!beforeIsObj && !afterIsObj) {
+    if (before !== after) out.push({ path: pathPrefix || "(root)", before: before, after: after });
+    return;
+  }
+  if (beforeIsObj !== afterIsObj) {
+    out.push({ path: pathPrefix || "(root)", before: before, after: after });
+    return;
+  }
+  var beforeIsArr = isArrayLikeValue(before);
+  var afterIsArr = isArrayLikeValue(after);
+  if (beforeIsArr !== afterIsArr) {
+    out.push({ path: pathPrefix || "(root)", before: before, after: after });
+    return;
+  }
+  if (beforeIsArr) {
+    var maxLen = Math.max(before.length, after.length);
+    for (var i = 0; i < maxLen; i++) {
+      if (out.length >= 200) return;
+      diffDumpedTrees(before[i], after[i], pathPrefix + "[" + i + "]", out);
+    }
+    return;
+  }
+  var seenKeys = {};
+  var k;
+  for (k in before) {
+    if (out.length >= 200) return;
+    seenKeys[k] = true;
+    var childPath = pathPrefix ? pathPrefix + "." + k : k;
+    diffDumpedTrees(before[k], after[k], childPath, out);
+  }
+  for (k in after) {
+    if (out.length >= 200) return;
+    if (seenKeys[k]) continue;
+    var childPath2 = pathPrefix ? pathPrefix + "." + k : k;
+    diffDumpedTrees(undefined, after[k], childPath2, out);
+  }
+}
+
+/**
+ * Deep, read-first investigation of the Source Text ComponentParam.
+ * Inserts the given .mogrt (reusing the same track resolution + three-tier
+ * detection as createTextGraphic — see its header comment and
+ * docs/CEP_BRIDGE_INVESTIGATION.md Part 7), locates the "Source Text"
+ * param, dumps everything reflect-visible about the param object AND
+ * about getValue()'s return value, and — ONLY if that dump reveals a
+ * plain-object or JSON-string shape with an identifiable text-like field —
+ * clones it, changes just that field, calls setValue() with the modified
+ * structure, and reports a full before/after diff. Never calls setValue()
+ * with a blind guess (e.g. a raw replacement string) — that hypothesis
+ * was already tested and confirmed to throw "Illegal Parameter type"
+ * (docs/MOGRT_DIAGNOSTIC.md).
+ *
+ * @param {{mogrtPath: string, videoTrackIndex?: number, newTextValue?: string}} payload
+ */
+$._captionStudioBridge.probeSourceTextDeep = function (payload, requestId) {
+  var diagnostics = [];
+  function logStep(message) {
+    diagnostics.push(message);
+  }
+
+  var mogrtPath = payload.mogrtPath;
+  var requestedVideoTrackIndex = typeof payload.videoTrackIndex === "number" ? payload.videoTrackIndex : null;
+  var newTextValue = payload.newTextValue || "__KERIS_SOURCE_TEXT_PROBE__";
+
+  if (!mogrtPath) {
+    return { ok: false, requestId: requestId, error: "payload.mogrtPath is required.", diagnostics: diagnostics };
+  }
+
+  var project = app.project;
+  if (!project) {
+    return { ok: false, requestId: requestId, error: "No active Premiere project. Open a project first.", diagnostics: diagnostics };
+  }
+  var sequence = project.activeSequence;
+  if (!sequence) {
+    return { ok: false, requestId: requestId, error: "No active sequence. Open a sequence first.", diagnostics: diagnostics };
+  }
+  logStep("Active sequence: " + sequence.name);
+
+  var videoTrackCount = sequence.videoTracks.numTracks;
+  var audioTrackCount = sequence.audioTracks.numTracks;
+  logStep("Video track count: " + videoTrackCount + ", audio track count: " + audioTrackCount);
+
+  var videoTrackIndex;
+  if (requestedVideoTrackIndex !== null && requestedVideoTrackIndex >= 0 && requestedVideoTrackIndex < videoTrackCount) {
+    videoTrackIndex = requestedVideoTrackIndex;
+    logStep("Using requested video track index: " + videoTrackIndex);
+  } else {
+    videoTrackIndex = videoTrackCount > 0 ? videoTrackCount - 1 : 0;
+    logStep(
+      "Requested video track index (" + requestedVideoTrackIndex + ") missing/out of range for " + videoTrackCount +
+        " track(s) — falling back to the topmost video track: " + videoTrackIndex + "."
+    );
+  }
+
+  var audioTrackIndex;
+  if (audioTrackCount <= 0) {
+    audioTrackIndex = 0;
+    logStep("Sequence reports 0 audio tracks — using audioTrackIndex 0 (best effort).");
+  } else if (videoTrackIndex < audioTrackCount) {
+    audioTrackIndex = videoTrackIndex;
+  } else {
+    audioTrackIndex = audioTrackCount - 1;
+    logStep("videoTrackIndex (" + videoTrackIndex + ") exceeds audio track count (" + audioTrackCount + ") — clamping audioTrackIndex to " + audioTrackIndex + ".");
+  }
+
+  var playheadTime;
+  try {
+    playheadTime = sequence.getPlayerPosition();
+  } catch (errPh) {
+    return {
+      ok: false,
+      requestId: requestId,
+      error: "sequence.getPlayerPosition() threw: " + (errPh && errPh.message ? errPh.message : String(errPh)),
+      diagnostics: diagnostics,
+    };
+  }
+  logStep(
+    "Requested insertion time: " + playheadTime.seconds.toFixed(3) + "s (" + playheadTime.ticks + " ticks). Requested tracks: video=" +
+      videoTrackIndex + ", audio=" + audioTrackIndex + "."
+  );
+
+  var beforeSnapshot = snapshotAllVideoTracks(sequence);
+  logStep("Before-import clip counts per video track: " + JSON.stringify(mapClipCounts(beforeSnapshot)));
+
+  var importReturnValue;
+  var importThrew = false;
+  var importError = null;
+  try {
+    importReturnValue = sequence.importMGT(mogrtPath, playheadTime.ticks, videoTrackIndex, audioTrackIndex);
+  } catch (errImport) {
+    importThrew = true;
+    importError = errImport && errImport.message ? errImport.message : String(errImport);
+  }
+  var importReturnType = typeof importReturnValue;
+  logStep("importMGT() returned: type=" + importReturnType + ", value=" + safeStringifyShallow(importReturnValue));
+
+  if (importThrew) {
+    return { ok: false, requestId: requestId, error: "sequence.importMGT() threw: " + importError, diagnostics: diagnostics };
+  }
+
+  var afterSnapshot = snapshotAllVideoTracks(sequence);
+  logStep("After-import clip counts per video track: " + JSON.stringify(mapClipCounts(afterSnapshot)));
+
+  var trackItem = null;
+  var detectionMethod = null;
+  var detectedTrackIndex = null;
+
+  if (looksLikeTrackItem(importReturnValue)) {
+    trackItem = importReturnValue;
+    detectionMethod = "importMGT return value";
+  }
+  if (!trackItem) {
+    var newClip = findNewClipAcrossTracks(beforeSnapshot, afterSnapshot);
+    if (newClip) {
+      trackItem = sequence.videoTracks[newClip.trackIndex].clips[newClip.clipIndex];
+      detectionMethod = "new clip diff across all tracks";
+      detectedTrackIndex = newClip.trackIndex;
+    }
+  }
+  if (!trackItem) {
+    var mogrtBaseName = basenameNoExt(mogrtPath);
+    var byTimeAndName = findClipByTimeAndName(afterSnapshot, playheadTime.seconds, mogrtBaseName, 1.0);
+    if (byTimeAndName) {
+      trackItem = sequence.videoTracks[byTimeAndName.trackIndex].clips[byTimeAndName.clipIndex];
+      detectionMethod = "time+name match";
+      detectedTrackIndex = byTimeAndName.trackIndex;
+    }
+  }
+  if (!trackItem) {
+    logStep("No inserted clip could be detected on any of the " + videoTrackCount + " video track(s) after checking all three detection tiers.");
+    return {
+      ok: false,
+      requestId: requestId,
+      error:
+        "importMGT() did not appear to add a clip to any video track (checked all " + videoTrackCount +
+        " track(s); the call itself did not throw and returned " + importReturnType + ").",
+      diagnostics: diagnostics,
+      beforeClipCounts: mapClipCounts(beforeSnapshot),
+      afterClipCounts: mapClipCounts(afterSnapshot),
+    };
+  }
+  if (detectedTrackIndex === null) {
+    detectedTrackIndex = findTrackIndexForClip(sequence, trackItem);
+  }
+  logStep('Inserted clip: "' + trackItem.name + '" on video track ' + (detectedTrackIndex === null ? "unknown" : detectedTrackIndex) + " via " + detectionMethod + ".");
+
+  // --- Locate the Source Text param, logging every component/param name seen along the way ---
+  var sourceTextParam = null;
+  var componentDisplayName = null;
+  var allParamNamesSeen = [];
+  try {
+    for (var ci = 0; ci < trackItem.components.numItems; ci++) {
+      var component = trackItem.components[ci];
+      var compName = null;
+      try { compName = component.displayName; } catch (eCompName) {}
+      for (var pi = 0; pi < component.properties.numItems; pi++) {
+        var param = component.properties[pi];
+        var pDisplayName = null;
+        try { pDisplayName = param.displayName; } catch (ePName) {}
+        allParamNamesSeen.push((compName || "?") + " / " + (pDisplayName || "?"));
+        if (pDisplayName === "Source Text") {
+          sourceTextParam = param;
+          componentDisplayName = compName;
+        }
+      }
+    }
+  } catch (errLocate) {
+    logStep("Error while enumerating components/params: " + (errLocate && errLocate.message ? errLocate.message : String(errLocate)));
+  }
+  logStep("All component/param names seen on this clip: " + JSON.stringify(allParamNamesSeen));
+
+  var result = {
+    trackItemName: trackItem.name,
+    detectedTrackIndex: detectedTrackIndex,
+    detectionMethod: detectionMethod,
+    componentAndParamNamesSeen: allParamNamesSeen,
+  };
+
+  if (!sourceTextParam) {
+    logStep(
+      'No "Source Text" param found on the inserted clip\'s components — the visible text is on another parameter entirely ' +
+        "(see componentAndParamNamesSeen above), or under a different displayName on this host version."
+    );
+    result.sourceTextFound = false;
+    result.diagnostics = diagnostics;
+    return { ok: true, requestId: requestId, result: result };
+  }
+
+  result.sourceTextFound = true;
+  result.componentDisplayName = componentDisplayName;
+  logStep('Source Text param located on component "' + componentDisplayName + '".');
+
+  // --- Dump EVERYTHING about the param itself, before ever calling setValue() ---
+  var paramDumpBudget = { count: 0 };
+  var paramDump = dumpValueDeep(sourceTextParam, 0, [], paramDumpBudget);
+  result.paramDump = paramDump;
+  try { result.paramMatchName = sourceTextParam.matchName; } catch (eMatch) { result.paramMatchName = undefined; }
+  try { result.paramDisplayName = sourceTextParam.displayName; } catch (eDisp) {}
+  try { result.paramTypeofSelf = typeof sourceTextParam; } catch (eTos) {}
+  try {
+    result.paramConstructorName = sourceTextParam.constructor ? String(sourceTextParam.constructor.name) : null;
+  } catch (eCtor) {
+    result.paramConstructorName = "[error reading constructor: " + (eCtor.message || eCtor) + "]";
+  }
+  logStep("Param dump complete (node budget used: " + paramDumpBudget.count + ").");
+
+  // --- The core question: what does getValue() actually return? ---
+  var rawValue;
+  var getValueThrew = false;
+  var getValueError = null;
+  var getValueErrorLine = null;
+  try {
+    rawValue = sourceTextParam.getValue();
+  } catch (errGet) {
+    getValueThrew = true;
+    getValueError = errGet && errGet.message ? errGet.message : String(errGet);
+    getValueErrorLine = errGet && typeof errGet.line !== "undefined" ? errGet.line : null;
+  }
+
+  if (getValueThrew) {
+    logStep(
+      "getValue() THREW on the initial read (before any write attempt): " + getValueError +
+        (getValueErrorLine !== null ? " (line " + getValueErrorLine + ")" : "")
+    );
+    result.getValueThrew = true;
+    result.getValueThrowLocation = "initial getValue() call on the located Source Text param";
+    result.getValueError = getValueError;
+    result.getValueErrorLine = getValueErrorLine;
+    result.diagnostics = diagnostics;
+    return { ok: true, requestId: requestId, result: result };
+  }
+
+  var rawType = typeof rawValue;
+  result.getValueRawType = rawType;
+  logStep("getValue() succeeded. typeof result: " + rawType);
+
+  var rawValueDumpBudget = { count: 0 };
+  var rawValueDump = dumpValueDeep(rawValue, 0, [], rawValueDumpBudget);
+  result.getValueDump = rawValueDump;
+  logStep("getValue() result dump complete (node budget used: " + rawValueDumpBudget.count + ").");
+
+  // If it's a string, see if it's actually JSON underneath.
+  var parsedFromJsonString = null;
+  var wasJsonString = false;
+  if (rawType === "string") {
+    try {
+      var attempted = JSON.parse(rawValue);
+      if (attempted !== null && typeof attempted === "object") {
+        parsedFromJsonString = attempted;
+        wasJsonString = true;
+        logStep("getValue() returned a string that IS valid JSON — parsed into a structured object.");
+      }
+    } catch (eParse) {
+      logStep("getValue() returned a plain string (not JSON — JSON.parse failed: " + (eParse.message || eParse) + ").");
+    }
+  }
+
+  // Determine the "structured base" to search for a text-like field in,
+  // per the task's read-before-write discipline: a plain object
+  // (getValueDump already flattened any host sub-object via .reflect), a
+  // JSON-parsed string, or neither.
+  var structuredBase = null;
+  var structuredKind = null; // "plain-object" | "json-string" | "host-object-with-reflect" | "none"
+  if (wasJsonString) {
+    structuredBase = parsedFromJsonString;
+    structuredKind = "json-string";
+  } else if (rawType === "object" && rawValue !== null) {
+    if (isHostObjectWithReflect(rawValue)) {
+      structuredKind = "host-object-with-reflect";
+      // Use the already-computed, safe plain dump (rawValueDump) as the
+      // structured base for locating candidate fields and for diffing —
+      // NOT the live host object itself, which for...in/JSON.stringify
+      // can't safely round-trip.
+      structuredBase = rawValueDump;
+    } else {
+      structuredKind = "plain-object";
+      structuredBase = rawValue;
+    }
+  } else {
+    structuredKind = "none";
+  }
+  result.structuredKind = structuredKind;
+  logStep("Structured shape classification: " + structuredKind + ".");
+
+  // --- Search for text-like fields, wherever they are ---
+  var textFieldCandidates = [];
+  if (structuredBase !== null) {
+    collectTextLikeFields(structuredBase, "", textFieldCandidates, 0);
+  }
+  result.textFieldCandidates = [];
+  for (var tf = 0; tf < textFieldCandidates.length; tf++) {
+    result.textFieldCandidates.push({
+      path: textFieldCandidates[tf].path,
+      key: textFieldCandidates[tf].key,
+      valuePreview: textFieldCandidates[tf].valuePreview,
+    });
+  }
+  logStep("Text-like field candidates found: " + JSON.stringify(result.textFieldCandidates));
+
+  // --- Only attempt a write if we found a genuinely constructible
+  // structured shape (plain object or JSON string) with a text-like
+  // field — never a live host object (no evidence a fabricated plain copy
+  // is what setValue() expects for that), and never a blind raw-string
+  // replacement (already confirmed to throw "Illegal Parameter type"). ---
+  if (structuredKind !== "plain-object" && structuredKind !== "json-string") {
+    logStep(
+      'Skipping the write test: getValue()\'s shape is "' + structuredKind + '", not a plain object or JSON string, ' +
+        "so there is no evidence-based way yet to construct a valid replacement value. No setValue() call is made here."
+    );
+    result.diagnostics = diagnostics;
+    return { ok: true, requestId: requestId, result: result };
+  }
+
+  if (!textFieldCandidates.length) {
+    logStep(
+      "Skipping the write test: getValue() returned a structured (" + structuredKind +
+        ") shape, but no text-like field name was found in it to modify."
+    );
+    result.diagnostics = diagnostics;
+    return { ok: true, requestId: requestId, result: result };
+  }
+
+  // Prefer an exact "textEditValue" match, then "text", then the first
+  // candidate whose current value is a non-empty string.
+  var chosen = null;
+  for (var c1 = 0; c1 < textFieldCandidates.length; c1++) {
+    if (textFieldCandidates[c1].key === "textEditValue") {
+      chosen = textFieldCandidates[c1];
+      break;
+    }
+  }
+  if (!chosen) {
+    for (var c2 = 0; c2 < textFieldCandidates.length; c2++) {
+      if (textFieldCandidates[c2].key === "text") {
+        chosen = textFieldCandidates[c2];
+        break;
+      }
+    }
+  }
+  if (!chosen) {
+    for (var c3 = 0; c3 < textFieldCandidates.length; c3++) {
+      var candidateValue = textFieldCandidates[c3].parent[textFieldCandidates[c3].key];
+      if (typeof candidateValue === "string" && candidateValue.length > 0) {
+        chosen = textFieldCandidates[c3];
+        break;
+      }
+    }
+  }
+  if (!chosen) chosen = textFieldCandidates[0];
+
+  logStep('Chosen field to modify for the write test: "' + chosen.path + '" (current value preview: ' + chosen.valuePreview + ").");
+  result.chosenWriteFieldPath = chosen.path;
+
+  // Clone the structured base (JSON round-trip — safe because
+  // structuredBase is already a plain, JSON-safe dump, never the live
+  // host object) and modify ONLY the chosen field.
+  var beforeClone, modifiedClone;
+  try {
+    var serialized = JSON.stringify(structuredBase);
+    beforeClone = JSON.parse(serialized);
+    modifiedClone = JSON.parse(serialized);
+  } catch (eClone) {
+    logStep("Could not JSON-clone the structured value — skipping the write test: " + (eClone.message || eClone));
+    result.diagnostics = diagnostics;
+    return { ok: true, requestId: requestId, result: result };
+  }
+
+  // Re-locate the same field on modifiedClone (fresh object graph after
+  // the clone, so `chosen.parent` from before no longer applies) by
+  // matching the recorded path.
+  var modifiedCandidates = [];
+  collectTextLikeFields(modifiedClone, "", modifiedCandidates, 0);
+  var modifiedTarget = null;
+  for (var mc = 0; mc < modifiedCandidates.length; mc++) {
+    if (modifiedCandidates[mc].path === chosen.path) {
+      modifiedTarget = modifiedCandidates[mc];
+      break;
+    }
+  }
+  if (!modifiedTarget) {
+    logStep("Could not re-locate the chosen field on the cloned structure — skipping the write test.");
+    result.diagnostics = diagnostics;
+    return { ok: true, requestId: requestId, result: result };
+  }
+  modifiedTarget.parent[modifiedTarget.key] = newTextValue;
+
+  var valueToWrite = structuredKind === "json-string" ? JSON.stringify(modifiedClone) : modifiedClone;
+
+  var writeOk = false;
+  var writeError = null;
+  var writeErrorLine = null;
+  try {
+    sourceTextParam.setValue(valueToWrite, true);
+    writeOk = true;
+    logStep("setValue() with the modified structured value SUCCEEDED.");
+  } catch (errSet) {
+    writeError = errSet && errSet.message ? errSet.message : String(errSet);
+    writeErrorLine = errSet && typeof errSet.line !== "undefined" ? errSet.line : null;
+    logStep("setValue() with the modified structured value THREW: " + writeError + (writeErrorLine !== null ? " (line " + writeErrorLine + ")" : ""));
+  }
+  result.sourceTextWriteOk = writeOk;
+  result.sourceTextWriteError = writeError;
+  result.sourceTextWriteErrorLine = writeErrorLine;
+
+  // --- Read back and produce a complete before/after diff ---
+  var afterRawValue;
+  var readBackThrew = false;
+  var readBackError = null;
+  try {
+    afterRawValue = sourceTextParam.getValue();
+  } catch (errReadBack) {
+    readBackThrew = true;
+    readBackError = errReadBack && errReadBack.message ? errReadBack.message : String(errReadBack);
+    logStep("getValue() THREW on the post-write read-back: " + readBackError);
+  }
+
+  if (readBackThrew) {
+    result.readBackThrew = true;
+    result.readBackThrowLocation = "getValue() call immediately after setValue()";
+    result.readBackError = readBackError;
+  } else {
+    var afterDumpBudget = { count: 0 };
+    var afterDump = dumpValueDeep(afterRawValue, 0, [], afterDumpBudget);
+    result.getValueDumpAfter = afterDump;
+
+    var beforeForDiff = wasJsonString ? beforeClone : structuredBase;
+    var afterForDiff = afterDump;
+    if (wasJsonString && typeof afterRawValue === "string") {
+      try {
+        afterForDiff = JSON.parse(afterRawValue);
+      } catch (eParseAfter) {
+        // Fall back to the raw dump if the post-write value isn't JSON anymore.
+      }
+    }
+
+    var diff = [];
+    diffDumpedTrees(beforeForDiff, afterForDiff, "", diff);
+    result.beforeAfterDiff = diff;
+    logStep("Before/after diff computed: " + diff.length + " differing leaf value(s).");
   }
 
   result.diagnostics = diagnostics;

@@ -109,6 +109,60 @@ test("result payload reports the detected track index and detection method used,
   assert.match(source, /detectionMethod\s*:\s*detectionMethod/);
 });
 
+// --- probeSourceTextDeep: read-before-write Source Text investigation ---
+// See docs/CEP_BRIDGE_INVESTIGATION.md Part 8. These checks guard the
+// specific discipline the user asked for: dump everything reflect-visible
+// about the param BEFORE ever calling getValue()/setValue() blindly, and
+// only attempt a write once a genuinely structured, constructible shape
+// with an identifiable text-like field has been found.
+
+test('dispatch() routes the "probeSourceTextDeep" command to $._captionStudioBridge.probeSourceTextDeep', () => {
+  const source = readHostScript();
+  assert.match(source, /command\s*===\s*["']probeSourceTextDeep["']/);
+  assert.match(source, /\$\._captionStudioBridge\.probeSourceTextDeep\s*=\s*function\s*\(/);
+});
+
+test("probeSourceTextDeep dumps the param via ExtendScript's documented .reflect interface, not a blind for...in guess", () => {
+  const source = readHostScript();
+  assert.match(source, /function\s+dumpValueDeep\s*\(/, "expected a dumpValueDeep() helper");
+  assert.match(source, /\.reflect\.properties/, "expected use of the documented ExtendScript reflect.properties introspection API");
+  assert.match(source, /\.reflect\.methods/, "expected use of the documented ExtendScript reflect.methods introspection API");
+});
+
+test("probeSourceTextDeep calls getValue() and dumps its result before any setValue() call is reached", () => {
+  const source = readHostScript();
+  const probeFnMatch = source.match(/\$\._captionStudioBridge\.probeSourceTextDeep = function[\s\S]*$/);
+  assert.ok(probeFnMatch, "expected to find the probeSourceTextDeep function body");
+  const probeFnSource = probeFnMatch[0];
+  const getValueIndex = probeFnSource.indexOf("sourceTextParam.getValue()");
+  const setValueIndex = probeFnSource.indexOf("sourceTextParam.setValue(");
+  assert.ok(getValueIndex !== -1, "expected an initial sourceTextParam.getValue() call");
+  assert.ok(setValueIndex !== -1, "expected a sourceTextParam.setValue() call");
+  assert.ok(getValueIndex < setValueIndex, "getValue() must be called (and its result dumped) before setValue() is ever reached");
+});
+
+test("probeSourceTextDeep only attempts setValue() when the value is a plain object or JSON string, never a live host object or a blind raw-string guess", () => {
+  const source = readHostScript();
+  assert.match(
+    source,
+    /structuredKind\s*!==\s*["']plain-object["']\s*&&\s*structuredKind\s*!==\s*["']json-string["']/,
+    "expected an explicit gate skipping the write test unless the shape is a plain object or JSON string"
+  );
+  assert.match(source, /host-object-with-reflect/, "expected the host-object-with-reflect case to be classified and excluded from blind writes");
+});
+
+test("probeSourceTextDeep reports a before/after diff via a dedicated diff helper, not just raw before/after dumps", () => {
+  const source = readHostScript();
+  assert.match(source, /function\s+diffDumpedTrees\s*\(/);
+  assert.match(source, /beforeAfterDiff/);
+});
+
+test("probeSourceTextDeep documents exactly where getValue() threw, on both the initial read and the post-write read-back", () => {
+  const source = readHostScript();
+  assert.match(source, /getValueThrowLocation/);
+  assert.match(source, /readBackThrowLocation/);
+});
+
 test("hostscript.jsx stays ES3/ES5-compatible (no const/let/arrow functions/template literals) since ExtendScript can't parse modern syntax", () => {
   const source = readHostScript();
   // Strip line/block comments and string contents loosely before scanning,

@@ -211,3 +211,68 @@ export async function testCepWriteProof(opts) {
   log(result.ok ? "════ CEP Bridge Write Proof — finished ════" : "════ CEP Bridge Write Proof — finished with errors ════", result.ok ? "success" : "error");
   return result;
 }
+
+export const CEP_SOURCE_TEXT_PROBE_SENTINEL = "__KERIS_SOURCE_TEXT_PROBE__";
+
+/**
+ * Read-before-write investigation of the Source Text ComponentParam: asks
+ * the CEP bridge to insert the given .mogrt, dump everything reflect-
+ * visible about the Source Text param and getValue()'s return value
+ * BEFORE calling setValue(), and only attempt a targeted, evidence-based
+ * write (plus a before/after diff) if that dump reveals a genuinely
+ * constructible (plain-object or JSON-string) shape with an identifiable
+ * text-like field. See cep-bridge/jsx/hostscript.jsx's
+ * probeSourceTextDeep() for exactly what runs host-side, and
+ * docs/CEP_BRIDGE_INVESTIGATION.md Part 8 for why this exists.
+ *
+ * Deliberately does NOT clean up the created clip — same rationale as
+ * testCepWriteProof(); see cep-bridge/README.md.
+ *
+ * @param {Object} opts
+ * @param {string} opts.mogrtPath
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {string} [opts.newTextValue]
+ * @param {number} [opts.videoTrackIndex]
+ * @param {number} [opts.timeoutMs]
+ */
+export async function probeSourceTextDeep(opts) {
+  const {
+    mogrtPath,
+    log,
+    newTextValue = CEP_SOURCE_TEXT_PROBE_SENTINEL,
+    videoTrackIndex,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+  } = opts;
+
+  log("════ CEP Source Text Deep Probe — start ════", "info");
+
+  if (!mogrtPath) {
+    log("✗ No .mogrt selected.", "error");
+    return { ok: false, step: "mogrt-path" };
+  }
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const resolvedVideoTrackIndex =
+    typeof videoTrackIndex === "number" ? videoTrackIndex : await resolveTopVideoTrackIndexForCep(log);
+
+  const payload = { mogrtPath, newTextValue };
+  if (typeof resolvedVideoTrackIndex === "number") payload.videoTrackIndex = resolvedVideoTrackIndex;
+
+  const result = await callCepBridge("probeSourceTextDeep", payload, { timeoutMs, log });
+
+  log(
+    result.ok ? "════ CEP Source Text Deep Probe — finished ════" : "════ CEP Source Text Deep Probe — finished with errors ════",
+    result.ok ? "success" : "error"
+  );
+  return result;
+}

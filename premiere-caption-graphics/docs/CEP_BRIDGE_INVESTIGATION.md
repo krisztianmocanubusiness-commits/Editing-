@@ -334,3 +334,123 @@ this agent (no host access in this environment). The next live run's
 definitively which track `importMGT()` actually used and whether
 `ComponentParam.setValue()` on Source Text succeeded — that is the
 information this fix was built to surface, not assume.
+
+## Part 8: second real-host run — insertion confirmed working; deep, read-first Source Text investigation
+
+**Confirmed real-host result (breakthrough):** the Part 7 fix worked.
+`importMGT()` succeeds, the MOGRT lands on the expected top video track
+(Premiere's UI shows `V13`; the 0-based API index `12` is correct — the
+topmost-track fallback from Part 7 resolved exactly right), and the
+inserted graphic briefly displays its default text, `"Hello World"`.
+**Insertion is solved.** The only remaining open question is what shape
+`ComponentParam.getValue()`/`.setValue()` actually use for that visible
+text — not whether insertion works.
+
+Rather than keep guessing at `setValue()` argument shapes (raw string —
+already confirmed to throw `"Illegal Parameter type"`, see
+`docs/MOGRT_DIAGNOSTIC.md`), this round adds a **read-first** diagnostic,
+`probeSourceTextDeep()`, that never calls `setValue()` until the read path
+(`getValue()` and the param's own shape) is fully understood from evidence.
+
+**Grounding for the introspection technique:** ExtendScript host object
+properties (like `ComponentParam`'s) are typically **not** enumerable via
+plain `for...in` — the documented, reliable way to enumerate them is the
+built-in **ExtendScript Reflection Interface** (Adobe's *JavaScript Tools
+Guide*, "ExtendScript Reflection Interface" section): every ExtendScript
+object exposes `.reflect`, a `ReflectionObject` with `.name` (class name),
+`.properties` (array of `{name, dataType, type}`), and `.methods` (array of
+`{name, arguments}`). Note: Adobe's own developer community has documented
+cases (After Effects) where `.type` reports `"readwrite"` for a property
+that is actually read-only at write time — so `.reflect`'s `.type` field is
+treated as informational only here; every read and every write in
+`probeSourceTextDeep()` stays wrapped in `try/catch` regardless of what
+`.type` claims.
+
+**What `cep-bridge/jsx/hostscript.jsx`'s new `probeSourceTextDeep()` command does,
+in order — never skipping ahead to a write:**
+1. Inserts the given `.mogrt` and locates the inserted clip using the exact
+   same track-resolution + three-tier detection as `createTextGraphic()`
+   (Part 7) — insertion is a solved problem now, so this reuses it as-is
+   rather than re-solving it.
+2. Enumerates every component/param `displayName` on the clip
+   (`componentAndParamNamesSeen`), so if `"Source Text"` isn't found by
+   that exact name, the response shows exactly what *was* found instead of
+   just failing silently.
+3. Once located, dumps **everything reflect-visible about the param itself**
+   (`result.paramDump`, via the new `dumpValueDeep()` helper — recursively
+   walks `.reflect.properties`/`.methods`, reading each property's live
+   value, bounded by depth/node-count/array-length limits so a
+   self-referential host object graph can't hang the script or blow up the
+   evalScript payload), plus `paramMatchName`, `paramDisplayName`,
+   `paramTypeofSelf`, `paramConstructorName` — **before `getValue()` is
+   ever called.**
+4. Calls `getValue()` exactly once for the initial read. If it throws, the
+   response records `getValueThrew: true`, `getValueThrowLocation`
+   (a human-readable description of exactly which call site), the error
+   message, and — where ExtendScript's `Error.line` is available — the
+   line number, then returns immediately without attempting anything else.
+5. On success, dumps the **complete** `getValue()` return value the same
+   way (`result.getValueDump`), records `typeof` (`getValueRawType`), and —
+   if it's a string — attempts `JSON.parse()` on it to check whether it's
+   actually JSON underneath.
+6. Classifies the shape into `structuredKind`: `"plain-object"` (a real
+   plain JS object), `"json-string"` (a string that parses as JSON),
+   `"host-object-with-reflect"` (a *live* ExtendScript host object — not
+   plain data), or `"none"` (primitive/null/undefined).
+7. Searches the structured shape (whichever of the three above it is) for
+   field **names** suggesting they hold visible text —
+   `textEditValue`, `fontTextRunLength`, `text`, `value`, `string`,
+   `content`, `run`, and any nested match, at any depth — recording every
+   candidate's full path, key, and a value preview
+   (`result.textFieldCandidates`), never assuming any single name is *the*
+   answer up front.
+8. **Only if** `structuredKind` is `"plain-object"` or `"json-string"`
+   **and** at least one text-like field was found does it attempt a write:
+   clones the structure (JSON round-trip — safe, since by this point it's
+   already a plain, JSON-safe value, never the live host object), modifies
+   *only* the chosen field (preferring an exact `textEditValue` match, then
+   `text`, then the first non-empty string candidate), and calls
+   `setValue()` with the modified structure — a JSON string if the
+   original was a JSON string, a plain object otherwise. A live
+   `"host-object-with-reflect"` value is **deliberately never** used to
+   fabricate a write — there is no evidence a hand-built plain copy is what
+   `setValue()` expects for a live host type, so that case is reported
+   (with its full dump) but not written to.
+9. Reads back via `getValue()` again (same throw-location discipline as
+   step 4, under `readBackThrew`/`readBackThrowLocation`), dumps the result
+   (`result.getValueDumpAfter`), and produces a **complete, bounded,
+   leaf-level before/after diff** (`result.beforeAfterDiff`, via the new
+   `diffDumpedTrees()` helper) between the pre-write and post-write
+   structures.
+
+**UXP/UI side:**
+- `src/ppro/cepBridge.js` adds `probeSourceTextDeep(opts)` — same
+  reachability-check-then-command pattern as `testCepWriteProof()`, calling
+  the `"probeSourceTextDeep"` host command with `{mogrtPath, newTextValue,
+  videoTrackIndex?}`; `videoTrackIndex` is resolved the same
+  never-hard-code-0 way as Part 7 (`resolveTopVideoTrackIndexForCep()`).
+- `src/ui/cepBridgePanel.js` adds a second button, "Probe Source Text
+  (deep, read-first)", rendering the param dump, the `getValue()` dump, the
+  text-field candidates, the write-test outcome (or a clear explanation of
+  why no write was attempted), and the full before/after diff — each large
+  JSON blob in a collapsible `<details>` block so the panel stays readable.
+- `test/cepBridge.test.js` and `test/cepHostScript.test.js` add coverage:
+  the client function's request shape/gating, and static regression checks
+  that `probeSourceTextDeep()` (a) is wired into `dispatch()`, (b) uses
+  `.reflect.properties`/`.reflect.methods` rather than a blind `for...in`,
+  (c) calls `getValue()` and dumps its result strictly before any
+  `setValue()` call is reached in the function body, (d) only attempts
+  `setValue()` when `structuredKind` is `"plain-object"` or
+  `"json-string"` — never for a live host object or a blind raw-string
+  guess, (e) computes a real before/after diff via a dedicated helper, and
+  (f) records exactly where `getValue()` threw on both the initial read
+  and the post-write read-back.
+
+**What is still unverified:** as with every prior round, this has not yet
+been run against a live Premiere host by this agent (no host access here).
+The next live run's `result.paramDump`, `result.getValueDump`,
+`result.structuredKind`, `result.textFieldCandidates`, and — if a write was
+attempted — `result.sourceTextWriteOk`/`result.beforeAfterDiff` will show,
+with evidence, exactly what Premiere stores for native graphic text and
+whether `ComponentParam.setValue()` can change it. That is what this
+diagnostic exists to surface, not assume.

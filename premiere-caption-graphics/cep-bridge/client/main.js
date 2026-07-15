@@ -70,6 +70,14 @@ function runExtendScriptCommand(command, payload, requestId) {
     // single string argument and does its own JSON.parse().
     const script = `$._captionStudioBridge.dispatch(${JSON.stringify(requestJson)})`;
 
+    // Task 2: log the exact evalScript source string immediately before
+    // calling evalScript() — lets a byte-for-byte comparison between a
+    // known-working command's call (e.g. probeSourceTextDeep) and a
+    // failing one's (e.g. bisectHostScript/echoPayload) rule in or out any
+    // difference in how the call itself is constructed, independent of
+    // what's actually loaded in the ExtendScript engine.
+    log(`evalScript source for "${command}": ${script}`, "info");
+
     try {
       csInterface.evalScript(script, (resultString) => {
         if (settled) return;
@@ -174,7 +182,36 @@ server.on("error", (err) => {
   log(`✗ Server error: ${err.message || err}`, "error");
 });
 
+/**
+ * Task 6: proves — automatically, on every panel load, with no user
+ * action required — whether the ExtendScript engine that's actually
+ * running has this session's latest hostscript.jsx loaded, or a stale
+ * earlier build. Calls "ping" (the oldest, least-likely-to-be-stale
+ * command) immediately after the HTTP server starts, and shows the
+ * returned hostscriptBuildId/supportedCommands directly in the panel's
+ * status line — if this reads an OLD build ID or is missing the newest
+ * commands, that alone proves the engine needs Premiere restarted (or the
+ * extension reloaded a way that forces ScriptPath re-evaluation), before
+ * any command is even attempted from the UXP side.
+ */
+async function runStartupBuildCheck() {
+  log("Checking loaded hostscript.jsx build (startup ping)…", "info");
+  const result = await runExtendScriptCommand("ping", {}, "startup-ping");
+  if (!result.ok) {
+    setStatus(`Bridge is up, but the startup ping to ExtendScript failed: ${result.error ?? "unknown error"}`, false);
+    log(`✗ Startup ping failed: ${result.error ?? "unknown error"}`, "error");
+    return;
+  }
+  const buildId = result.result && result.result.hostscriptBuildId;
+  const commands = (result.result && result.result.supportedCommands) || [];
+  setStatus(`Listening on http://${HOST}:${PORT} — hostscript.jsx build: ${buildId ?? "unknown (pre-build-ID version)"}`, true);
+  log(`✓ Loaded hostscript.jsx build: ${buildId ?? "unknown"}. Supported commands: ${commands.join(", ") || "(none reported — pre-build-ID version)"}`, "success");
+}
+
 server.listen(PORT, HOST, () => {
-  setStatus(`Listening on http://${HOST}:${PORT} — keep this panel open while using the CEP Bridge from the main UXP panel.`, true);
+  setStatus(`Listening on http://${HOST}:${PORT} — checking hostscript.jsx build…`, true);
   log(`✓ Bridge server started on http://${HOST}:${PORT}`, "success");
+  runStartupBuildCheck().catch((err) => {
+    log(`✗ Startup build check crashed: ${err.message || err}`, "error");
+  });
 });

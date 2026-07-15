@@ -426,3 +426,76 @@ export async function bisectHostScript(opts) {
   log(result.ok ? `════ CEP Bisect — step ${step} — finished ════` : `════ CEP Bisect — step ${step} — finished with errors ════`, result.ok ? "success" : "error");
   return result;
 }
+
+/**
+ * Task 6/7: asks the CEP bridge which hostscript.jsx build is actually
+ * loaded in the live ExtendScript engine right now (hostscriptBuildId)
+ * and which commands it recognizes (supportedCommands) — the direct way
+ * to confirm or rule out the leading real-host theory: that Premiere's
+ * ExtendScript engine only loads the manifest's ScriptPath file ONCE per
+ * running Premiere Pro process, so reopening the CEP panel does not
+ * reload newer commands until Premiere itself is restarted. See
+ * cep-bridge/jsx/hostscript.jsx's getAvailableCommands() and
+ * docs/CEP_BRIDGE_INVESTIGATION.md Part 12.
+ *
+ * @param {Object} opts
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {number} [opts.timeoutMs]
+ */
+export async function getAvailableCommands(opts) {
+  const { log, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+
+  log("════ CEP getAvailableCommands — start ════", "info");
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const result = await callCepBridge("getAvailableCommands", {}, { timeoutMs, log });
+
+  log(result.ok ? "════ CEP getAvailableCommands — finished ════" : "════ CEP getAvailableCommands — finished with errors ════", result.ok ? "success" : "error");
+  return result;
+}
+
+/**
+ * Task 3: calls echoPayload — registered host-side using the exact same
+ * pattern as the known-working probeSourceTextDeep, with no helper
+ * functions or Premiere APIs — and expects the payload back verbatim. If
+ * this fails identically to bisectHostScript's step 0 while
+ * probeSourceTextDeep keeps working, that's further evidence the fault is
+ * about WHAT's loaded in the live engine, not anything about this
+ * specific command's code.
+ *
+ * @param {Object} opts
+ * @param {(message: string, level?: string) => void} opts.log
+ * @param {*} [opts.payload] — anything JSON-serializable; echoed back verbatim.
+ * @param {number} [opts.timeoutMs]
+ */
+export async function echoPayload(opts) {
+  const { log, payload = { hello: "world" }, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+
+  log("════ CEP echoPayload — start ════", "info");
+
+  const health = await checkCepBridgeHealth();
+  if (!health.ok) {
+    log(
+      `✗ CEP bridge unavailable: ${health.error}. Make sure the "Caption Studio CEP Bridge" CEP panel is open in ` +
+        'Premiere (Window > Extensions) — see cep-bridge/README.md for setup.',
+      "error"
+    );
+    return { ok: false, step: "bridge-unavailable", error: health.error };
+  }
+  log("✓ CEP bridge is reachable.", "success");
+
+  const result = await callCepBridge("echoPayload", payload, { timeoutMs, log });
+
+  log(result.ok ? "════ CEP echoPayload — finished ════" : "════ CEP echoPayload — finished with errors ════", result.ok ? "success" : "error");
+  return result;
+}

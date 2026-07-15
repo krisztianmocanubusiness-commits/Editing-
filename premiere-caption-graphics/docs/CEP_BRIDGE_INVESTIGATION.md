@@ -758,3 +758,148 @@ the exact breaking statement, and its step number directly identifies
 which construct (a plain string operation, a specific helper function, or
 something about how these functions/constants are declared in the file)
 is the true root cause.
+
+## Part 12: sixth real-host run — bisection step 0 fails too; this is dispatch/registration, not code
+
+**Confirmed real-host result that redirects the whole investigation:**
+`bisectHostScript()`'s **step 0** — a bare `return { ok: true, ... }`, no
+string/JSON helpers, no Premiere APIs, structurally identical to the
+already-confirmed-working `"ping"` command — fails immediately with the
+same non-JSON `"EvalScript error."`. Meanwhile `ping`, `createTextGraphic`,
+and `probeSourceTextDeep` all keep working. Since step 0 rules out every
+JavaScript-compatibility hypothesis from Parts 9–11 (there is no string
+manipulation, no JSON parsing, no character-code logic — the theories this
+investigation had been chasing), the fault cannot be in what any of these
+new commands' code *does*. It has to be in whether that code is actually
+being *reached* at all.
+
+### Task 1: the complete working path, `probeSourceTextDeep` vs. `bisectHostScript`
+
+| Layer | `probeSourceTextDeep` (confirmed working) | `bisectHostScript` (confirmed failing, even step 0) |
+| --- | --- | --- |
+| UXP request command name | `"probeSourceTextDeep"` | `"bisectHostScript"` |
+| CEP Node server routing (`client/main.js`) | `handleCommand()` reads `command` from the POST body and passes it straight through to `runExtendScriptCommand()` — command name is never special-cased. | Identical — `handleCommand()`/`runExtendScriptCommand()` contain no command-specific branching at all. |
+| `CSInterface.evalScript()` string construction | `` `$._captionStudioBridge.dispatch(${JSON.stringify(requestJson)})` `` — same template every time, `requestJson` is `JSON.stringify({command, payload, requestId})`. | Byte-for-byte identical construction — only the JSON *content* embedded inside differs (`"command":"bisectHostScript"` vs. `"command":"probeSourceTextDeep"`, `"payload":{"step":0}` vs. a mogrt-path payload). Task 2's new logging (below) makes this directly comparable on the next live run. |
+| ExtendScript dispatcher branch | `else if (command === "probeSourceTextDeep") { response = $._captionStudioBridge.probeSourceTextDeep(payload, requestId); }` | `else if (command === "bisectHostScript") { response = $._captionStudioBridge.bisectHostScript(payload, requestId); }` — same `if`/`else if` chain, same shape, defined a few lines below the `probeSourceTextDeep` branch in the same function. |
+| Exported/global function visibility | `$._captionStudioBridge.probeSourceTextDeep = function (payload, requestId) { ... };` — a property assignment on the persistent `$._captionStudioBridge` object, at column 0 (true top level, confirmed by this commit's new brace-balance + top-level-scope regression tests). | `$._captionStudioBridge.bisectHostScript = function (payload, requestId) { ... };` — identical pattern, also confirmed top-level and inside a perfectly brace-balanced file. |
+| Argument serialization/parsing | `dispatch()` does one `JSON.parse(requestJsonString)`, extracts `.payload`, passes it straight through. | Identical — no per-command parsing differences exist anywhere in `dispatch()`. |
+| Return serialization | Command function returns a plain object; `dispatch()` does the one `JSON.stringify(response)` call. | Identical convention (see the new `echoPayload` command's doc comment, which explicitly follows this rather than pre-stringifying, specifically to keep this comparison apples-to-apples). |
+
+**The finding, stated plainly: every layer is structurally identical.**
+There is no code-level difference between the working and failing paths
+that this comparison — or five previous rounds of static/dynamic
+investigation — has found. The only remaining variable is **content**:
+`probeSourceTextDeep` existed in `hostscript.jsx` before `bisectHostScript`
+did. That points at one specific, well-documented CEP/ExtendScript
+behavior, not a bug in this project's code:
+
+**The CEP/ExtendScript caching hypothesis.** Per Adobe's own CEP
+architecture, the manifest's `ScriptPath` (`cep-bridge/jsx/hostscript.jsx`)
+is evaluated into a persistent ExtendScript "engine" session **once**,
+when the extension is first activated in a running Premiere Pro process.
+Reopening the CEP panel window reloads `client/index.html`/`client/main.js`
+(the browser-side code) — but that is a **separate** reload path from the
+ExtendScript engine, and does **not** by itself force the engine to
+re-evaluate `hostscript.jsx`. If the live engine loaded this file at some
+point before `bisectHostScript`/`testRawBytesHelpers`/
+`inspectSourceTextRawBytes` were added (but after `probeSourceTextDeep`
+was), every command that existed at that moment keeps working forever
+(within that Premiere session), while every command added afterward is
+simply **not defined** in the live engine at all — no matter how correct
+its code is on disk.
+
+*(One open detail worth flagging honestly: a plain "stale dispatch()"
+alone would be expected to hit its own `else` branch and return a clean
+`"Unknown command: X"` JSON error, not the opaque `"EvalScript error."`
+string — so the precise mechanism inside ExtendScript's engine may be more
+specific than a simple stale copy of the whole file. This doesn't change
+the recommended fix (force a real reload), but it's why this document
+still calls it a hypothesis rather than a certainty this agent can confirm
+without live-host access.)*
+
+### What this round adds — verification tools, not more diagnostics (task 8: nothing beyond what was asked)
+
+- **`HOSTSCRIPT_BUILD_ID`** (task 6): a version string constant declared
+  near the top of `hostscript.jsx`, bumped on every change to this file.
+  Returned in `"ping"`'s result and in the new `"getAvailableCommands"`
+  command's result.
+- **`SUPPORTED_COMMANDS`**: an explicit array of every real command name
+  `dispatch()` routes — also returned by `"ping"` and
+  `"getAvailableCommands"`. A new regression test cross-checks this array
+  against every `command === "..."` branch actually present in
+  `dispatch()`, so it can't silently drift out of date.
+- **`getAvailableCommands`** (task 7): a dedicated command for checking
+  this independent of `"ping"` (defense in depth, in case `"ping"` itself
+  were ever part of a stale load — unlikely, since it's the oldest command
+  here, but cheap to guard against).
+- **`echoPayload`** (task 3): registered using the *exact same pattern* as
+  `probeSourceTextDeep` — a plain function on `$._captionStudioBridge`,
+  wired into `dispatch()`'s `if`/`else if` chain the same way, returning a
+  plain object (not pre-stringified, to stay apples-to-apples with every
+  other command's convention). No helper functions, no Premiere APIs.
+  Deliberately placed near the **top** of the file, immediately after
+  `dispatch()`/`ping`/`getAvailableCommands` — as structurally far as
+  possible from `bisectHostScript` (defined near the very end) — so that
+  comparing whether `echoPayload` succeeds while `bisectHostScript` step 0
+  fails (or vice versa) is itself diagnostic evidence about *where* in the
+  file the live engine's loaded copy stops matching disk.
+- **Exact evalScript string logging** (task 2): `client/main.js` now logs
+  the full `script` string (the literal text passed to
+  `csInterface.evalScript()`) immediately before every call, to both the
+  on-panel log and the browser console — enabling a byte-for-byte
+  comparison between a working command's call and a failing one's.
+- **Automatic startup build check** (task 6): the CEP panel now calls
+  `"ping"` automatically the moment its local server starts (no user
+  action required) and displays the returned `hostscriptBuildId` +
+  `supportedCommands` directly in the panel's status line — so simply
+  opening the CEP panel answers "is this a stale engine?" immediately.
+- **Structural audit** (task 5, done via static analysis rather than a new
+  runtime diagnostic): a brace-balance scanner confirms every `{`/`}` in
+  the file matches (zero unmatched braces), and a scope check confirms
+  every `$._captionStudioBridge.X = function` handler — including
+  `bisectHostScript`, `testRawBytesHelpers`, and
+  `inspectSourceTextRawBytes` — sits at column 0 (true top-level/global
+  scope, never nested inside another function or after a stray unmatched
+  brace). Both are now permanent regression tests
+  (`test/cepHostScript.test.js`). **Neither found any problem** — which is
+  itself the evidence ruling out "appended outside global scope" as the
+  cause and pointing back at engine-level caching.
+
+### What forces a real reload (this is the answer to "must Premiere be restarted")
+
+Based on the CEP/ExtendScript architecture described above: reopening the
+CEP panel (closing and reopening the "Caption Studio CEP Bridge" window)
+is **not** expected to be sufficient on its own, because it only reloads
+the browser-side `client/main.js`, not the ExtendScript engine's loaded
+copy of `hostscript.jsx`. **Fully quitting and relaunching Premiere Pro**
+is the reliable way to force the ExtendScript engine to start a fresh
+session and re-evaluate the `ScriptPath` file from disk. (Some CEP setups
+also support forcing a script reload without a full app restart via a
+manual `$.evalFile(new File(...))` call against the same engine — not
+implemented here, since a full restart is simple, always works, and this
+is a scoped proof of concept rather than long-lived tooling.)
+
+**Verification procedure for the next live-host run, in order:**
+1. Fully quit Premiere Pro (not just close the project).
+2. Pull this branch, `npm run build` in `premiere-caption-graphics/`.
+3. Relaunch Premiere Pro, open the project, open the "Caption Studio CEP
+   Bridge" panel (Window > Extensions).
+4. Watch the panel's own status line/log — the automatic startup ping
+   should show `hostscriptBuildId: "2026-07-15-bisect-r2"` (or whatever
+   `HOSTSCRIPT_BUILD_ID` is at the time) and list `bisectHostScript`,
+   `echoPayload`, etc. in `supportedCommands`.
+5. Open the UXP panel, click "Check Bridge Build & Commands" — it should
+   report the same build ID and no missing commands.
+6. Run `echoPayload` and `bisectHostScript` step 0 — both should now
+   succeed with a clean JSON result instead of `"EvalScript error."`.
+7. If they still fail after a full Premiere restart, the caching
+   hypothesis is disproven and the fault is something neither this round
+   nor any prior round has identified yet — report that plainly rather
+   than guessing further.
+
+**What this agent could not do:** verify any of the above against a live
+Premiere Pro process — no host access in this environment. Every piece of
+this round is grounded in Adobe's documented CEP/ExtendScript engine
+lifecycle and in ruling out every code-level explanation this
+investigation could statically check; whether it's the actual, complete
+root cause is what the verification procedure above will show.

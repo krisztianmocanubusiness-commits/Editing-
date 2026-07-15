@@ -9,6 +9,8 @@ import {
   inspectSourceTextRawBytes,
   testRawBytesHelpers,
   bisectHostScript,
+  getAvailableCommands,
+  echoPayload,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../src/ppro/cepBridge.js";
@@ -499,4 +501,97 @@ test("bisectHostScript calls the bisectHostScript host command with the given st
   assert.deepEqual(calledUrls, ["http://localhost:3010/health", "http://localhost:3010/command"]);
   assert.equal(capturedCommand, "bisectHostScript");
   assert.deepEqual(capturedPayload, { step: 5 });
+});
+
+// --- getAvailableCommands ---
+
+test("getAvailableCommands returns step:bridge-unavailable and never calls /command when the health check fails", async () => {
+  const calledUrls = [];
+  await withFetch(
+    async (url) => {
+      calledUrls.push(url);
+      throw new Error("connect ECONNREFUSED");
+    },
+    async () => {
+      const result = await getAvailableCommands({ log: noopLog });
+      assert.equal(result.ok, false);
+      assert.equal(result.step, "bridge-unavailable");
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health"]);
+});
+
+test("getAvailableCommands calls the getAvailableCommands host command with an empty payload and forwards the result", async () => {
+  let capturedCommand = null;
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      const body = JSON.parse(init.body);
+      capturedCommand = body.command;
+      capturedPayload = body.payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: { hostscriptBuildId: "test-build", supportedCommands: ["ping"] } });
+    },
+    async () => {
+      const result = await getAvailableCommands({ log: noopLog });
+      assert.equal(result.ok, true);
+      assert.equal(result.result.hostscriptBuildId, "test-build");
+    }
+  );
+  assert.equal(capturedCommand, "getAvailableCommands");
+  assert.deepEqual(capturedPayload, {});
+});
+
+// --- echoPayload ---
+
+test("echoPayload returns step:bridge-unavailable and never calls /command when the health check fails", async () => {
+  const calledUrls = [];
+  await withFetch(
+    async (url) => {
+      calledUrls.push(url);
+      throw new Error("connect ECONNREFUSED");
+    },
+    async () => {
+      const result = await echoPayload({ log: noopLog });
+      assert.equal(result.ok, false);
+      assert.equal(result.step, "bridge-unavailable");
+    }
+  );
+  assert.deepEqual(calledUrls, ["http://localhost:3010/health"]);
+});
+
+test("echoPayload sends the given payload verbatim as the command payload (not wrapped) and forwards the result", async () => {
+  let capturedCommand = null;
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      const body = JSON.parse(init.body);
+      capturedCommand = body.command;
+      capturedPayload = body.payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: { received: { testValue: "abc" } } });
+    },
+    async () => {
+      const result = await echoPayload({ log: noopLog, payload: { testValue: "abc" } });
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.result.received, { testValue: "abc" });
+    }
+  );
+  assert.equal(capturedCommand, "echoPayload");
+  assert.deepEqual(capturedPayload, { testValue: "abc" });
+});
+
+test("echoPayload defaults to a {hello: 'world'} payload when none is given", async () => {
+  let capturedPayload = null;
+  await withFetch(
+    async (url, init) => {
+      if (url.endsWith("/health")) return fakeJsonResponse(200, { ok: true, extendscriptReady: true });
+      capturedPayload = JSON.parse(init.body).payload;
+      return fakeJsonResponse(200, { ok: true, requestId: "r", result: {} });
+    },
+    async () => {
+      await echoPayload({ log: noopLog });
+    }
+  );
+  assert.deepEqual(capturedPayload, { hello: "world" });
 });

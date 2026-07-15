@@ -401,3 +401,119 @@ test("bisectHostScript tests exactly one new construct per step — never combin
     assert.ok(lineCount <= 12, `a bisect step block is unexpectedly large (${lineCount} lines) — each step should add only one construct:\n${block}`);
   }
 });
+
+// --- Real-host finding that redirects the whole investigation: even
+// bisectHostScript's step 0 (a bare minimal return, no helpers, no
+// Premiere APIs) fails with the same "EvalScript error." as everything
+// added since probeSourceTextDeep (still confirmed working). Since a full
+// audit found nothing structurally wrong in this file (see the two tests
+// below), the leading theory is that Premiere's ExtendScript engine only
+// evaluates the manifest's ScriptPath file ONCE per running process — so
+// this section adds an independently-checkable build identifier, a
+// command list, and a minimal command (echoPayload) placed as far from
+// bisectHostScript as possible in the file, per the user's explicit
+// tasks. See docs/CEP_BRIDGE_INVESTIGATION.md Part 12.
+
+test("every $._captionStudioBridge.X = function(...) command handler is defined at column 0 (true top-level/global scope, never nested inside another function)", () => {
+  const source = readHostScript();
+  const handlerLines = source.split("\n").filter((line) => /\$\._captionStudioBridge\.\w+\s*=\s*function/.test(line));
+  assert.ok(handlerLines.length >= 8, "expected at least 8 registered command handlers (ping's caller, dispatch, and the real commands)");
+  for (const line of handlerLines) {
+    assert.match(line, /^\$\._captionStudioBridge\./, `handler line is indented (not top-level/global scope): ${JSON.stringify(line)}`);
+  }
+});
+
+test("hostscript.jsx's braces are perfectly balanced (no unmatched brace anywhere in the file)", () => {
+  const source = readHostScript();
+  let depth = 0;
+  let inString = null;
+  let inLineComment = false;
+  let inBlockComment = false;
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    if (inLineComment) {
+      if (c === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (c === "*" && source[i + 1] === "/") {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (inString) {
+      if (c === "\\") {
+        i++;
+        continue;
+      }
+      if (c === inString) inString = null;
+      continue;
+    }
+    if (c === "/" && source[i + 1] === "/") {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (c === "/" && source[i + 1] === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inString = c;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      assert.ok(depth >= 0, `found an unmatched closing brace at character offset ${i}`);
+    }
+  }
+  assert.equal(depth, 0, "braces are not balanced across the whole file — expected every { to have a matching }");
+});
+
+test("HOSTSCRIPT_BUILD_ID and SUPPORTED_COMMANDS are declared, and ping()'s result includes both — so a caller can directly confirm what's loaded in the live ExtendScript engine (task 6)", () => {
+  const source = readHostScript();
+  assert.match(source, /var\s+HOSTSCRIPT_BUILD_ID\s*=\s*["'][^"']+["'];/);
+  assert.match(source, /var\s+SUPPORTED_COMMANDS\s*=\s*\[/);
+  assert.match(source, /hostscriptBuildId:\s*HOSTSCRIPT_BUILD_ID/);
+  assert.match(source, /supportedCommands:\s*SUPPORTED_COMMANDS/);
+});
+
+test("SUPPORTED_COMMANDS lists every real command name dispatch() actually routes", () => {
+  const source = readHostScript();
+  const dispatchCommands = [...source.matchAll(/command\s*===\s*["'](\w+)["']/g)].map((m) => m[1]);
+  const listMatch = source.match(/var\s+SUPPORTED_COMMANDS\s*=\s*\[([\s\S]*?)\];/);
+  assert.ok(listMatch, "expected to find the SUPPORTED_COMMANDS array literal");
+  const declared = [...listMatch[1].matchAll(/"(\w+)"/g)].map((m) => m[1]);
+  for (const cmd of dispatchCommands) {
+    assert.ok(declared.includes(cmd), `dispatch() routes "${cmd}" but SUPPORTED_COMMANDS doesn't list it — bump it so getAvailableCommands()/ping() stay accurate`);
+  }
+});
+
+test('dispatch() routes "getAvailableCommands" to $._captionStudioBridge.getAvailableCommands()', () => {
+  const source = readHostScript();
+  assert.match(source, /command\s*===\s*["']getAvailableCommands["']/);
+  assert.match(source, /\$\._captionStudioBridge\.getAvailableCommands\s*=\s*function\s*\(/);
+});
+
+test('dispatch() routes "echoPayload" to $._captionStudioBridge.echoPayload() — task 3\'s minimal, ping-like command', () => {
+  const source = readHostScript();
+  assert.match(source, /command\s*===\s*["']echoPayload["']/);
+  assert.match(source, /\$\._captionStudioBridge\.echoPayload\s*=\s*function\s*\(payload,\s*requestId\)\s*\{/);
+});
+
+test("echoPayload uses the exact same registration/return pattern as probeSourceTextDeep — a plain object return, no helper functions, no Premiere APIs — and is placed near the TOP of the file, far from bisectHostScript", () => {
+  const source = readHostScript();
+  const echoMatch = source.match(/\$\._captionStudioBridge\.echoPayload = function[\s\S]*?\n\};/);
+  assert.ok(echoMatch, "expected to find the echoPayload function body");
+  const echoFnSource = echoMatch[0];
+  assert.match(echoFnSource, /return\s*\{\s*ok:\s*true,\s*requestId:\s*requestId,\s*result:/, "expected a plain-object return, matching every other command's convention (dispatch() does the one JSON.stringify)");
+  assert.doesNotMatch(echoFnSource, /app\.project|\.activeSequence|importMGT|snapshotAllVideoTracks|charCodeHexDump|tryJsonParse|stripNullChars/, "echoPayload must not call any Premiere API or helper function — it's the minimal isolated test case");
+
+  const echoIndex = source.indexOf("$._captionStudioBridge.echoPayload = function");
+  const bisectIndex = source.indexOf("$._captionStudioBridge.bisectHostScript = function");
+  assert.ok(echoIndex !== -1 && bisectIndex !== -1);
+  assert.ok(echoIndex < bisectIndex, "echoPayload should be defined well before bisectHostScript in the file, to test whether position-in-file matters");
+});

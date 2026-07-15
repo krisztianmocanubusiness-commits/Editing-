@@ -109,5 +109,10 @@ export const store = createStore({
     bisectStep: 0,
     bisectRunning: false,
     lastBisectResult: null, // full bisectHostScript() return value, or null — see src/ppro/cepBridge.js
+    buildCheckRunning: false,
+    lastBuildCheckResult: null, // full getAvailableCommands() return value, or null — see src/ppro/cepBridge.js
+    echoTestValue: "hello-from-uxp",
+    echoRunning: false,
+    lastEchoResult: null, // full echoPayload() return value, or null — see src/ppro/cepBridge.js
   },
 });

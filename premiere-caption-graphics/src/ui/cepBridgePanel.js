@@ -8,6 +8,8 @@ import {
   inspectSourceTextRawBytes,
   testRawBytesHelpers,
   bisectHostScript,
+  getAvailableCommands,
+  echoPayload,
   CEP_WRITE_PROOF_SENTINEL,
   CEP_SOURCE_TEXT_PROBE_SENTINEL,
 } from "../ppro/cepBridge.js";
@@ -16,6 +18,37 @@ const BISECT_MAX_STEP = 11;
 
 function patchCepBridge(patch) {
   store.set((s) => ({ cepBridge: { ...s.cepBridge, ...patch } }));
+}
+
+async function runBuildCheck() {
+  patchCepBridge({ buildCheckRunning: true, lastBuildCheckResult: null });
+  try {
+    const result = await getAvailableCommands({ log });
+    console.error("[Caption Graphics Studio] CEP getAvailableCommands result:", JSON.stringify(result, null, 2));
+    patchCepBridge({ lastBuildCheckResult: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] CEP getAvailableCommands crashed:", err);
+    log(`CEP getAvailableCommands crashed unexpectedly: ${err.message || err}`, "error");
+    patchCepBridge({ lastBuildCheckResult: { ok: false, step: "crash" } });
+  } finally {
+    patchCepBridge({ buildCheckRunning: false });
+  }
+}
+
+async function runEchoPayload() {
+  const { echoTestValue } = store.getState().cepBridge;
+  patchCepBridge({ echoRunning: true, lastEchoResult: null });
+  try {
+    const result = await echoPayload({ log, payload: { testValue: echoTestValue } });
+    console.error("[Caption Graphics Studio] CEP echoPayload result:", JSON.stringify(result, null, 2));
+    patchCepBridge({ lastEchoResult: result });
+  } catch (err) {
+    console.error("[Caption Graphics Studio] CEP echoPayload crashed:", err);
+    log(`CEP echoPayload crashed unexpectedly: ${err.message || err}`, "error");
+    patchCepBridge({ lastEchoResult: { ok: false, step: "crash" } });
+  } finally {
+    patchCepBridge({ echoRunning: false });
+  }
 }
 
 async function pickMogrt() {
@@ -529,9 +562,74 @@ function bisectResultBlock(result) {
   ]);
 }
 
+function buildCheckResultBlock(result) {
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ Build check failed${stepLabel}${result.error ? `: ${result.error}` : ""}` }),
+    ]);
+  }
+  const r = result.result ?? {};
+  const commands = Array.isArray(r.supportedCommands) ? r.supportedCommands : [];
+  const expected = ["ping", "getAvailableCommands", "echoPayload", "createTextGraphic", "probeSourceTextDeep", "inspectSourceTextRawBytes", "testRawBytesHelpers", "bisectHostScript"];
+  const missing = expected.filter((c) => !commands.includes(c));
+  return el("div", { class: "inspector-results" }, [
+    el("div", { class: "status-line log-success", text: `✓ Loaded hostscript.jsx build: "${r.hostscriptBuildId ?? "unknown (pre-build-ID version)"}".` }),
+    el("div", { class: "status-line", text: `Supported commands (${commands.length}): ${commands.join(", ") || "(none reported)"}` }),
+    el("div", {
+      class: `status-line ${missing.length ? "log-error" : "log-success"}`,
+      text: missing.length
+        ? `✗ MISSING from the loaded engine: ${missing.join(", ")} — the live ExtendScript engine has a STALE build. Restart Premiere Pro (see docs/CEP_BRIDGE_INVESTIGATION.md Part 12) to force it to reload hostscript.jsx.`
+        : "✓ All expected commands are present in the loaded engine — this is not a stale-build issue.",
+    }),
+  ]);
+}
+
+function echoResultBlock(result) {
+  if (!result) return null;
+  if (!result.ok) {
+    const stepLabel = result.step ? ` (step: ${result.step})` : "";
+    if (result.stage) return fatalStageBlock(result);
+    return el("div", { class: "inspector-results" }, [
+      el("div", { class: "status-line log-error", text: `✗ echoPayload failed${stepLabel}${result.error ? `: ${result.error}` : ""}` }),
+    ]);
+  }
+  const r = result.result ?? {};
+  return el("div", { class: "inspector-results" }, [
+    el("div", { class: "status-line log-success", text: "✓ echoPayload succeeded — the minimal, ping-like registration pattern works." }),
+    el("div", { class: "status-line", text: `Build: "${r.hostscriptBuildId ?? "n/a"}". Received back: ${JSON.stringify(r.received)}` }),
+  ]);
+}
+
 export function renderCepBridgePanel(onChange) {
   const state = store.getState();
   const cb = state.cepBridge;
+
+  const buildCheckBtn = el("button", {
+    class: "btn btn-primary",
+    text: cb.buildCheckRunning ? "Checking…" : "Check Bridge Build & Commands",
+    disabled: !isHosted() || cb.buildCheckRunning || undefined,
+    onClick: async () => {
+      await runBuildCheck();
+      onChange();
+    },
+  });
+  const echoInput = el("input", { type: "text" });
+  echoInput.value = cb.echoTestValue;
+  echoInput.addEventListener("change", () => {
+    patchCepBridge({ echoTestValue: echoInput.value });
+    onChange();
+  });
+  const echoBtn = el("button", {
+    class: "btn",
+    text: cb.echoRunning ? "Echoing…" : "Run echoPayload Test",
+    disabled: !isHosted() || cb.echoRunning || undefined,
+    onClick: async () => {
+      await runEchoPayload();
+      onChange();
+    },
+  });
 
   const pickBtn = el("button", { class: "btn", text: "Choose .mogrt…", onClick: () => pickMogrt().then(onChange) });
   const runBtn = el("button", {
@@ -613,6 +711,22 @@ export function renderCepBridgePanel(onChange) {
 
   return el("section", { class: "panel panel-cep-bridge" }, [
     el("h2", { text: "7. CEP Bridge (experimental)" }),
+    el(
+      "p",
+      { class: "hint" },
+      [
+        "Step 0 first: check what's actually loaded in the live ExtendScript engine before running anything else. " +
+          'A real-host bisection found that even a bare-minimum command ("bisectHostScript" step 0, no code beyond a ' +
+          "single return statement) fails with the same non-JSON \"EvalScript error.\" as every command added since " +
+          '"probeSourceTextDeep" (still working) — pointing at Premiere\'s ExtendScript engine only loading the ' +
+          "manifest's ScriptPath file ONCE per running Premiere Pro process, not on every CEP panel reopen. See " +
+          "docs/CEP_BRIDGE_INVESTIGATION.md Part 12.",
+      ]
+    ),
+    el("div", { class: "row" }, [buildCheckBtn]),
+    buildCheckResultBlock(cb.lastBuildCheckResult),
+    el("div", { class: "row" }, [el("label", { class: "field-inline" }, ["Echo test value: ", echoInput]), echoBtn]),
+    echoResultBlock(cb.lastEchoResult),
     el(
       "p",
       { class: "hint" },

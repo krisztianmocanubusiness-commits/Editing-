@@ -17,6 +17,40 @@ if (typeof $._captionStudioBridge === "undefined") {
   $._captionStudioBridge = {};
 }
 
+// Real-host finding that demands this (see docs/CEP_BRIDGE_INVESTIGATION.md
+// Part 12): bisectHostScript()'s step 0 — a bare minimal return, no
+// string/JSON helpers, no Premiere APIs — failed with the same non-JSON
+// "EvalScript error." as every command added since probeSourceTextDeep
+// (still confirmed working). Since the failure is that immediate and that
+// context-free, and since a full brace-balance + top-level-scope audit of
+// this file found nothing structurally wrong, the leading suspect is
+// Adobe's own documented CEP/ExtendScript behavior: the manifest's
+// ScriptPath file is evaluated ONCE into a persistent ExtendScript engine
+// session when the extension is first activated in a running Premiere Pro
+// process — reopening the CEP panel window reloads client/index.html and
+// client/main.js (the CEP browser-side code), but does NOT re-evaluate
+// this .jsx file into that same engine session. If the live engine is
+// still running an earlier build of this file (from before these newer
+// commands existed), every NEW command would be undefined in that engine,
+// while every command that existed at the time the engine last loaded
+// this file (ping, createTextGraphic, probeSourceTextDeep) keeps working.
+// HOSTSCRIPT_BUILD_ID + SUPPORTED_COMMANDS exist specifically to make that
+// checkable directly, without guessing: call "ping" or
+// "getAvailableCommands" and compare the returned build ID/command list
+// against what's actually in this file on disk. Bump HOSTSCRIPT_BUILD_ID
+// on every change to this file that should be verifiable after a reload.
+var HOSTSCRIPT_BUILD_ID = "2026-07-15-bisect-r2";
+var SUPPORTED_COMMANDS = [
+  "ping",
+  "getAvailableCommands",
+  "echoPayload",
+  "createTextGraphic",
+  "probeSourceTextDeep",
+  "inspectSourceTextRawBytes",
+  "testRawBytesHelpers",
+  "bisectHostScript",
+];
+
 /**
  * Single entry point called from client/main.js via evalScript. Takes one
  * JSON-encoded string (a { command, payload, requestId } request), returns
@@ -37,8 +71,18 @@ $._captionStudioBridge.dispatch = function (requestJsonString) {
       response = {
         ok: true,
         requestId: requestId,
-        result: { pong: true, appVersion: (app && app.version) || null, hasActiveSequence: Boolean(app && app.project && app.project.activeSequence) },
+        result: {
+          pong: true,
+          appVersion: (app && app.version) || null,
+          hasActiveSequence: Boolean(app && app.project && app.project.activeSequence),
+          hostscriptBuildId: HOSTSCRIPT_BUILD_ID,
+          supportedCommands: SUPPORTED_COMMANDS,
+        },
       };
+    } else if (command === "getAvailableCommands") {
+      response = $._captionStudioBridge.getAvailableCommands(payload, requestId);
+    } else if (command === "echoPayload") {
+      response = $._captionStudioBridge.echoPayload(payload, requestId);
     } else if (command === "createTextGraphic") {
       response = $._captionStudioBridge.createTextGraphic(payload, requestId);
     } else if (command === "probeSourceTextDeep") {
@@ -50,7 +94,7 @@ $._captionStudioBridge.dispatch = function (requestJsonString) {
     } else if (command === "bisectHostScript") {
       response = $._captionStudioBridge.bisectHostScript(payload, requestId);
     } else {
-      response = { ok: false, requestId: requestId, error: "Unknown command: " + command };
+      response = { ok: false, requestId: requestId, error: "Unknown command: " + command, hostscriptBuildId: HOSTSCRIPT_BUILD_ID };
     }
     return JSON.stringify(response);
   } catch (err) {
@@ -59,8 +103,43 @@ $._captionStudioBridge.dispatch = function (requestJsonString) {
       requestId: requestId,
       error: "dispatch() threw: " + (err && err.message ? err.message : String(err)),
       stack: err && err.stack ? String(err.stack) : null,
+      hostscriptBuildId: HOSTSCRIPT_BUILD_ID,
     });
   }
+};
+
+/**
+ * Task 7: lets a caller confirm exactly what's loaded in the live
+ * ExtendScript engine right now, independent of "ping" (in case "ping"
+ * itself is somehow part of a stale load — defense in depth, though
+ * "ping" is the oldest command in this file and the least likely to be
+ * affected).
+ */
+$._captionStudioBridge.getAvailableCommands = function (payload, requestId) {
+  return { ok: true, requestId: requestId, result: { hostscriptBuildId: HOSTSCRIPT_BUILD_ID, supportedCommands: SUPPORTED_COMMANDS } };
+};
+
+/**
+ * Task 3: registered via the EXACT SAME pattern as the known-working
+ * probeSourceTextDeep — a plain function assigned to
+ * $._captionStudioBridge, wired into dispatch()'s if/else chain the same
+ * way, returning a plain object (dispatch() does the one, single
+ * JSON.stringify(response) call, same as every other command here; this
+ * command does not pre-stringify its own result, since doing so would be
+ * double-encoded by dispatch()'s own JSON.stringify() and would no longer
+ * match the "exact same registration pattern" as every other working
+ * command). Accepts one argument (the payload, an object or string as
+ * sent by the caller) and echoes it back verbatim. No helper functions,
+ * no Premiere APIs — deliberately placed here, immediately after
+ * dispatch()/ping/getAvailableCommands near the TOP of the file, as far
+ * as possible from bisectHostScript/testRawBytesHelpers/
+ * inspectSourceTextRawBytes (all defined near the END of the file) — so
+ * that if THIS fails while ping/createTextGraphic/probeSourceTextDeep
+ * keep working, that is itself evidence about WHERE in the file the live
+ * engine's loaded copy stops matching what's on disk.
+ */
+$._captionStudioBridge.echoPayload = function (payload, requestId) {
+  return { ok: true, requestId: requestId, result: { received: payload, hostscriptBuildId: HOSTSCRIPT_BUILD_ID } };
 };
 
 // --- Multi-track clip detection helpers ---
